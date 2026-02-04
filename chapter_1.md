@@ -327,3 +327,17 @@ def train_wordpiece(corpus, target_vocab_size):
         
     return vocab
 ```
+
+**Advantages**
+- Efficient OOV Handling: Like BPE, it effectively manages Out-of-Vocabulary words by breaking them down into known sub-units, ensuring the model can process almost any input.
+
+- Reduced Vocabulary Redundancy: The likelihood-based approach helps avoid merging common but uninformative character pairs that might otherwise take up space in a frequency-based vocabulary.
+
+**Disadvantages**
+- Potential for [UNK] Tokens: While it handles subwords well, if the base character set is not comprehensive, WordPiece may still resort to [UNK] tokens for truly unseen characters, a problem Byte-level BPE (BBPE) avoids.
+
+- Loss of Single-Word Meaning: Highly frequent but long words may still be fragmented into sub-units, which can sometimes obscure the direct semantic meaning of the original word.
+
+- Segmentation Ambiguity: Because WordPiece relies primarily on learned statistical correlations to merge units, it cannot resolve all segmentation ambiguities, which can lead to inconsistent or ambiguous tokenization results.
+
+#### 1.1.3.4 Unigram
