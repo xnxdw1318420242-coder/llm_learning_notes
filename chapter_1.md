@@ -187,6 +187,20 @@ for i in range(5):
 print("\nFinal BBPE Tokens:", list(vocab.keys())[0].split())
 ```
 
+**Advantages**
+- Zero Out-of-Vocabulary (OOV) Rate: By falling back to bytes ($256$ base tokens) instead of characters, BBPE can represent any string of text, ensuring the model never encounters an "unknown" token.
+
+- Compact Vocabulary: It allows for a dynamically controlled vocabulary size that balances common words with rare subword units, making it efficient for large models.
+
+- Strong Generalization: Breaking words into subwords allows the model to understand the semantic relationships between different forms of a word (e.g., "smart," "smarter," "smartest").
+
+**Disadvantages**
+- Reduced Encoding Efficiency: It can result in longer sequence lengths because single characters often decompose into multiple bytes, which increases the overall computational cost.
+
+- Semantic Information Loss: BBPE ignores word-level structures, meaning it can lose more semantic meaning compared to methods using higher-level units.
+  
+- Complex Post-processing: The system becomes more complex because extra steps are needed to merge bytes back into their original character or word forms.
+  
 #### 1.1.3.3 WordPiece
 
 WordPiece is a subword tokenization algorithm originally developed by Google for the Google Voice Search system and later popularized by BERT. It sits between character-level and word-level tokenization, designed to handle large vocabularies and out-of-vocabulary (OOV) words efficiently. 
@@ -341,3 +355,292 @@ def train_wordpiece(corpus, target_vocab_size):
 - Segmentation Ambiguity: Because WordPiece relies primarily on learned statistical correlations to merge units, it cannot resolve all segmentation ambiguities, which can lead to inconsistent or ambiguous tokenization results.
 
 #### 1.1.3.4 Unigram
+
+Unigram Language Model Tokenization is a subword tokenization method that treats tokenization as a probabilistic optimization problem. Unlike BPE or WordPiece, which start with characters and merge them upward, Unigram starts with a very large initial vocabulary and iteratively removes tokens that contribute the least to the overall likelihood of the corpus. The Unigram algorithm is a core component of the SentencePiece library and is the default tokenizer for several state-of-the-art transformer architectures, including AlBERT, T5, Big Bird, and XLNet.
+
+The core philosophy of Unigram is to find the most likely way to segment a sentence $S$ into a series of subwords $\vec{x} = (x_1, x_2, \dots, x_m)$. If we assume that each subword $x_i$ exists independently, the probability of a specific segmentation $\vec{x}$ is the product of the probabilities of all its constituent subwords:
+
+$$P(\vec{x}) = \prod_{i=1}^{m} P(x_i)$$
+
+For a given sentence $S$, the best segmentation $x^*$ is the one that maximizes this likelihood among all possible tokenization combinations $U(x)$:
+
+$$x^* = \text{arg max}_{x \in U(x)} P(\vec{x})$$
+
+In practice, a vocabulary can contain tens of thousands of tokens, making it impossible to list and compare every possible combination of subwords manually. To solve this efficiently, Unigram utilizes the Viterbi algorithm to find the optimal path ($x^*$) through all potential segmentations.
+
+To determine the probability $P(x_i)$ for each subword, Unigram uses the Expectation-Maximization (EM) algorithm. During the Maximization (M) step, the objective is to maximize the following likelihood function across the entire corpus $D$:
+
+$$L = \sum_{s=1}^{|D|} \log(P(X^{(s)})) = \sum_{s=1}^{|D|} \log \left( \sum_{x \in U(X^{(s)})} P(x) \right)$$
+
+This formula calculates the total probability by summing the probabilities of every possible segmentation for every sentence in the entire training corpus. By maximizing this value, the model learns subword probabilities that best represent the actual patterns in the language data.
+
+Here are the implementation steps of the Unigram process:
+
+1. Vocabulary Initialization: Generate an extensive initial vocabulary by collecting all individual characters plus the most frequent substrings found in the training corpus. The goal is to start with a set of subwords that is significantly larger than your desired final vocabulary size.
+
+2. Estimate Probabilities using EM Algorithm: Apply the Expectation-Maximization (EM) algorithm to estimate the occurrence probability $P(x_i)$ for every subword in the current vocabulary. The algorithm maximizes the log-likelihood of the entire training corpus by considering all possible segmentations for every sentence.
+
+3. Calculate the "Loss" for Each Token: For every subword in the current vocabulary, calculate how much the total corpus likelihood would decrease if that specific token were removed. 
+
+4. Prune the Vocabulary: Sort the tokens by their loss value. Remove a fixed percentage (e.g., 10–20%) of tokens that have the lowest impact on the overall likelihood. Always keep individual characters in the vocabulary to ensure the model can always tokenize any string (avoiding OOV issues).
+
+5. Repeat Until Target Size is Reached: Repeat steps 2 through 4 until the vocabulary reaches your predefined size (e.g., 32,000 tokens).
+
+ Training code example:
+ ```python
+import math
+import collections
+
+def train_unigram(corpus, target_vocab_size):
+    """
+    Implements the Unigram training process:
+    1. Initialize a large seed vocabulary.
+    2. Use EM to estimate probabilities.
+    3. Prune tokens that contribute the least to corpus likelihood.
+    """
+    # Step 1: Initialize Seed Vocabulary
+    # In practice, this would be all frequent substrings.
+    # Here we simplify it to common words split into substrings.
+    word_freqs = collections.Counter(" ".join(corpus).split())
+    vocab = initialize_seed_vocab(word_freqs)
+
+    while len(vocab) > target_vocab_size:
+        # Step 2: Expectation-Maximization (EM) Step
+        # Estimate P(x) for each subword to maximize corpus likelihood L
+        token_probs = estimate_probabilities(word_freqs, vocab)
+
+        # Step 3: Loss Calculation
+        # How much does the total log-likelihood L drop if token x is removed?
+        # L = Σ log(Σ P(x))
+        token_losses = calculate_token_losses(word_freqs, vocab, token_probs)
+
+        # Step 4: Pruning
+        # Sort by loss and remove the bottom 10-20% of tokens
+        # Note: Never prune individual characters to avoid OOV!
+        sorted_tokens = sorted(token_losses.items(), key=lambda x: x[1], reverse=True)
+        keep_count = max(target_vocab_size, int(len(vocab) * 0.8))
+        vocab = {t for t, loss in sorted_tokens[:keep_count]}
+        
+    return vocab
+
+def estimate_probabilities(word_freqs, vocab):
+    """
+    M-step of the EM algorithm: Maximize the likelihood function L.
+    This calculates the normalized frequency of tokens in the optimal segmentations.
+    """
+    counts = collections.defaultdict(float)
+    total_count = 0
+    
+    for word, freq in word_freqs.items():
+        # Find optimal segmentation using current probabilities (Viterbi)
+        # and increment counts of subwords used in those segmentations.
+        best_segmentation = viterbi_segment(word, vocab)
+        for token in best_segmentation:
+            counts[token] += freq
+            total_count += freq
+            
+    # Return P(x_i) = count(x_i) / total_count
+    return {token: count / total_count for token, count in counts.items()}
+
+def calculate_token_losses(word_freqs, vocab, token_probs):
+    """
+    Calculates the impact of removing each token on the global likelihood L.
+    L = Σ log(P(S))
+    """
+    token_losses = {}
+    current_total_log_likelihood = compute_corpus_likelihood(word_freqs, vocab, token_probs)
+    
+    for token in vocab:
+        if len(token) == 1: continue # Skip base characters
+        
+        # Temporarily remove token and see how much the likelihood drops
+        temp_vocab = vocab - {token}
+        new_likelihood = compute_corpus_likelihood(word_freqs, temp_vocab, token_probs)
+        token_losses[token] = current_total_log_likelihood - new_likelihood
+        
+    return token_losses
+
+def compute_corpus_likelihood(word_freqs, vocab, token_probs):
+    """
+    Calculates the total log-likelihood of the corpus.
+    L = Σ log(P(word)) * frequency
+    """
+    total_log_likelihood = 0.0
+    
+    for word, freq in word_freqs.items():
+        # For each word, we calculate the sum of probabilities of all possible segmentations.
+        # We use a variation of the Forward Algorithm (Dynamic Programming).
+        word_prob = compute_word_likelihood(word, vocab, token_probs)
+        
+        # Add to total using log to handle the corpus-level product
+        if word_prob > 0:
+            total_log_likelihood += freq * math.log(word_prob)
+        else:
+            # Handle cases where word cannot be formed (should not happen if chars are kept)
+            total_log_likelihood += freq * -1e10 
+            
+    return total_log_likelihood
+
+def compute_word_likelihood(word, vocab, token_probs):
+    """
+    Calculates the sum of probabilities of ALL possible ways to segment a word.
+    Implementation of: Σ P(x) for x in U(X)
+    """
+    n = len(word)
+    # dp[i] stores the sum of probabilities of all segments ending at index i
+    dp = [0.0] * (n + 1)
+    dp[0] = 1.0 # Base case: empty string has probability 1
+    
+    for end_idx in range(1, n + 1):
+        for start_idx in range(end_idx):
+            subword = word[start_idx:end_idx]
+            
+            # If subword is in current vocabulary, add its contribution
+            if subword in vocab and subword in token_probs:
+                # Probability of path to start_idx * Probability of this subword
+                dp[end_idx] += dp[start_idx] * token_probs[subword]
+                
+    return dp[n]
+```
+
+Inference code example:
+```python
+import math
+
+def unigram_viterbi_tokenize(text, vocab_probs):
+    """
+    Implements Viterbi decoding to find the most likely segmentation.
+    x* = arg max P(x) where P(x) is the product of subword probabilities.
+    """
+    n = len(text)
+    
+    # best_probabilities[i] stores the maximum log-probability to reach position i
+    # Initialize with negative infinity
+    best_probs = [-float("inf")] * (n + 1)
+    best_probs[0] = 0.0
+    
+    # best_segment_starts[i] stores the starting index of the best subword ending at i
+    best_segment_starts = [0] * (n + 1)
+
+    # 1. Forward Pass: Dynamic Programming to find the max likelihood path
+    for end_idx in range(1, n + 1):
+        for start_idx in range(end_idx):
+            subword = text[start_idx:end_idx]
+            
+            if subword in vocab_probs:
+                # Use log-probabilities to avoid numerical underflow (summing logs = multiplying probs)
+                # Formula: log(P(x1...xi)) = log(P(x1...xj)) + log(P(xj...xi))
+                log_prob = math.log(vocab_probs[subword])
+                current_prob = best_probs[start_idx] + log_prob
+                
+                if current_prob > best_probs[end_idx]:
+                    best_probs[end_idx] = current_prob
+                    best_segment_starts[end_idx] = start_idx
+
+    # 2. Backward Pass: Reconstruct the best segmentation path
+    if best_probs[n] == -float("inf"):
+        return ["[UNK]"]
+
+    tokens = []
+    curr = n
+    while curr > 0:
+        start = best_segment_starts[curr]
+        tokens.append(text[start:curr])
+        curr = start
+    
+    # Reverse because we backtracked from the end
+    return tokens[::-1]
+
+# --- Example Usage ---
+# Probabilities would typically be estimated via the EM algorithm
+sample_vocab_probs = {
+    "h": 0.1, "e": 0.1, "l": 0.1, "o": 0.1,
+    "he": 0.2, "llo": 0.3, "hello": 0.5
+}
+
+# For "hello", Unigram will choose ['hello'] because it has the highest individual probability.
+print(unigram_viterbi_tokenize("hello", sample_vocab_probs))
+```
+
+**Advantages**
+- Simple and Efficient: The implementation is relatively straightforward and computationally efficient, making it well-suited for processing large-scale datasets.
+
+- Highly Customizable: By preprocessing training samples and statistical word frequencies, it can be tailored with custom rules to meet the specific tokenization needs of different domains and tasks.
+
+  
+**Disadvantages**
+- Lack of Contextual Information: The algorithm only considers the probability of each word in isolation. This lack of context can result in ambiguous or blurry segmentation results.
+
+- Out-of-Vocabulary (OOV) Issues: It has a limited ability to handle "unseen" words that did not appear in the training set, potentially leading to incorrect segmentation of OOV terms.
+
+- Ambiguity Problems: Because certain words can have different meanings, the Unigram algorithm may fail to accurately segment them without contextual cues.
+
+
+#### 1.1.3.5 SentencePiece
+
+SentencePiece is an open-source subword tokenization library developed by Google that treats the input text as a raw stream of characters, including spaces. It is unique because it performs tokenization and detokenization without requiring language-specific pre-tokenizers (like splitting by whitespace), making it truly language-independent.
+SentencePiece is designed as a language-independent subword tokenizer. It treats the input as a raw stream of characters, relying on these four internal modules:
+
+1. Normalizer
+* Standardization: Converts raw text into a consistent format using **Unicode normalization** (typically NFKC) to handle character variations.
+* Space Handling: Replaces whitespaces with a visible meta-symbol (usually `_`), allowing spaces to be treated as standard characters within the vocabulary.
+  
+2. Trainer
+* Vocabulary Building: Learns the subword units from a training corpus using either **BPE** or **Unigram** logic.
+* Probabilistic Estimation: In Unigram mode, it utilizes the **EM (Expectation-Maximization) algorithm** to find subword probabilities that maximize the total log-likelihood of the corpus.
+
+3. Encoder (Tokenizer)
+* Segmentation: Transforms the normalized text into a sequence of subword tokens or numerical IDs.
+* Optimal Pathing: For Unigram, it employs the **Viterbi algorithm** to find the most likely segmentation by maximizing the product of the probabilities of all constituent subwords.
+
+4. Decoder (Detokenizer)
+* Reconstruction: Converts subword sequences back into the original raw text string.
+* Lossless Mapping: Because spaces were preserved as meta-symbols, the decoder simply joins the tokens and restores standard whitespaces for a perfect reconstruction of the original text.
+
+**Advantages**
+- Dynamic Vocabulary: By merging units, SentencePiece can dynamically control vocabulary size, allowing it to adapt to different tasks and data scales efficiently.
+
+- Superior Segmentation: It segments words into subwords with high precision, which provides better semantic representation and overall tokenization performance.
+
+- Reduced OOV Issues: By breaking unknown words into known subword units, it significantly reduces out-of-vocabulary (OOV) problems and improves the model's ability to generalize.
+
+**Disadvantages**
+- Computational Cost: The Unigram training process involves iterative Expectation-Maximization (EM) steps, which are more computationally expensive than the simple frequency-counting used in BPE.
+
+- Ambiguity in Segmentation: Certain words may have multiple valid segmentations depending on the learned vocabulary, which the algorithm may not always resolve accurately across different contexts.
+
+## 1.2 Embedding
+
+In the context of Large Language Models (LLMs), an **embedding** is a numerical representation of a word, subword, or sentence. It converts the discrete tokens produced by algorithms like Unigram or BBPE into a continuous vector of numbers that a machine can actually "understand." The process includes the following steps:
+1. Build a Vocabulary: A collection of all unique words (or subwords) is created, where every word is assigned a unique numerical index.
+2. Initialize the Embedding Matrix: A matrix is created with dimensions of (Vocabulary Size × Embedding Dimension). Each row in this matrix represents the "embedding vector" for a specific word.
+3. Token to Index: Each word in the input text is converted into its corresponding unique index from the vocabulary.
+4. Lookup Embedding Vectors: The model uses these indices to locate and "look up" the specific vector row from the embedding matrix.
+
+An embedding matrix is a fundamental lookup table used in neural networks to translate discrete token IDs into dense, continuous vectors that a model can process mathematically.  It is a large matrix of weights with dimensions $V \times D$, where $V$ is the Vocabulary Size (the number of unique tokens, like 50,000) and $D$ is the Embedding Dimension (the length of the vector, like 768 or 1024). Every value in this matrix is a trainable parameter. During the model's training phase, these numbers are adjusted so that tokens with similar meanings end up with similar vector values.
+
+In the context of building a language model, there are two primary ways to initialize an Embedding Matrix to translate token indices into dense vectors.
+1. Random Initialization: In this approach, the matrix is initialized with small, random numbers (often following a specific distribution like Xavier or Heuristic initialization). The model learns the "meaning" of these vectors from scratch during training. As the model processes text, it updates these weights via backpropagation until words with similar meanings cluster together in the vector space.
+2. Pre-trained Initialization: This approach involves using an embedding matrix that has already been trained on a massive external corpus (like Word2Vec, GloVe, or FastText). Instead of random numbers, the rows are populated with vectors that already represent semantic relationships learned from other data. This gives the model a head start. It already "knows" basic semantic associations, which is particularly helpful when the current training dataset is small.
+
+### 1.2.1 History 
+
+#### 1.2.1.1 One-hot Encoding
+
+One-Hot Encoding is the most basic way to represent words as numerical vectors. Each word in the vocabulary is represented by a vector of the same length as the total vocabulary size. In this vector, only one element is set to 1 (at the unique index assigned to that word), while all other elements are set to 0.
+
+One-hot Encoding has two disadvantages. First, as the vocabulary grows, the vectors become extremely long, leading to a massive, memory-intensive sparse matrix. Most of the vector consists of zeros, which provides very little useful information for the model to learn complex patterns compared to dense embeddings. Second, One-hot vectors treat every word as equidistant. They cannot capture relationships; for example, "cat" and "dog" are mathematically as different as "cat" and "refrigerator".
+
+#### 1.2.1.2 Co-occurrence Matrix
+A co-occurrence matrix is a statistical tool used to capture the relationships between words based on how frequently they appear near each other within a specified "window" of text. The matrix counts how many times two words appear together within a fixed distance (e.g., 2 or 5 words) across an entire corpus. It is a square matrix of size $V \times V$ (where $V$ is vocabulary size), where the value at $(\text{word } A, \text{word } B)$ is the count of their shared appearances. Words that appear in similar contexts will have similar row vectors, reflecting the distributional hypothesis that "similar words appear in similar neighborhoods."
+
+The matrix size increases quadratically with the vocabulary ($V^2$), leading to massive storage and computational requirements for large datasets. Most word pairs never appear together, resulting in a matrix filled mostly with zeros, which is inefficient for model learning.
+
+#### 1.2.1.3 Distributed Word Representation
+Distributed word representation (embeddings) addresses the limitations of sparse methods like one-hot encoding or co-occurrence matrices by mapping words into a dense, low-dimensional space. Unlike one-hot encoding where all words are equidistant, distributed representations place words with similar meanings closer together in the vector space.
+
+### 1.2.2 Static Embeddings
+
+Static vectors are defined as representations that, once training is complete, no longer change. Regardless of the future scenario or context the word appears in, its corresponding vector remains the same. This approach includes well-known methods such as Word2Vec, GloVe, and FastText.
+
+#### 1.2.2.1 Word2Vec
