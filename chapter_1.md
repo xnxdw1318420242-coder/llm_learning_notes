@@ -780,3 +780,84 @@ While traditional models like Word2Vec and GloVe assign a single static vector t
 In static models, the word "bank" has the same vector whether you are talking about a "river bank" or a "bank account." Contextual embeddings solve this "polysemy" problem by looking at the entire sentence before assigning a vector. This allows the model to capture deep semantic meaning and syntax based on specific usage.
 
 ELMo was one of the first models to successfully implement this idea. BERT revolutionized the field by moving away from LSTMs and adopting the Transformer architecture. We will introduce the technical details, training objectives, and implementation of ELMo and BERT in depth in the upcoming chapters.
+
+## 1.3 Positional Encoding
+
+Unlike previous sequential models (RNNs or LSTMs), the Transformer architecture processes an entire sequence in parallel rather than word by word. While this makes training much faster, it introduces a major flaw: Permutation Invariance.
+
+Without additional information, the Transformer "sees" a sentence as a "bag of words." For example, the model would treat these two sentences as identical because they contain the same tokens:
+
+- "The dog bit the man."
+
+- "The man bit the dog."
+
+Since self-attention calculates relationships between tokens regardless of their distance, we must explicitly inject information about the order of the words to preserve grammatical and semantic meaning.
+
+**Positional Encoding (PE)** is a technique where a unique vector is added to each input word embedding to represent its specific position in the sequence. This vector can be viewed as a signal that is either added to or concatenated with the token's word vector (embedding) or feature vector. This process ensures that the subsequent self-attention mechanism is aware of the positional information for every token in the sequence. There are several primary methods for positional encoding:
+
+* Absolute Positional Encoding
+    * Learnable Positional Embedding
+    * Sinusoidal Positional Encoding
+    
+* Relative Positional Encoding
+    * RoPE (Rotary Position Embedding)
+    * ALiBi (Attention with Linear Biases)
+ 
+### 1.3.1 Learnable Positional Embedding
+
+Unlike Sinusoidal encoding, which uses fixed mathematical functions, Learnable Positional Embeddings treat the position of a token as a parameter to be optimized during the training process. Instead of calculating a static value, the model initializes a dedicated embedding matrix where each row represents a specific position index (e.g., Position 0, Position 1, etc.). This method is the standard approach for several foundational Transformer architectures including BERT and GPT.
+
+Training this method may require more data to effectively cover a longer range of sequences. Also, the maximum sequence length is fixed; if the model encounters a sequence longer than the maximum length used during training, it cannot effectively "extrapolate" or generalize to those new position indices.
+
+Implementation details:
+1. Initialization: A matrix $P \in \mathbb{R}^{L_{max} \times d_{model}}$ is initialized, where $L_{max}$ represents a pre-defined maximum sequence length.
+2. Vector Assignment: For the token at a specific $position$ in a sequence, its positional encoding is the corresponding row vector $P[position]$ from this matrix.
+3. Training Process: During training, this matrix $P$ is updated via backpropagation, similar to how word embeddings are updated, allowing the model to gradually learn how to encode different positions.
+
+Code example:
+```python
+import torch
+import torch.nn as nn
+
+class LearnablePositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512):
+        """
+        Implementation of Absolute Learnable Positional Encoding.
+        
+        Args:
+            d_model: The dimensionality of the word vectors/model (d_model).
+            max_len: The pre-defined maximum sequence length (L_max).
+        """
+        super().__init__()
+        self.position_embeddings = nn.Embedding(max_len, d_model)
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model).
+        
+        Returns:
+            Tensor with positional signals added to word vectors.
+        """
+        seq_len = x.size(1)
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
+        pos_encodings = self.position_embeddings(positions)
+        
+        return x + pos_encodings
+
+# Example Usage:
+# model = LearnablePositionalEncoding(d_model=768, max_len=512)
+# input_embeddings = torch.randn(1, 10, 768) 
+# output = model(input_embeddings)
+```
+**Advantages**
+- Simplicity: It treats positional information exactly like word embeddings, making it straightforward to implement using standard embedding layers in frameworks like PyTorch.
+
+**Disadvantages**
+- Poor Generalization: If the model encounters a sequence during inference that is longer than the maximum length seen during training, it cannot effectively "extrapolate" or generalize to those new position indices.
+
+- Memory Constraints: A separate vector must be stored for every position up to $L_{max}$, which can become memory-intensive if the context window is extremely large.
+
+- Data Hunger: Training these embeddings may require a larger volume of data to ensure the model effectively learns representations for every possible position index in the sequence range.
+
+### 1.3.3 Sinusoidal Positional Encoding
