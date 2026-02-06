@@ -1,4 +1,4 @@
-# 1. Transformer Basics
+# 1. LLM Basics
 ## 1.1 Tokenization
 
 **Tokenization** is the fundamental bridge between raw human text and the numerical processing power of a machine. It is the process of converting a string of characters into a sequence of discrete units—tokens—that the model can understand and manipulate.
@@ -644,3 +644,139 @@ Distributed word representation (embeddings) addresses the limitations of sparse
 Static vectors are defined as representations that, once training is complete, no longer change. Regardless of the future scenario or context the word appears in, its corresponding vector remains the same. This approach includes well-known methods such as Word2Vec, GloVe, and FastText.
 
 #### 1.2.2.1 Word2Vec
+
+Word2Vec is a groundbreaking framework developed by Google in 2013 that uses a shallow, two-layer neural network to learn static word embeddings. It is based on the idea that "a word is characterized by the company it keeps." The model processes a large corpus of text and maps each word to a dense vector (typically 100–300 dimensions). The result of Word2Vec is a static lookup table. Once trained, the vector for "apple" is fixed, regardless of whether you are talking about the fruit or the tech company.
+
+<p align="center">
+  <img width="329" height="182" alt="eee82a74-7b47-4513-a8df-ca6b4f7fc1da" src="https://github.com/user-attachments/assets/a0c9c73d-b19f-4543-ab03-aa1812dd14d0" />
+</p>
+
+In Word2Vec, the CBOW and Skip-gram architectures are two different strategies for training a model to understand word meanings based on context. Skip-gram generally performs better with large datasets and is superior at representing rare words. CBOW is faster to train and often performs well with smaller datasets or when focusing on frequent words.
+
+Here are the specific steps of CBOW:
+
+1. Input and Encoding: The model identifies the context words within a fixed "window" (e.g., two words before and two words after the target). These words are converted into One-Hot Vectors.
+- Example sentence: "The quick brown [fox] jumps over."
+- Inputs: "quick", "brown", "jumps", "over".
+
+2. Vector Lookup: Each one-hot vector is multiplied by an Input Embedding Matrix. This step essentially "plucks" the corresponding dense word vector for each context word from the vocabulary table.
+
+3. Averaging (The "Bag" Step): The vectors of all the context words are summed or averaged together to create a single representative vector. This combined vector represents the overall "vibe" or meaning of the surrounding context.
+
+4. Output Prediction: The averaged vector is then passed through an Output Embedding Matrix (and usually a Softmax layer). This produces a probability distribution across the entire vocabulary.
+
+5. Loss Calculation: The model compares its prediction to the actual target word (e.g., "fox"). If the probability for "fox" is low, the model uses Backpropagation to adjust the weights in both embedding matrices. Over time, the vectors for words that appear in similar contexts (like "fox" and "wolf") begin to move closer together in the vector space.
+
+Once the CBOW model is trained, we generally stop using the "prediction" part of the network and keep the learned weights. Discard the output layer and keep the Input Embedding Matrix. Each word in the vocabulary now corresponds to a specific row in that matrix. 
+
+<p align="center">
+  <img width="214" height="309" alt="02fa6ce2-416f-4257-8708-52dafe71bc91" src="https://github.com/user-attachments/assets/7270dcb1-e20b-4c14-891a-c0a74f70e15a" />
+</p>
+
+Skip-gram is the "inverse" of CBOW. Instead of using the context to guess a word, it takes a single target word and tries to predict the context words that likely surround it.
+
+Here are the steps the model follows during training:
+
+1. The model selects a center word (target) from the text and identifies its neighbors within a set window size.
+- Example sentence: "The quick brown [fox] jumps over."
+- Input: "brown"
+- Targets to predict: "quick", "fox"
+
+2. Vector Lookup: The input word ("brown") is converted into a One-Hot Vector. This vector is multiplied by the Input Embedding Matrix to retrieve the specific dense vector for that word.
+
+3. Parallel Predictions: Unlike CBOW, which averages vectors, Skip-gram uses the single input vector to make multiple separate predictions. It tries to calculate the probability of each word in the vocabulary appearing in the nearby slots (e.g., position -1, position +1, etc.).
+
+4. Softmax and Probability: The input vector is multiplied by the Output Embedding Matrix. A Softmax function is applied to turn the results into probabilities. The goal is for the probabilities of "quick" and "fox" to be high, while the probability of unrelated words like "keyboard" remains low.
+
+5. Loss Calculation: The model calculates the error (loss) between its predictions and the actual context words. It then uses Backpropagation to update the weights in both the Input and Output matrices.
+
+<p align="center">
+<img width="320" height="465" alt="d82b8625-0387-48b6-9ac3-57deabdf2104" src="https://github.com/user-attachments/assets/51cfe6cd-ed3b-4663-af7a-a8a5462d3393" />
+</p>
+
+In standard Word2Vec, the final layer uses a Softmax function that must calculate a probability for every single word in the vocabulary (which could be 50,000+ words). This is computationally "expensive" and slow. Hierarchical Softmax and Negative Sampling are two optimization techniques designed to solve this bottleneck.
+
+#### 1.2.2.2 GloVe
+
+GloVe (Global Vectors for Word Representation) is an unsupervised learning algorithm developed by Stanford for generating dense word embeddings. Unlike Word2Vec, which uses a "predictive" approach (local context windows), GloVe is a "count-based" model that leverages global co-occurrence statistics from the entire text corpus.
+
+The core insight of GloVe is that the ratio of word-word co-occurrence probabilities encodes semantic meaning. For example, if you look at the words "ice" and "steam":
+
+- The word "solid" co-occurs frequently with "ice" but rarely with "steam."
+
+- The word "gas" co-occurs frequently with "steam" but rarely with "ice."
+
+- The word "water" co-occurs frequently with both. By looking at the ratio of these probabilities, the model can precisely distinguish the relationship between words.
+
+Training Steps
+1. Build a Vocabulary: Tokenize the corpus and create a unique set of words.
+   
+2. Construct a Co-occurrence Matrix ($X$): Scan the corpus with a fixed window size. For every pair of words $(i, j)$, count how many times they appear near each other. $X_{ij}$ represents the global count of word $j$ appearing in the context of word $i$.
+   
+3. Calculate Co-occurrence Probabilities: Compute $P_{ij} = \frac{X_{ij}}{X_i}$, where $X_i$ is the total count of any word appearing in the context of word $i$.
+   
+4. Define the Objective Function: The model aims to learn vectors $w_i$ and $w_j$ such that their dot product equals the logarithm of their co-occurrence:
+   
+$$w_i^T \tilde{w}_j + b_i + \tilde{b}_j = \log(X_{ij})$$
+
+5. Apply Weighted Least Squares: To prevent common words (like "the") from dominating the loss, a weighting function $f(X_{ij})$ is used. It assigns lower weights to rare word pairs and caps the weight for extremely frequent ones.
+   
+$$J = \sum_{i,j=1}^{V} f(X_{ij})(w_i^T \tilde{w}_j + b_i + \tilde{b}_j - \log(X_{ij}))^2$$
+
+   There are three critical conditions that the weighting function must meet to work effectively:
+   - Non-decreasing: Common word pairs (those that appear together often) should have a higher weight than rare pairs. Therefore, $f(x)$ must be a non-decreasing function.
+   - Saturation: The weight should not increase indefinitely. Once the co-occurrence reaches a certain level, the weight should cap out (not increase further) to prevent extremely frequent words from dominating the loss.
+   - Handling Zero Counts: If two words never appear together ($X_{ij} = 0$), they should not contribute to the loss function. This means $f(0) = 0$.
+
+   The authors of the GloVe paper chose a specific piecewise function to satisfy these conditions:
+   
+$$f(x) = \begin{cases} (x/x_{max})^\alpha & \text{if } x < x_{max} \\ 1 & \text{otherwise} \end{cases}$$
+   
+   - $\alpha$ (Alpha): Set to 0.75 for all experiments.
+   
+   - $x_{max}$: Fixed at 100.
+   
+   - The Curve: As shown in the graph, the weight grows quickly at first but "levels off" at 1.0 once the co-occurrence count ($X_{ij}$) hits 100.
+    
+6. Optimization: Use Stochastic Gradient Descent (SGD) to minimize the difference between the dot product of the vectors and the actual log-counts.
+
+**Example: King vs. Queen**
+In a large dataset, "King" and "Queen" will both frequently co-occur with words like "throne," "crown," and "rule." 
+- **GloVe** records these counts globally.
+- The model adjusts their vectors so the dot product of `vector(King)` and `vector(throne)` is high.
+- Because they share many "probe words," `vector(King)` and `vector(Queen)` end up close together in the vector space.
+
+> **Result:** King - Man + Woman ≈ Queen
+
+GloVe uses the AdaGrad gradient descent algorithm. It performs stochastic sampling on all non-zero elements within the global co-occurrence matrix $X$. During training, its iteration count varies by vector size: 50 iterations for vectors under 300 dimensions, and 100 iterations for larger vectors. The model achieves optimal performance with a vector dimension of 300 and a context window size ranging approximately from 6 to 10.
+
+The training process produces two separate sets of vectors, $w$ and $\tilde{w}$. To improve robustness and reduce noise, the final word representation used is the sum of the two vectors ($w + \tilde{w}$).
+
+
+#### 1.2.2.3 FastText
+
+FastText is an open-source library for word embeddings and text classification developed by Facebook's AI Research (FAIR) lab. It is essentially an evolution of the Word2Vec model that treats words as more than just individual tokens. In text classification tasks, FastText often achieves accuracy levels comparable to deep neural networks, yet it is many orders of magnitude faster in terms of training time. 
+
+Unlike Word2Vec or GloVe, which assign a single vector to each unique word, FastText breaks words down into character n-grams. For example, with $n=3$, the word "apple" would be broken into: <ap, app, ppl, ple, le>. The final vector for "apple" is the sum of the vectors of these subword n-grams. By utilizing subword n-grams, the model significantly improves its understanding of phrases and varied expressions. This approach generates superior vectors for rare words and uniquely enables the construction of embeddings for out-of-vocabulary (OOV) terms by leveraging their internal character patterns.
+
+FastText consists of three primary layers:
+- Input Layer: Words and their features are represented as vectors.
+- Hidden Layer: This layer calculates the average of multiple input vectors.
+- Output Layer: A specific target—usually a document label—is predicted.
+
+FastText introduces several unique elements designed for text classification:
+- Input Features: Instead of just using the context words surrounding a target, FastText uses a combination of individual words and their subword n-gram features to represent a document.
+- Vector Processing: Inputs are already processed as embeddings.
+- The Objective: FastText predicts the class label (category) of the entire document.
+- Character-level n-grams: By including subword features as extra inputs, the model captures internal word structure. This is a major reason why the model is so effective at classification.
+- Hierarchical Softmax: At the output stage, FastText uses a hierarchical structure to process the multi-class classification. This significantly reduces the total training time compared to standard softmax.
+
+The model effectively treats a document as a "Bag of Words". It first Collects vectors for all words and n-grams in the document, superimpose and average these vectors to form a combined document-level vector, and feed this final document vector into the linear softmax classifier to determine the category.
+
+### 1.2.3 Contextual Embeddings
+
+While traditional models like Word2Vec and GloVe assign a single static vector to each word, **Contextual Embeddings** represent a major leap forward by allowing a word's vector to change based on the words surrounding it. 
+
+In static models, the word "bank" has the same vector whether you are talking about a "river bank" or a "bank account." Contextual embeddings solve this "polysemy" problem by looking at the entire sentence before assigning a vector. This allows the model to capture deep semantic meaning and syntax based on specific usage.
+
+ELMo was one of the first models to successfully implement this idea. BERT revolutionized the field by moving away from LSTMs and adopting the Transformer architecture. We will introduce the technical details, training objectives, and implementation of ELMo and BERT in depth in the upcoming chapters.
