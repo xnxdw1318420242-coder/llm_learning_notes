@@ -967,4 +967,330 @@ class SinusoidalPositionalEncoding(nn.Module):
         return x + self.pe[:, :seq_len, :]
 ```
 
-### 1.3.4 T5
+**Advantages**
+- It allows the model to distinguish the position of words in a sequence, which is critical for semantic understanding.
+  
+- Because these encodings are unique to each position, they help the model maintain global consistency across the entire sequence.
+  
+- It enables the self-attention mechanism to weigh information based on distance, improving the handling of long-distance dependencies.
+
+**Disadvantages**
+- Because it is not learnable, it may not adapt optimally to specific tasks or datasets.
+
+- It may struggle to fully represent the features of extremely long sequences.
+
+- In Tranformer, adding positional encodings linearly to word embeddings might cause some semantic information to be obscured or "overwritten."
+
+### 1.3.4 Bucketed Relative Position Bias
+
+While Sinusoidal Positional Encoding provides a fixed "coordinate" for every word, it treats position as an absolute value (e.g., "this word is at index 5"). Relative Positional Encoding (RPE) shifts the focus from where a word is to how far apart two words are.
+
+Instead of adding a vector to the word embedding at the input layer, RPE modifies the Attention Mechanism itself. When calculating the attention score between a "Query" ($Q$) and a "Key" ($K$), the model injects a bias term or a transformation based on the distance $k = i - j$.
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T + \text{Relative Bias}}{\sqrt{d_k}}\right)V$$
+
+In the context of Multi-Head Attention, each individual attention head is assigned its own unique set of bias terms.
+
+In the T5 (Text-to-Text Transfer Transformer) model, Google introduced a simplified version of relative positional encoding called Bucketed Relative Position Bias. Instead of calculating a unique bias for every possible distance, it groups distances into "buckets." The fundamental idea is that precise distance matters more for nearby tokens than for distant ones. T5 uses a non-linear mapping to assign a distance $d = (i - j)$ to a specific bucket index:
+
+- Small Distances: For tokens very close to each other (e.g., 0 to 7 tokens apart), T5 assigns a unique bucket for every single integer distance.
+
+- Large Distances: As the distance increases, T5 uses logarithmic growth to group ranges of distances into the same bucket. For example, the difference between 100 and 110 tokens away is treated as functionally the same, so they share a single bias value.
+
+During the self-attention calculation, the distance between query $i$ and key $j$ is converted into a bucket index. The corresponding bias is then added directly to the attention score before the softmax:
+
+$$\text{Attention Score} = \frac{QK^T}{\sqrt{d_k}} + \text{Bias}_{\text{head, bucket}(i-j)}$$
+
+Code example:
+```python
+import torch
+import torch.nn as nn
+import math
+
+class T5RelativePositionBias(nn.Module):
+    def __init__(self, num_buckets=32, max_distance=128, n_heads=8):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.n_heads = n_heads
+        
+        # Learnable bias table: (num_buckets, n_heads)
+        self.relative_attention_bias = nn.Embedding(num_buckets, n_heads)
+
+    @staticmethod
+    def _relative_position_bucket(relative_position, num_buckets=32, max_distance=128):
+        """
+        Maps a matrix of relative distances to bucket indices.
+        """
+        relative_buckets = 0
+        n = -relative_position # T5 convention
+
+        # 1. Split buckets between forward (positive) and backward (negative) distances
+        num_buckets //= 2
+        relative_buckets += (n < 0).to(torch.long) * num_buckets
+        n = torch.abs(n)
+
+        # 2. Linear mapping for small distances
+        max_exact = num_buckets // 2
+        is_small = n < max_exact
+
+        # 3. Logarithmic mapping for large distances
+        val_if_large = max_exact + (
+            torch.log(n.float() / max_exact) / 
+            math.log(max_distance / max_exact) * (num_buckets - max_exact)
+        ).to(torch.long)
+        
+        # Cap the value at the maximum bucket index
+        val_if_large = torch.min(val_if_large, torch.full_as(val_if_large, num_buckets - 1))
+
+        relative_buckets += torch.where(is_small, n.to(torch.long), val_if_large)
+        return relative_buckets
+
+    def forward(self, query_len, key_len):
+        """
+        Produces the bias matrix to be added to the attention scores.
+        Returns shape: (1, n_heads, query_len, key_len)
+        """
+        # Create grid of positions: [query_len, 1] and [1, key_len]
+        q_pos = torch.arange(query_len, dtype=torch.long)
+        k_pos = torch.arange(key_len, dtype=torch.long)
+        
+        # Matrix of relative distances (i - j)
+        rel_pos = k_pos[None, :] - q_pos[:, None] 
+        
+        # Get bucket indices for each pair
+        buckets = self._relative_position_bucket(
+            rel_pos, self.num_buckets, self.max_distance
+        )
+
+        # Lookup biases: (query_len, key_len, n_heads)
+        bias = self.relative_attention_bias(buckets)
+        
+        # Permute to match attention shape: (1, n_heads, query_len, key_len)
+        return bias.permute(2, 0, 1).unsqueeze(0)
+
+# Example usage:
+# model = T5RelativePositionBias(num_buckets=32, n_heads=8)
+# bias_matrix = model(seq_len=128, seq_len=128)
+# attn_scores = (Q @ K.T) + bias_matrix
+```
+
+### 1.3.5 ALiBi
+ALiBi (Attention with Linear Biases) is a simpler, faster alternative to traditional positional encodings, introduced to solve the "length extrapolation" problem. ALiBi does not use any positional embeddings (absolute or relative). Instead, it adds a constant, non-learnable negative bias to the attention scores based on the distance between tokens. The attention score between a Query ($i$) and Key ($j$) is calculated as:
+
+$$\text{Attention}_{i,j} = \text{softmax}(QK^T - m \cdot |i - j|)$$
+
+- $|i - j|$: The linear distance between two tokens.
+- $m$: A head-specific slope (a constant). Each attention head is assigned a different slope (e.g., $1, \frac{1}{2}, \frac{1}{4} \dots$), meaning some heads focus on local context while others have a "flatter" view of the whole sequence. For a model with $n$ attention heads, the slopes are typically set as powers of $2$. If the number of heads is a power of $2$, the set of slopes is defined by the following sequence:
+
+$$m = \left( \frac{1}{2^1}, \frac{1}{2^2}, \frac{1}{2^3}, \dots, \frac{1}{2^n} \right)$$
+
+<p align="center">
+  <img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/ae363985-94bb-432f-aebc-50d49459aae4" />
+</p>
+
+Code example:
+```python
+import torch
+
+def get_alibi_slope(n_heads):
+    """Returns a list of slopes for ALiBi."""
+    def get_slopes_power_of_2(n):
+        start = (2**(-2**-(math.log2(n)-3)))
+        ratio = start
+        return [start * ratio**i for i in range(n)]
+    
+    # Typically calculated as powers of 2 for stability
+    return torch.tensor(get_slopes_power_of_2(n_heads))
+
+def apply_alibi_bias(attn_scores, slopes):
+    """
+    attn_scores: (batch, n_heads, seq_len, seq_len)
+    slopes: (n_heads, 1, 1)
+    """
+    seq_len = attn_scores.size(-1)
+    # Create distance matrix: [[0, 1, 2], [-1, 0, 1], [-2, -1, 0]]
+    # For causal models, we usually only care about the lower triangle
+    context_position = torch.arange(seq_len).view(1, -1)
+    memory_position = torch.arange(seq_len).view(-1, 1)
+    relative_distance = torch.abs(memory_position - context_position)
+    
+    # Apply penalty: score - (slope * distance)
+    bias = slopes * relative_distance * -1
+    return attn_scores + bias.unsqueeze(0)
+```
+
+### 1.3.5 RoPE
+Rotary Positional Embedding (RoPE) is a modern positional encoding technique used in state-of-the-art models like Llama, PaLM, and Mistral. It effectively bridges the gap between the fixed sinusoidal encodings you saw in your images and the flexibility of relative positional encoding.
+
+RoPE encodes positional information by rotating the Query ($Q$) and Key ($K$) vectors in a high-dimensional space. It tries to find a transformation for Query ($q$) and Key ($k$) vectors such that their dot product depends only on the relative distance between positions $m$ and $n$. For a token at position $m$ and a feature pair $(x_1, x_2)$, the transformation looks like this:
+
+$$
+\begin{aligned}
+\begin{bmatrix} 
+q^{(m)}_{2i} \\ 
+q^{(m)}_{2i+1} 
+\end{bmatrix} 
+&= \begin{bmatrix} 
+\cos(m\theta_i) & -\sin(m\theta_i) \\ 
+\sin(m\theta_i) & \cos(m\theta_i) 
+\end{bmatrix} 
+\begin{bmatrix} 
+q_{2i} \\ 
+q_{2i+1} 
+\end{bmatrix}
+\end{aligned}
+$$
+
+1. The Objective Function
+
+We want to define a function $f(x, pos)$ that injects positional information into a vector $x$. The core requirement is that the inner product of two transformed vectors must be a function of their relative distance:
+
+$$\langle f(q, m), f(k, n) \rangle = g(q, k, m - n)$$
+
+2. The 2D Case
+
+To solve this, we start in 2D space. Let the vector $x$ be represented as a complex number $z = x_1 + ix_2$. Applying a rotation by an angle proportional to the position $m$ can be written using Euler's formula:
+
+$$f(x, m) = x \cdot e^{im\theta}$$
+
+In matrix form, rotating a 2D vector $\begin{bmatrix} x_1 \\ x_2 \end{bmatrix}$ by angle $m\theta$ is:
+
+$$
+f(\mathbf{x}, m) = \begin{bmatrix} 
+\cos(m\theta) & -\sin(m\theta) \\ 
+\sin(m\theta) & \cos(m\theta) 
+\end{bmatrix} 
+\begin{bmatrix} 
+x_1 \\ 
+x_2 
+\end{bmatrix}
+$$
+
+3. Proving the Relative Property
+
+When we take the dot product (inner product) of two rotated vectors $q$ at position $m$ and $k$ at position $n$, we use the property that the dot product of 2D vectors is equivalent to the real part of $q \bar{k}$ in complex space:
+
+$$
+\begin{aligned}
+\langle f(q, m), f(k, n) \rangle &= \text{Re}[ (q e^{im\theta}) \overline{(k e^{in\theta})} ] \\
+&= \text{Re}[ q \bar{k} e^{i(m-n)\theta} ]
+\end{aligned}
+$$
+
+The resulting expression depends only on the difference $(m - n)$. This proves that the attention mechanism will naturally perceive relative distances.
+
+4. Generalization to D-Dimensions
+
+Since the dot product is additive, we can generalize this to a $d$-dimensional space by splitting the vector into $d/2$ pairs of dimensions. Each pair $(x_{2i}, x_{2i+1})$ is rotated by its own frequency $\theta_i$:
+
+$$\theta_i = 10000^{-2i/d}$$
+
+The full transformation is a block-diagonal matrix:
+
+$$
+\text{RoPE}(\mathbf{x}, m) = \begin{bmatrix} 
+\cos m\theta_1 & -\sin m\theta_1 & 0 & 0 & \dots \\
+\sin m\theta_1 & \cos m\theta_1 & 0 & 0 & \dots \\
+0 & 0 & \cos m\theta_2 & -\sin m\theta_2 & \dots \\
+0 & 0 & \sin m\theta_2 & \cos m\theta_2 & \dots \\
+\vdots & \vdots & \vdots & \vdots & \ddots
+\end{bmatrix} 
+\begin{bmatrix} 
+x_0 \\ x_1 \\ x_2 \\ x_3 \\ \vdots 
+\end{bmatrix}
+$$
+
+While RoPE is defined as an orthogonal matrix transformation $\mathcal{R}_m$, this matrix is highly sparse. Performing a standard direct matrix multiplication would be computationally wasteful. To save computational power, the operation is implemented using element-wise multiplication ($\otimes$) and vector addition rather than a full matrix dot product.
+
+$$
+\begin{aligned}
+\text{Rotated Vector} &= \begin{pmatrix} 
+q_0 \\ 
+q_1 \\ 
+q_2 \\ 
+q_3 \\ 
+\vdots \\ 
+q_{d-2} \\ 
+q_{d-1} 
+\end{pmatrix} \otimes \begin{pmatrix} 
+\cos m\theta_0 \\ 
+\cos m\theta_0 \\ 
+\cos m\theta_1 \\ 
+\cos m\theta_1 \\ 
+\vdots \\ 
+\cos m\theta_{d/2-1} \\ 
+\cos m\theta_{d/2-1} 
+\end{pmatrix} \\ + \begin{pmatrix} 
+-q_1 \\ 
+q_0 \\ 
+-q_3 \\ 
+q_2 \\ 
+\vdots \\ 
+-q_{d-1} \\ 
+q_{d-2} 
+\end{pmatrix} \otimes \begin{pmatrix} 
+\sin m\theta_0 \\ 
+\sin m\theta_0 \\ 
+\sin m\theta_1 \\ 
+\sin m\theta_1 \\ 
+\vdots \\ 
+\sin m\theta_{d/2-1} \\ 
+\sin m\theta_{d/2-1} 
+\end{pmatrix}
+\end{aligned}
+$$
+
+Code example:
+```python
+import torch
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    Precomputes the frequency constants (cos, sin) as complex numbers.
+    Llama uses complex numbers to simplify the 'rotation' math.
+    """
+    # 1. Generate frequencies for each pair of dimensions
+    # Using the formula: theta_i = 10000^(-2i/d)
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    
+    # 2. Map frequencies across the sequence length (positions)
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()  # (seq_len, dim/2)
+    
+    # 3. Convert to polar form (complex numbers: cos + i*sin)
+    # This represents the rotation matrix in a compact form
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
+    """
+    Applies the Rotary Positional Embedding to queries and keys.
+    """
+    # 1. Transform real vectors into complex pairs
+    # (batch, seq_len, heads, head_dim) -> (batch, seq_len, heads, head_dim/2)
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+
+    # 2. Reshape freqs_cis to broadcast across batch and heads
+    # Llama alignment: (1, seq_len, 1, head_dim/2)
+    freqs_cis = freqs_cis.view(1, xq_complex.shape[1], 1, xq_complex.shape[-1])
+
+    # 3. Perform the rotation via complex multiplication
+    # (cos + i*sin) * (q_real + i*q_imag) = Rotated Vector
+    xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
+
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+```
+
+Suppose we have a 2-dimensional embedding for the word "Apple":
+- Vector ($q$): $[1, 0]$
+- Position ($m$): 1 (the first word in a sentence)
+- Angle ($\theta$): $90^\circ$ (for simplicity)
+
+To encode the position, we rotate $[1, 0]$ by $1 \times 90^\circ$.
+- Rotated Vector ($q^{(1)}$): $[0, 1]$
+
+If "Apple" was at Position 2, we would rotate it by $2 \times 90^\circ$ ($180^\circ$ total).
+- Rotated Vector ($q^{(2)}$): $[-1, 0]$
