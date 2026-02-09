@@ -861,3 +861,110 @@ class LearnablePositionalEncoding(nn.Module):
 - Data Hunger: Training these embeddings may require a larger volume of data to ensure the model effectively learns representations for every possible position index in the sequence range.
 
 ### 1.3.3 Sinusoidal Positional Encoding
+
+Since Transformer models process all tokens in a sequence simultaneously, they lack an inherent understanding of word order. Sinusoidal Positional Encoding solves this by injecting a unique mathematical "signature" into each token based on its position.
+
+For a token at position $position$ (starting from 0) and a model with dimensionality $d_{model}$, the encoding for each dimension $i$ is calculated using sine and cosine functions:
+- Even Dimensions ($2i$): Uses the sine function.
+
+$$PE_{(position, 2i)} = \sin\left(\frac{position}{10000^{\frac{2i}{d_{model}}}}\right)$$
+
+- Odd Dimensions ($2i+1$): Uses the cosine function.
+
+$$PE_{(position, 2i+1)} = \cos\left(\frac{position}{10000^{\frac{2i}{d_{model}}}}\right)$$
+
+The denominator $10000^{\frac{2i}{d_{model}}}$ controls the wavelength/frequency across different dimensions. As the dimension index $i$ increases, the wavelength becomes longer, allowing the model to capture a wide range of positional relationships. When a sequence length exceeds the maximum length seen during training, the model can still interpret position information by extending the sine and cosine periods. As the $position$ index increases, the changes in the encoding vector are smooth and continuous, without sudden jumps. All values are generated using a fixed formula, meaning no additional learnable weights are added to the model.
+
+One of the most powerful properties of this method is that it allows the model to learn relative positions through linear transformations. By using these geometric properties, the Transformer doesn't just know "where" a word is; it can mathematically calculate how far apart words are from one another, regardless of where they appear in the sentence. For any two positions separated by a fixed distance $\Delta$, the encoding at $pos + \Delta$ can be expressed as a rotation of the encoding at $pos$. Mathematically, this is represented by a rotation matrix:
+
+$$
+\begin{aligned}
+\begin{bmatrix} 
+PE_{(pos + \Delta, 2i)} \\ 
+PE_{(pos + \Delta, 2i+1)} 
+\end{bmatrix} 
+&= \begin{bmatrix} 
+\sin((pos + \Delta) \cdot \theta_i) \\ 
+\cos((pos + \Delta) \cdot \theta_i) 
+\end{bmatrix} \\
+&= \begin{bmatrix} 
+\sin(pos \cdot \theta_i)\cos(\Delta \cdot \theta_i) + \cos(pos \cdot \theta_i)\sin(\Delta \cdot \theta_i) \\ 
+\cos(pos \cdot \theta_i)\cos(\Delta \cdot \theta_i) - \sin(pos \cdot \theta_i)\sin(\Delta \cdot \theta_i) 
+\end{bmatrix} \\
+&= \begin{bmatrix} 
+\cos(\Delta \cdot \theta_i) & \sin(\Delta \cdot \theta_i) \\ 
+-\sin(\Delta \cdot \theta_i) & \cos(\Delta \cdot \theta_i) 
+\end{bmatrix} 
+\begin{bmatrix} 
+\sin(pos \cdot \theta_i) \\ 
+\cos(pos \cdot \theta_i) 
+\end{bmatrix} \\
+&= \begin{bmatrix} 
+\cos(\Delta \cdot \theta_i) & \sin(\Delta \cdot \theta_i) \\ 
+-\sin(\Delta \cdot \theta_i) & \cos(\Delta \cdot \theta_i) 
+\end{bmatrix} 
+\begin{bmatrix} 
+PE_{(pos, 2i)} \\ 
+PE_{(pos, 2i+1)} 
+\end{bmatrix}
+\end{aligned}
+$$
+
+- Rotation Angle: The rotation amount is $\Delta \cdot \theta_i$.
+- $\theta_i$: This is the geometric frequency for a specific dimension $i$, defined as $\theta_i = \frac{1}{10000^{2i/d_{model}}}$.
+- Position Independence: This rotation relationship depends only on the distance $\Delta$ and the dimension frequency $\theta_i$; it is completely independent of the specific absolute position $pos$.
+
+<p align="center">
+  <img width="290" height="220" alt="4205ebd7-61d1-4eea-9909-48f896bf64c3" src="https://github.com/user-attachments/assets/7159ded4-c0bc-4195-ad00-8edc537a7b1d" />
+</p>
+
+Code example:
+```python
+import torch
+import torch.nn as nn
+import math
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        """
+        Fixed Sinusoidal Positional Encoding module.
+        
+        Args:
+            d_model: The dimension of the word embeddings.
+            max_len: The maximum sequence length supported.
+        """
+        super().__init__()
+        
+        # 1. Create a matrix of shape (max_len, d_model) filled with zeros
+        pe = torch.zeros(max_len, d_model)
+        
+        # 2. Create a column vector for positions (0, 1, ..., max_len-1)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        
+        # 3. Calculate the frequency/division term
+        # Use log space for numerical stability: 1 / 10000^(2i/d_model)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        # 4. Apply sine to even indices (0, 2, ...) and cosine to odd indices (1, 3, ...)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # 5. Add a batch dimension (1, max_len, d_model) and register as a buffer
+        # A buffer is part of the model state but not a trainable parameter.
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+        Returns:
+            Embeddings with positional information added.
+        """
+        # Add the positional encoding to the input embeddings
+        # We slice self.pe to match the specific sequence length of x
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len, :]
+```
+
+### 1.3.4 T5
