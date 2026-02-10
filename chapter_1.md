@@ -1294,3 +1294,28 @@ To encode the position, we rotate $[1, 0]$ by $1 \times 90^\circ$.
 
 If "Apple" was at Position 2, we would rotate it by $2 \times 90^\circ$ ($180^\circ$ total).
 - Rotated Vector ($q^{(2)}$): $[-1, 0]$
+
+RoPE combines the strengths of both absolute and relative positional encodings while introducing unique benefits for long-sequence modeling. It reflects relative position characteristics at the attention score level while maintaining the "extrapolation" property (the ability to handle longer sequences than seen during training) similar to sinusoidal encodings. As the distance between the Query and Key ($m - n$) increases, the rotation angle increases, which naturally causes the inner product (attention score) to decrease. This allows the model to naturally reduce focus on distant elements. It maintains effectiveness over longer sequences or across different segments. Computationally, it only requires a simple rotation transformation before vector multiplication, making it highly efficient.
+
+Unlike many relative positional methods that require an explicit attention matrix to function, RoPE injects information directly into the Query and Key vectors. This makes it compatible with Linear Attention, enabling efficient long-sequence processing. It is the default positional encoding for many large-scale open-source models (such as Llama) and multimodal models. Compared to original sinusoidal encodings, RoPE demonstrates significantly better performance when aligning long texts and handling extensive context windows.
+
+### 1.3.6 Length Extrapolation
+
+Choosing an encoding depends on specific task requirements and model scales:
+
+| Feature | Sinusoidal (Standard) | Learnable Embedding | ALiBi | RoPE (Rotary) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Sequence Length** | Limited; struggles with very long sequences | Hard limit; cannot handle sequences longer than training | Excellent; naturally extrapolates to much longer sequences | Excellent; best for long-context and long-text alignment |
+| **Complexity** | Low; fixed formula with no learned parameters | Medium; adds significant parameter overhead for long sequences | Low; simple linear penalty added to attention scores | High; requires complex-number math or 2D rotation logic |
+| **Implementation** | Element-wise **addition** to word vectors | Element-wise **addition** or concatenation | **Bias** added directly to the Attention Matrix | **Multiplicative** rotation using a sparse matrix trick |
+| **Stability** | Moderate; linear addition can "overwrite" semantic info | Moderate; depends on training data distribution | High; consistent penalty regardless of scale | High; orthogonal transformation preserves vector length |
+
+Most models use addition to combine position and word vectors because it is simple and does not change the embedding dimension. Sine and cosine functions allow models to learn periodic patterns, enabling them to maintain regularity even in unseen positions. For modern large language models, RoPE is generally preferred for its ability to align long texts and handle extensive context windows effectively.
+
+**Length extrapolation** refers to the ability of a model to perform effectively on sequences longer than those it encountered during training. Ideally, if a model is trained on a sequence length of 512 tokens, an "extrapolating" model should be able to process 1024 or 2048 tokens at inference time without a significant drop in performance or accuracy. We need length extrapolation primarily because training on extremely long sequences is computationally expensive and often impractical. In real-world applications, models often need to process extremely long documents, books, extensive Wikipedia entries, or codebases consisting of thousands of tokens. These inputs frequently exceed the original training length limits of the model. Models with strong length extrapolation capabilities can seamlessly adapt to various input lengths. This removes the need to perform costly model fine-tuning every time a longer text is encountered.
+
+Length extrapolation is difficult because models struggle with position values they have never encountered during training. Taking sinusoidal encoding or Rotary Positional Embedding (RoPE) as examples, if a model is only trained up to a maximum position $p = T_{train}$, any inference involving a test position $T_{test}$ where $T_{test} > T_{train}$ will result in a corresponding rotation angle ($\alpha_{T_{test}} = T_{test} \cdot \theta_i$) that is significantly larger than any seen during the training phase. Because the model has never "seen" such large rotation angles or sinusoidal values, the interpolation range is effectively stretched beyond its learned bounds, which typically leads to a significant decline in inference performance.
+
+As summarized in the table above, ALiBi and RoPE in general suit long sequence better. However, these two methods still have their limitation. While RoPE combines the benefits of absolute and relative encoding and maintains the "extrapolation" properties of sinusoidal methods, at extreme lengths, position information can "oscillate" or become blurry, making distant positions hard to distinguish. Therefore, RoPE is effective for long-text alignment but has specific limits. ALiBi is often considered stronger for extreme length extrapolation, because it does not suffer from "oscillation" and it captures relative relationships well even as sequences grow very long. But it is slightly more specialized and primarily used when long-sequence handling is the top priority.
+
+#### 1.3.6.1 NTK (Neural Tangent Kernel)
