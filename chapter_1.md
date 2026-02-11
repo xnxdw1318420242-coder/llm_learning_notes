@@ -1120,6 +1120,16 @@ def apply_alibi_bias(attn_scores, slopes):
     return attn_scores + bias.unsqueeze(0)
 ```
 
+**Advantages**
+- Superior Length Extrapolation: It allows models trained on short sequences (e.g., 1,024 tokens) to maintain stable performance and low perplexity on much longer sequences at inference time (e.g., 2x to 8x longer).
+  
+- Computational Efficiency: ALiBi requires zero learned parameters for positional encoding. 
+
+**Disadvantages**
+- Fixed Linear Decay: The penalty pattern is strictly linear and non-learned, which may be less flexible than learned positional embeddings that can adapt to specific datasets.
+  
+- Loss of True Global Attention: Because distant tokens are exponentially suppressed, the model may struggle with tasks where very long-range, non-local context is critical.
+
 ### 1.3.5 RoPE
 Rotary Positional Embedding (RoPE) is a modern positional encoding technique used in state-of-the-art models like Llama, PaLM, and Mistral. It effectively bridges the gap between the fixed sinusoidal encodings you saw in your images and the flexibility of relative positional encoding.
 
@@ -1421,3 +1431,242 @@ Dual-Chunk Attention is a technique designed to handle long sequences efficientl
 ## 1.4 Attention
 
 Since there is an abundance of resources available on the topic of Attention, we will not repeat the basics of standard mechanisms here. Instead, this entry will focus on documenting and exploring some discussions in the field.
+
+- Why attention?
+
+The Attention mechanism solves the information bottleneck and long-range dependency problems that plagued earlier sequence models like RNNs and LSTMs. Unlike fixed-length vector representations, Attention allows a model to focus on the most relevant parts of the input for each specific output token, essentially "paying attention" to the right context at the right time. By removing the need for sequential processing, Attention enables models to process entire sequences at once, which is the foundational breakthrough of the Transformer architecture. As tasks grew more complex—from simple translation to summarizing entire books—the ability to selectively retrieve information became mandatory to maintain performance without losing critical details.
+
+- Self-Attention v.s. Cross-Attention
+
+| Feature | Self-Attention | Cross-Attention |
+| :--- | :--- | :--- |
+| **Input Sequences** | One (e.g., just the input text) | Two (e.g., input text + output text) |
+| **Q, K, V Source** | Same source: $Q, K, V$ all from one sequence | Hybrid: $Q$ from target; $K, V$ from source |
+| **Primary Use Case** | Contextual understanding & internal relations | Alignment, translation & information fusion |
+| **Typical Models** | GPT, BERT, Llama | T5, Whisper, Stable Diffusion |
+
+- Why multi-head?
+
+By splitting the attention mechanism into multiple "heads," the model can simultaneously focus on different types of relationships within the data. Each individual head can learn to identify and extract different linguistic or structural features. Instead of trying to find one "average" relationship, the model looks at the sequence through multiple "lenses" at once, providing a much richer understanding of the context. A single attention head can cause information to become too concentrated, making it difficult for the model to capture multi-dimensional dependencies in complex contexts. By introducing multiple heads, the model lowers the risk of encountering these bottlenecks when learning intricate relationships.
+
+Multi-head also allows different attention heads to perform calculations simultaneously. Compared to traditional sequential models like RNNs, this significantly boosts both training and inference speeds by capturing multiple dependency relationships at once.
+
+In practical use, a single head's weights can become overly focused on specific terms, leading to over-reliance. Combining multiple heads creates a more balanced and smooth attention distribution, which improves the model's overall comprehension across diverse contexts.
+
+Multi-head Attention (MHA) will assign $d_{model}$ to $h$ heads, each with $d_{model} / h$ dimensions. This is because processing attention in several smaller chunks is significantly more efficient than doing it all at once. If the model used the full model dimension ($d_{model}$) for a single $Q, K, V$ dot product, the computational complexity would be prohibitively high. By dividing the dimension into smaller heads, the scale of the inner product operations is reduced, making the overall calculation faster and more manageable for the hardware.
+
+- Why do we "scale" each head?
+
+The reason we "scale" each head (specifically the dot product of $Q$ and $K$) is primarily to prevent gradient vanishing during training. When the dimensionality of the head ($d_k$) is large, the dot product of the Query ($Q$) and Key ($K$) vectors can result in very large numerical values. Large input values push the Softmax function into its extreme regions, where the curve becomes almost flat. In these flat regions, the gradient (derivative) of the softmax becomes nearly zero. This leads to the vanishing gradient problem, making it almost impossible for the model to update its weights effectively during backpropagation.
+
+Mathematically, if we assume the components of $Q$ and $K$ are independent random variables with a mean of 0 and a variance of 1, their dot product will have a mean of 0 but a variance of $d_k$. By dividing the dot product by $\sqrt{d_k}$, we scale the variance back down to 1. This keeps the distribution of the attention scores stable, regardless of how large the embedding dimension is. This is why the standard Attention formula includes the scaling factor:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+
+- Weights Sharing in Transformers
+
+The primary motivation of weights sharing is to significantly decrease the total number of parameters in the model without necessarily hurting performance. Because a Transformer is essentially a stack of identical blocks (Self-Attention + Feed-Forward Networks), these layers are structurally compatible for sharing. Experiments have shown that sharing weights across different layers of the Encoder or Decoder does not significantly degrade the model's overall capabilities.
+
+- Why three separate matrices for Q, K, and V?
+
+Each matrix serves a unique purpose—$Q$ is the "question" (searching), $K$ is the "label" (matching), and $V$ is the "content" (the information being retrieved). Independent linear projections allow the model to map the same input into different vector subspaces, enabling it to capture more complex and nuanced relationships than a single matrix could. 
+
+- Different roles of Q, K, and V
+
+$Q$ (Query - The Searcher) represents the current word's "question" to the rest of the sequence. It is used to determine which other words in the context are relevant to the current one. $K$ (Key - The Index) serves as a "feature description" for every word in the sequence. It acts as a label that the Query ($Q$) checks against to see how well two words match. $V$ (Value - The Content) is the actual "information carrier". Once $Q$ and $K$ establish a relationship strength (the attention weight), the model extracts the corresponding content from $V$ to build the new representation.
+
+In Transformer architectures, attention mechanisms have evolved to balance performance and efficiency. **Multi-Head Attention (MHA)**, the standard, processes information through multiple independent "heads" to capture diverse features in parallel. **Multi-Query Attention (MQA)** streamlines this by allowing all heads to share the same Keys and Values, significantly reducing memory and speeding up inference. **Grouped-Query Attention (GQA)** offers a compromise, where heads are divided into groups, and each group shares its own set of Keys and Values. 
+
+<p align="center">
+  <img width="1031" height="265" alt="462d596d-c07a-4a21-9e6f-4420a0b6206b" src="https://github.com/user-attachments/assets/89e3ad46-b368-4842-9d35-05fd7ebf4fdd" />
+
+</p>
+
+## 1.4.1 Multi-Head Attention (MHA)
+
+Multi-Head Attention (MHA) is the core architectural component of the Transformer. Instead of performing a single attention function over the entire hidden dimension, MHA splits the queries, keys, and values into multiple "heads," allowing the model to attend to information from different representation subspaces simultaneously.
+
+Code example:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads # Dimension per head
+        
+        # Linear layers to project input into Q, K, and V
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        self.w_o = nn.Linear(d_model, d_model) # Final output projection
+
+    def forward(self, q, k, v, mask=None):
+        batch_size = q.size(0)
+        
+        # 1. Linear projection & Split into heads
+        # Shape change: (batch, seq, d_model) -> (batch, num_heads, seq, d_k)
+        q = self.w_q(q).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        k = self.w_k(k).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.w_v(v).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+
+        # 2. Scaled Dot-Product Attention
+        # Score = (Q * K^T) / sqrt(d_k)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask == 0, -1e9) # Block illegal tokens
+        
+        attn_weights = F.softmax(attn_scores, dim=-1) # Normalize to probabilities
+        output = torch.matmul(attn_weights, v) # Weighted sum of Values
+
+        # 3. Concatenate heads back together
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.d_k)
+        
+        return self.w_o(output) # Final linear layer
+```
+
+**Advantages**
+- Multi-faceted Learning: Captures different types of relationships (e.g., syntax vs. semantics) in parallel.
+  
+- High Computational Efficiency: Multi-head also allows different attention heads to perform calculations simultaneously.
+
+**Disadvantages**
+- High Memory Usage: The $O(N^2)$ complexity relative to sequence length makes it memory-intensive.
+
+- Inference Bottleneck: During generation, loading $K$ and $V$ tensors for every head slows down throughput.
+
+## 1.4.2 Multi-Query Attention (MQA)
+
+Multi-Query Attention (MQA) is an optimization of the standard Multi-Head Attention (MHA) designed to significantly speed up inference and reduce memory overhead. While MHA gives each query head its own dedicated Key ($K$) and Value ($V$) head, MQA uses a single Key and Value head that is shared across all Query heads. MQA is adopted by PaLM, StarCoder, and Gemini.
+
+In a standard Transformer, $Q, K, \text{ and } V$ all have the same number of heads. In MQA, the input is projected into multiple Query heads (just like MHA). However, the input is projected into only one Key head and one Value head. All Query heads perform their attention calculation against that same shared $K$ and $V$ pair.
+
+$$\text{Attention}(Q_i, K, V) = \text{softmax}\left(\frac{Q_i K^T}{\sqrt{d_k}}\right)V$$
+
+Code example:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiQueryAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        
+        # MQA: Multiple Query projections
+        self.w_q = nn.Linear(d_model, d_model)
+        
+        # MQA: Only ONE Key and ONE Value projection for all heads
+        self.w_k = nn.Linear(d_model, self.d_k)
+        self.w_v = nn.Linear(d_model, self.d_k)
+        
+        self.w_o = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        
+        # Q: (batch, num_heads, seq, d_k)
+        q = self.w_q(x).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        
+        # K, V: (batch, 1, seq, d_k) - Notice the '1' head
+        k = self.w_k(x).view(batch_size, seq_len, 1, self.d_k).transpose(1, 2)
+        v = self.w_v(x).view(batch_size, seq_len, 1, self.d_k).transpose(1, 2)
+
+        # Scaled Dot-Product: K and V are automatically broadcasted across num_heads
+        # Q: (B, H, S, D) * K^T: (B, 1, D, S) -> Scores: (B, H, S, S)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        
+        # Output: (B, H, S, D)
+        output = torch.matmul(attn_weights, v)
+        
+        # Restore original shape
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.w_o(output)
+```
+
+**Advantages**
+- Increased Throughput: Allows for much larger batch sizes and faster decoding speeds.
+  
+- Drastic KV Cache Reduction: Dramatically reduces the memory needed to store the KV cache during generation.
+
+- Reduced Bandwidth: Lowers the amount of data moved from memory to the GPU/TPU cores.
+
+**Disadvantages**
+- Minor Accuracy Loss: Sharing keys/values across heads can slightly reduce the model's expressive power.
+  
+- Training Stability: Can sometimes be more sensitive during the initial training phases compared to MHA.
+
+## 1.4.2 Grouped-Query Attention (GQA)
+
+Grouped-Query Attention (GQA) is a hybrid attention mechanism introduced to strike a balance between the high performance of Multi-Head Attention (MHA) and the high efficiency of Multi-Query Attention (MQA).
+
+In GQA, query heads are divided into $G$ groups. Each group shares a single pair of Key ($K$) and Value ($V$) heads. The core attention operation remains the same, but the $K$ and $V$ matrices are "broadcasted" (repeated) to match the number of query heads in each group:
+
+$$\text{Attention}(Q_i, K_g, V_g) = \text{softmax}\left(\frac{Q_i K_g^T}{\sqrt{d_k}}\right)V_g$$
+
+In modern Large Language Models (LLMs) like Llama 3 or Mistral, the number of groups ($G$) is often set to 8 because it represents a "Goldilocks" sweet spot: it is just enough to save a massive amount of memory without significantly hurting the model's intelligence.
+
+Code example:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model, num_queries, num_kv_groups):
+        super().__init__()
+        self.num_queries = num_queries
+        self.num_kv = num_kv_groups
+        self.group_size = num_queries // num_kv_groups # Q heads per KV head
+        self.d_k = d_model // num_queries
+
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, num_kv_groups * self.d_k)
+        self.w_v = nn.Linear(d_model, num_kv_groups * self.d_k)
+        self.w_o = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        b, s, _ = x.shape
+        
+        # 1. Project and Reshape
+        q = self.w_q(x).view(b, s, self.num_queries, self.d_k).transpose(1, 2)
+        k = self.w_k(x).view(b, s, self.num_kv, self.d_k).transpose(1, 2)
+        v = self.w_v(x).view(b, s, self.num_kv, self.d_k).transpose(1, 2)
+
+        # 2. Repeat KV heads to match Q head count
+        # (b, num_kv, s, d_k) -> (b, num_queries, s, d_k)
+        k = torch.repeat_interleave(k, repeats=self.group_size, dim=1)
+        v = torch.repeat_interleave(v, repeats=self.group_size, dim=1)
+
+        # 3. Standard Attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+
+        # 4. Final Projection
+        out = out.transpose(1, 2).contiguous().view(b, s, -1)
+        return self.w_o(out)
+```
+
+**Advantages**
+- Efficient KV Cache: Reduces memory bandwidth and storage (e.g., an 8x reduction in KV cache size for Llama 2 70B).
+  
+- High Performance: Retains nearly the same accuracy and modeling quality as MHA.
+
+- Faster Inference: Significant speedups in autoregressive generation (TTFT and throughput).
+
+**Disadvantages**
+- Architectural Complexity: Slightly more complex to implement than MHA or MQA.
+
+## 1.4.3 Multi-head Latent Attention (MLA)
+
+## 1.4.4 Linear Attention
+
+## 1.4.5 Sparse Attention
