@@ -34,3 +34,9 @@
     * **1.3.6.4 Other Methods**
  
 **1.4 Attention**
+* **1.4.1 Multi-Head Attention (MHA)**
+* **1.4.2 Multi-Query Attention (MQA)**
+* **1.4.3 Grouped-Query Attention (GQA)**
+* **1.4.4 Multi-head Latent Attention (MLA)**
+* **1.4.5 Linear Attention**
+* **1.4.6 Sparse Attention**
