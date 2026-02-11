@@ -31,6 +31,6 @@
     * **1.3.6.1 NTK (Neural Tangent Kernel)**
     * **1.3.6.2 YaRN**
     * **1.3.6.3 Dual-Chunk Attention**
-    * **1.3.6.3 Other Methods**
+    * **1.3.6.4 Other Methods**
  
 **1.4 Attention**
