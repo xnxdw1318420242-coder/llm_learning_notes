@@ -1319,3 +1319,105 @@ Length extrapolation is difficult because models struggle with position values t
 As summarized in the table above, ALiBi and RoPE in general suit long sequence better. However, these two methods still have their limitation. While RoPE combines the benefits of absolute and relative encoding and maintains the "extrapolation" properties of sinusoidal methods, at extreme lengths, position information can "oscillate" or become blurry, making distant positions hard to distinguish. Therefore, RoPE is effective for long-text alignment but has specific limits. ALiBi is often considered stronger for extreme length extrapolation, because it does not suffer from "oscillation" and it captures relative relationships well even as sequences grow very long. But it is slightly more specialized and primarily used when long-sequence handling is the top priority.
 
 #### 1.3.6.1 NTK (Neural Tangent Kernel)
+
+In the context of length extrapolation, NTK acts as a tool to describe how a neural network's output changes relative to its input under the assumption of infinite width. It can be understood as a measure of similarity between inputs; specifically, it helps maintain a "smoothness" or similarity in the network's behavior even when the input sequence grows much longer than what was seen during training. "NTK-Aware" methods aim to adjust or "remap" position indices during inference so that the attention mechanism's behavior remains consistent with the distribution seen during training. Instead of using raw position indices that would result in massive, unfamiliar rotation angles, it applies non-linear scaling to ensure the "effective position" perceived by the model stays within its originally trained range.
+
+We need NTK-aware approaches to solve the fundamental breakdown that occurs during long-sequence inference. Without it, a model trained on length $T_{train}$ encounters rotation angles at position $T_{test}$ that are far larger than anything it "saw" during training. This leads to a severe drop in performance because the model cannot interpolate these new, extreme values. 
+
+By keeping the effective position within the trained boundaries, NTK-aware methods allow the model to generalize its understanding to extremely long sequences without requiring the massive computational cost of training on those lengths from scratch.
+
+- Linear Scaling: This is the simplest form of remapping. It compresses the entire target sequence length ($T_{test}$) into the original training length ($T_{train}$) using a constant ratio. When the current position $p$ reaches the new maximum ($T_{test}$), the output $f(p)$ perfectly equals the original maximum ($T_{train}$). While easy to implement and ensures rotation angles never exceed training limits, it is often sub-optimal because it shifts the distribution of all intermediate positions uniformly. Also, linear interpolation causes a significant drop in numerical precision, particularly for the smaller integer components of a position.
+
+$$f(p) = p \cdot \frac{T_{train}}{T_{test}}$$
+
+- Power/Logarithmic Function Scaling: These methods use non-linear functions to prioritize certain parts of the sequence, often growing faster at the start and slower at the end (or vice versa). By using functions like $ln(p+1)$ or $p^{\alpha}$, the model can apply different "compression rates" to different parts of the sequence. The goal is to keep position differences locally distinct while compressing them more aggressively at a global scale. This helps maintain NTK consistency—the similarity in attention patterns—across a much larger range of positions compared to simple linear scaling.
+
+- Multi-Head (Frequency-Specific) Scaling: This is a more sophisticated approach that applies different scaling factors to different attention heads or frequency "bands." In RoPE, different dimensions correspond to different rotation "frequencies." More complex methods apply unique scaling coefficients to each $i$-th attention head. This allows the model to be more flexible, perhaps keeping high-frequency heads (local detail) sharp while stretching low-frequency heads (global structure) to handle the longer context.
+
+Not all data and tasks are sensitive to "NTK-Aware" methods. However, if your application truly requires an ultra-long context and has strong attention dependencies in the later stages of the sequence, NTK-Aware is almost a mandatory choice. Advanced implementations use different scaling coefficients for different attention heads. This is common in some large models (where different extrapolation strategies are set for different frequency $\theta_i$), allowing the model to balance local and global attention patterns effectively.
+
+**Advantages**
+- Model Integrity: It allows for window extension without changing the model's underlying parameters or architecture, meaning it does not negatively impact a model that has already been well-trained.
+  
+- Theoretical Control: The methods have clear theoretical support, making the interpolation process controllable and predictable.
+  
+- Deployment Efficiency: It is an ideal solution for a rapid "context window upgrade" before a model is deployed.
+
+**Disadvantages**
+- Structural Compatibility: These methods have specific requirements regarding the NTK properties of the model; consequently, they cannot be used with all types of model architectures.
+
+- Risk of Boundary Effects: If the interpolation method is not handled correctly, it can result in "boundary effects," such as weakening the model's ability to handle extreme long-distance dependencies.
+
+- Limited Fine-tuning Range: In practice, there is very little room for adjustment; it is viewed primarily as a "fine-tuning" tool rather than a major structural change.
+
+#### 1.3.6.2 YaRN
+YaRN (Yet Another RoPE Extension) is an advanced upgrade for Rotary Positional Embedding (RoPE) designed to solve the "performance crash" that standard RoPE experiences when dealing with ultra-long sequences. 
+
+Standard RoPE is highly stable for short sequences, but as length increases, it suffers from several issues. Long sequences push trigonometric functions into new cycles, making originally clear position information blurry. Different positions may be confused due to periodic repetition, preventing the model from accurately distinguishing relationships between distant tokens. These issues cause massive fluctuations in attention scores, leading to a significant drop in generation quality. YaRN acts as a "patch" or upgrade to fix these specific problems and allow models to handle much longer contexts reliably.
+
+- Dynamic Interval Stretching: YaRN dynamically adjusts the spacing between positional encodings based on the actual sequence length to prevent the model from entering a "new cycle" of trigonometric values that it hasn't seen before. 
+
+- NTK-by-parts (Segmented Encoding): YaRN realizes that different dimensions of the embedding represent different wavelengths. It treats "high-frequency" and "low-frequency" components differently to balance local and global consistency. High-frequency dimensions are not interpolated; instead, they are only slightly extrapolated to maintain local stability. Low-frequency dimensions undergo standard interpolation to ensure global consistency across the entire long sequence. This "divided" approach prevents high-frequency dimensions from becoming too "crowded" while allowing low-frequency ones to transition smoothly.
+
+- Global Normalization (Temperature Adjustment): When calculating attention scores, YaRN introduces a temperature parameter $t$ to modify the softmax distribution of the logits. The temperature $t$ regulates the flatness of the attention distribution, which helps control the stability and randomness of the generated content. Simultaneously, the Query ($q$) and Key ($k$) embeddings are scaled by a factor of $\sqrt{1/t}$. This allows the model to better balance local and global information regardless of whether the sequence is short or long.
+
+$$\text{softmax}\left(\frac{q_m^T k_n}{t\sqrt{d_k}}\right)$$
+
+YaRN provides a significant upgrade to the model's capabilities with virtually no extra computational cost for either inference or training. The RoPE embeddings used in YaRN are pre-generated, allowing them to be reused across different tasks without recalculation. The core logic—specifically Dynamic Interval Stretching and Segmented Encoding (NTK-by-parts)—is processed in linear time, making it exceptionally fast. For popular models like the LLaMA series (LLaMA1 and LLaMA2), YaRN provides a specific formula to find the ideal scaling factor ($s$) for context expansion, which allows the model to maintain the best possible scaling ratio across varying context lengths:
+
+$$\sqrt{1/t} = 0.1 \ln(s) + 1$$
+
+**Advantages**
+- Minimal Implementation Cost: YaRN requires very small changes to the model.
+  
+- High Computational Efficiency: The position embeddings are generated in advance and can be reused. Additionally, the logic for dynamic stretching and segmented encoding operates in linear time, ensuring high performance.
+  
+
+**Disadvantages**
+- Implementation Complexity: To use YaRN, developers must manually rewrite the specific parts of the code responsible for RoPE.
+  
+#### 1.3.6.3 Dual-Chunk Attention
+
+Dual-Chunk Attention is a technique designed to handle long sequences efficiently by dividing the input into two distinct types of chunks: Local Chunks and Global Chunks. It aims to balance the need for fine-grained local detail with the necessity of broad global context, preventing the "blurriness" often seen in standard long-context methods. To implement Dual-Chunk Attention:
+
+1. Segment the Input Sequence: Divide the entire sequence into fixed-size blocks or chunks. This allows the model to process information in manageable units rather than one massive, computationally expensive block.
+
+2. Apply Local Attention: Within each chunk, compute standard self-attention. This ensures that tokens can interact closely with their immediate neighbors to capture high-frequency, precise information.
+
+3. Establish Global Connectivity: Select specific tokens (often the first token of each chunk or a compressed summary) to act as "global anchors." These anchors attend to each other across the entire sequence length, allowing information to flow between distant chunks.
+
+4. Integrate Positional Scaling (YaRN/NTK): Apply scaling strategies like YaRN or NTK-aware interpolation to the positional encodings within these chunks. Use different scaling factors for the local and global components to ensure that local detail remains sharp while global positioning stays stable.
+
+5. Global Normalization: Adjust the attention scores using temperature scaling to ensure the softmax distribution remains numerically stable across the combined local and global attention results.
+
+**Advantages**
+- High Computational Efficiency: It offers higher calculation efficiency, leading to a significant reduction in overall Attention complexity.
+  
+- Ultra-Long Context Support: Theoretically, there is no limit to the sequence length it can support, allowing for extremely long context processing.
+
+- Strong Flexibility: It is highly adaptable, as parameters like chunk size and structure can be dynamically adjusted based on the specific task requirements.
+
+**Disadvantages**
+- Major Structural Changes: Implementing this method requires significant modifications to the model architecture.
+
+- Risk to Global Understanding: If the strategy for connecting different chunks is poorly designed, it can severely impair the model's ability to maintain a global understanding of the sequence.
+
+- Hyperparameter Sensitivity: Chunk size, step length, or connection density.
+
+#### 1.3.6.4 Other Methods
+
+- Base-conversion: The core idea is to use a larger base to represent more information within the same number of dimensions. Models are naturally good at generalizing relationships rather than just memorizing exact digits. Even if a value exceeds the training range, the model can still understand relative magnitudes because it focuses on relative patterns rather than strict numerical limits. This method is more concise than adding more dimensions. It avoids the need for retraining or structural changes, solving range expansion issues without causing the model to collapse due to increased complexity.
+
+- Linear Attention: This method aims to reduce the quadratic computational complexity of standard attention to linear complexity. While it allows for processing extremely long sequences efficiently, it often comes at the cost of reduced expressive power compared to traditional Softmax attention.
+
+- Recurrent Chunking & Memory Tokens: This approach enables the model to maintain a "notebook" or summary of previous blocks of text. By passing compressed summaries (memory tokens) from one chunk to the next, the model can retain a persistent state of past information without needing the full context window.
+
+- Transformer-XL & Compressive Transformer: These architectures utilize recurrence and caching mechanisms to preserve memory across different segments. By storing previous hidden states in a cache, the model can attend to information outside its immediate window, effectively creating a longer "functional" memory.
+
+- Sliding Windows & Model Fusion (e.g., Longformer): This hybrid strategy combines local "fine-grained" reading with global perception. It uses a sliding window for immediate local context and specific global attention patterns to capture the broader structure of the document.
+
+- Architectural Outsourcing (Retrieval-Augmented Generation): Rather than trying to "remember" everything internally, this method externalizes memory. The model solves long-document problems by querying external databases or documents and retrieving relevant information only when needed.
+
+## 1.4 Attention
+
+Since there is an abundance of resources available on the topic of Attention, we will not repeat the basics of standard mechanisms here. Instead, this entry will focus on documenting and exploring some discussions in the field.
