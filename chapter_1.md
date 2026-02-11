@@ -1603,7 +1603,7 @@ class MultiQueryAttention(nn.Module):
   
 - Training Stability: Can sometimes be more sensitive during the initial training phases compared to MHA.
 
-## 1.4.2 Grouped-Query Attention (GQA)
+## 1.4.3 Grouped-Query Attention (GQA)
 
 Grouped-Query Attention (GQA) is a hybrid attention mechanism introduced to strike a balance between the high performance of Multi-Head Attention (MHA) and the high efficiency of Multi-Query Attention (MQA).
 
@@ -1665,8 +1665,8 @@ class GroupedQueryAttention(nn.Module):
 **Disadvantages**
 - Architectural Complexity: Slightly more complex to implement than MHA or MQA.
 
-## 1.4.3 Multi-head Latent Attention (MLA)
+## 1.4.4 Multi-head Latent Attention (MLA)
 
-## 1.4.4 Linear Attention
+## 1.4.5 Linear Attention
 
-## 1.4.5 Sparse Attention
+## 1.4.6 Sparse Attention
