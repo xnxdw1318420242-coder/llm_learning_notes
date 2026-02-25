@@ -1482,7 +1482,7 @@ In Transformer architectures, attention mechanisms have evolved to balance perfo
 
 </p>
 
-## 1.4.1 Multi-Head Attention (MHA)
+### 1.4.1 Multi-Head Attention (MHA)
 
 Multi-Head Attention (MHA) is the core architectural component of the Transformer. Instead of performing a single attention function over the entire hidden dimension, MHA splits the queries, keys, and values into multiple "heads," allowing the model to attend to information from different representation subspaces simultaneously.
 
@@ -1539,7 +1539,7 @@ class MultiHeadAttention(nn.Module):
 
 - Inference Bottleneck: During generation, loading $K$ and $V$ tensors for every head slows down throughput.
 
-## 1.4.2 Multi-Query Attention (MQA)
+### 1.4.2 Multi-Query Attention (MQA)
 
 Multi-Query Attention (MQA) is an optimization of the standard Multi-Head Attention (MHA) designed to significantly speed up inference and reduce memory overhead. While MHA gives each query head its own dedicated Key ($K$) and Value ($V$) head, MQA uses a single Key and Value head that is shared across all Query heads. MQA is adopted by PaLM, StarCoder, and Gemini.
 
@@ -1603,7 +1603,7 @@ class MultiQueryAttention(nn.Module):
   
 - Training Stability: Can sometimes be more sensitive during the initial training phases compared to MHA.
 
-## 1.4.3 Grouped-Query Attention (GQA)
+### 1.4.3 Grouped-Query Attention (GQA)
 
 Grouped-Query Attention (GQA) is a hybrid attention mechanism introduced to strike a balance between the high performance of Multi-Head Attention (MHA) and the high efficiency of Multi-Query Attention (MQA).
 
@@ -1665,7 +1665,7 @@ class GroupedQueryAttention(nn.Module):
 **Disadvantages**
 - Architectural Complexity: Slightly more complex to implement than MHA or MQA.
 
-## 1.4.4 Multi-head Latent Attention (MLA)
+### 1.4.4 Multi-head Latent Attention (MLA)
 In multi-head attention, to generate new tokens, the model must store the Keys ($K$) and Values ($V$) of all previous tokens to avoid recomputing them at every step. For every individual token $i$, the model must store vectors $k_i^{(h)}$ and $v_i^{(h)}$. The total storage required per token is $2 \times n_h \times d_h$. As the number of tokens (context length) increases, the KV Cache grows significantly, leading to massive memory consumption. 
 
 **Multi-Head Latent Attention (MLA)** is a novel attention mechanism introduced by DeepSeek (specifically in the DeepSeek-V3 and-V2 architectures). It is designed to solve a major bottleneck in Transformer models: the massive memory footprint of the Key-Value (KV) cache during inference. MLA drastically reduces memory usage by introducing Low-Rank Compression. Instead of caching the full Key and Value vectors, it caches a small, compressed "latent" vector.
@@ -1793,7 +1793,7 @@ Memory is typically represented as a matrix $M \in \mathbb{R}^{N \times d}$, whe
 - $N$ (Slots): The number of rows, representing distinct "storage locations" or "slots."
 - $d$ (Dimension): The size of the vector stored in each slot, which captures a compressed representation of information.
 
-## 1.4.5 Linear Attention
+### 1.4.5 Linear Attention
 
 Standard Softmax Attention has a computational complexity of $O(L^2)$, where $L$ is the sequence length. This is because every token must attend to every other token. **Linear Attention** aims to achieve $O(L)$ complexity, meaning the cost grows linearly with the length of the input.
 
@@ -1815,7 +1815,7 @@ $$\text{head}_i \approx \frac{\phi(Q_i)\Phi}{\phi(Q_i)z}$$
 $z$ is used here as a normalization factor to ensure the values stay stable, similar to the denominator in standard Softmax.
 4. All individual token outputs are concatenated or stacked together, resulting in a final output similar to traditional Multi-Head Attention but computed much faster.
 
-## 1.4.6 Sparse Attention
+### 1.4.6 Sparse Attention
 **Sparse Attention** is a technique designed to reduce the computational complexity of the standard Transformer's self-attention mechanism from quadratic $O(L^2)$ to something more manageable, such as $O(L\sqrt{L})$ or $O(L \log L)$, where $L$ is the sequence length. It optimizes this by pre-defining a "sparsity pattern." Instead of calculating all $L^2$ interactions, each token only attends to a small subset of "important" tokens. Common patterns include:
 - Local/Sliding Window: Tokens only attend to their immediate neighbors.
 - Global Tokens: A few specific tokens (like the [CLS] token) attend to everyone, and everyone attends to them, acting as "hubs" for information flow.
@@ -1832,6 +1832,8 @@ In practice, instead of multiplying the full $Q$ and $K^\top$ and then applying 
 
 Sparse attention is a go-to solution for scenarios where standard Transformers hit their memory limits. It is primarily used in long-form NLP tasks and massive sequence modeling.
 
+### 1.4.7 Mask
+
 ## 1.5 FFN (Feed-Forward Network)
 
 In a Transformer architecture, the Feed-Forward Network (FFN)—also known as the Position-wise Feed-Forward Network—is a crucial component that follows the Multi-Head Attention layer in every Transformer block. While the attention layer helps tokens "communicate" with each other, the FFN is where the model processes each token's information independently to learn higher-level representations. Its primary role is to increase model capacity by projecting the data into a higher-dimensional space (usually 4x the model dimension) to perform complex non-linear transformations, and to apply non-linearity. The classic formula is:
@@ -1840,8 +1842,28 @@ $$\text{FFN}(x) = \text{Activation}(xW_1) \cdot W_2$$
 
 In modern architectures (like Llama or DeepSeek), the activation function often uses SwiGLU or GELU.
 
-### 1.5.1 Activation Function
+Code example:
+```python
+import torch
+import torch.nn as nn
 
-### 1.5.2 Normalization
+class TransformerFFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        # The first linear layer projects to a higher-dimensional space (Expansion)
+        # Traditionally d_ff = 4 * d_model
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.relu = nn.ReLU()
+        self.w_2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        # Formula: FFN(x) = ReLU(xW1 + b1)W2 + b2
+        x = self.w_1(x)
+        x = self.relu(x)
+        x = self.w_2(x)
+        
+        return x
+```
+
+### 1.6 Normalization
  
-### 1.5.3 Mask
