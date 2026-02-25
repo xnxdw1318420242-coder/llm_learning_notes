@@ -1666,7 +1666,168 @@ class GroupedQueryAttention(nn.Module):
 - Architectural Complexity: Slightly more complex to implement than MHA or MQA.
 
 ## 1.4.4 Multi-head Latent Attention (MLA)
+In multi-head attention, to generate new tokens, the model must store the Keys ($K$) and Values ($V$) of all previous tokens to avoid recomputing them at every step. For every individual token $i$, the model must store vectors $k_i^{(h)}$ and $v_i^{(h)}$. The total storage required per token is $2 \times n_h \times d_h$. As the number of tokens (context length) increases, the KV Cache grows significantly, leading to massive memory consumption. 
+
+**Multi-Head Latent Attention (MLA)** is a novel attention mechanism introduced by DeepSeek (specifically in the DeepSeek-V3 and-V2 architectures). It is designed to solve a major bottleneck in Transformer models: the massive memory footprint of the Key-Value (KV) cache during inference. MLA drastically reduces memory usage by introducing Low-Rank Compression. Instead of caching the full Key and Value vectors, it caches a small, compressed "latent" vector.
+
+Instead of projecting directly to heads, the input $x_i$ is first compressed into a low-dimensional latent vector $c_i$:
+
+$$c_i = W_c x_i \in \mathbb{R}^{d_c}$$
+
+Here, $d_c$ (the latent dimension) is much smaller than the total dimension used in MHA.
+
+When needed, the model "up-samples" this compressed vector $c_i$ to generate unique Keys and Values for each head $h$:
+
+$$k_i^{(h)} = U_k^{(h)} c_i, \quad v_i^{(h)} = U_v^{(h)} c_i$$
+
+Unlike Grouped-Query Attention (GQA) which simply copies values, MLA uses unique matrices $U_k^{(h)}$ and $U_v^{(h)}$ for each head. This allows each head to have different information, matching or exceeding the expressive power of traditional MHA.
+
+During the inference stage, MLA only caches the compressed latent vector ($c_i$). The model uses "up-projection" matrices ($U_k^{(h)}$) to restore the necessary Keys and Values only when calculating the attention score for the current token. To save even more time, the up-projection matrix $U_k^{(h)}$ can be mathematically "absorbed" into the Query ($q_t^{(h)}$) projection. This trick removes the need to repeatedly compute $k_j^{(h)}$ for every past token, significantly reducing computational overhead and memory bandwidth consumption.
+
+Rotary Positional Embeddings (RoPE) are used to help the model understand the order of tokens. However, standard RoPE is mathematically incompatible with low-rank latent compression. MLA solves this by "decoupling" the Key into two specialized parts: A compressed portion that carries the "meaning" of the token and benefits from latent caching, and a separate branch dedicated specifically to carrying positional information via RoPE:
+
+$$k_t^{(h)} = [k_t^{(h), C}; \text{RoPE}(U_k^{(h), R} x_t)]$$
+
+By concatenating these two parts, the model retains the benefits of RoPE while still utilizing the memory-saving advantages of the low-rank latent cache. While the extra RoPE branch slightly increases computation compared to a "pure" compressed model, it is still much smaller and more efficient than a full MHA model.
+
+Inference is composed of prefill and generation. In the prefill stage, MLA requires additional "up-sampling" transformations to calculate the Keys and Values. Consequently, the total amount of computation is slightly higher than Grouped-Query Attention (GQA). Despite the extra math, the KV Cache remains small, which reduces the pressure on memory bandwidth. Compared to traditional Multi-Head Attention (MHA), the prefill speed is generally comparable or even superior because the reduced data movement offsets the extra calculation. In the generation stage, every time a new token is generated, the model must read and write past Keys and Values. Because MLA's cache is significantly smaller, the bandwidth overhead is much lower. The generation speed is significantly faster because the bottleneck—moving large amounts of data from memory to the processor—is removed.
+
+Code example:
+```python
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_head: int,
+        d_latent: int,      # Compressed dimension (d_c)
+        d_rope: int,        # Dimension for the decoupled RoPE branch
+    ):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_latent = d_latent
+        self.d_rope = d_rope
+        self.scale = (d_head + d_rope) ** -0.5
+
+        # 1. Low-Rank Compression: Input -> Latent Vector (c_i)
+        self.project_c = nn.Linear(d_model, d_latent, bias=False)
+        
+        # 2. Up-projection: Latent -> Heads (Keys and Values)
+        # Restores the full head dimensions from the compressed latent vector
+        self.up_project_kv = nn.Linear(d_latent, n_heads * (d_head + d_rope), bias=False)
+        
+        # 3. Query Projection (Includes both content and RoPE branches)
+        self.project_q = nn.Linear(d_model, n_heads * (d_head + d_rope), bias=False)
+        
+        # 4. Final Output Projection
+        self.project_out = nn.Linear(n_heads * d_head, d_model, bias=False)
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        cos: torch.Tensor, 
+        sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[torch.Tensor] = None
+    ):
+        batch_size, seq_len, _ = x.shape
+
+        # --- STEP 1: Generate Latent Vector (Compression) ---
+        # c_i = W_c * x_i
+        latent_c = self.project_c(x) 
+        
+        # --- STEP 2: Inference Caching Logic ---
+        # Instead of caching all heads, we only cache the latent vector
+        if kv_cache is not None:
+            latent_c = torch.cat([kv_cache, latent_c], dim=1)
+        
+        # --- STEP 3: Up-sample to Heads ---
+        # k_i = U_k * c_i, v_i = U_v * c_i
+        kv = self.up_project_kv(latent_c) 
+        kv = kv.view(batch_size, -1, self.n_heads, self.d_head + self.d_rope)
+        kv = kv.transpose(1, 2) # [B, H, S, d_head + d_rope]
+        
+        # Split into Content and RoPE branches (Decoupled RoPE)
+        k_content, k_rope = kv.split([self.d_head, self.d_rope], dim=-1)
+        v_content = kv[..., :self.d_head] # Values only use the content branch
+
+        # --- STEP 4: Query Processing ---
+        q = self.project_q(x).view(batch_size, seq_len, self.n_heads, -1).transpose(1, 2)
+        q_content, q_rope = q.split([self.d_head, self.d_rope], dim=-1)
+
+        # --- STEP 5: Apply Decoupled RoPE ---
+        # Apply RoPE only to the positional branch to maintain compression
+        q_rope = apply_rope(q_rope, cos, sin)
+        k_rope = apply_rope(k_rope, cos, sin)
+
+        # Re-combine branches for score calculation
+        q_final = torch.cat([q_content, q_rope], dim=-1)
+        k_final = torch.cat([k_content, k_rope], dim=-1)
+
+        # --- STEP 6: Attention Calculation ---
+        attn_scores = torch.matmul(q_final, k_final.transpose(-1, -2)) * self.scale
+        
+        if mask is not None:
+            attn_scores += mask
+            
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        
+        # Weighted sum of values
+        out = torch.matmul(attn_weights, v_content) 
+        
+        # --- STEP 7: Final Projection ---
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.project_out(out), latent_c
+```
+
+This approach is quite cutting-edge and deviates from the standard Transformer architecture. While it isn't the mainstream method yet, you'll often encounter it in advanced Reinforcement Learning environments or complex multimodal systems—examples include the Perceiver or Memory-Augmented Transformers.
+
+The Perceiver architecture uses a fixed-size latent array to solve the scalability issues of standard Transformers when dealing with high-dimensional inputs (like images, audio, or large point clouds). Instead of performing self-attention on the massive input data itself, which is computationally expensive, the Perceiver uses a Cross-Attention mechanism to bridge the gap:
+- The model initializes a small, learned latent array (a set of vectors). This array acts as the Query ($Q$).
+- The raw, high-dimensional input (e.g., millions of pixels) serves as the Key ($K$) and Value ($V$).
+- During cross-attention, the small latent array "probes" the large input to extract the most relevant information. This compresses the input's complexity into the compact latent space.
+
+In Memory-Augmented Transformers (like Memformer, RMT, or DNC), memory is organized into memory slots, which act as a structured "notebook" or "external RAM" that the model can interact with independently of the main sequence processing.
+Memory is typically represented as a matrix $M \in \mathbb{R}^{N \times d}$, where:
+- $N$ (Slots): The number of rows, representing distinct "storage locations" or "slots."
+- $d$ (Dimension): The size of the vector stored in each slot, which captures a compressed representation of information.
 
 ## 1.4.5 Linear Attention
 
+Standard Softmax Attention has a computational complexity of $O(L^2)$, where $L$ is the sequence length. This is because every token must attend to every other token. **Linear Attention** aims to achieve $O(L)$ complexity, meaning the cost grows linearly with the length of the input.
+
+The "secret" of linear attention is the Associative Property of matrix multiplication. In standard attention, we calculate the similarity between all Queries ($Q$) and Keys ($K$) first, creating a massive $L \times L$ matrix. Linear attention uses a kernel function $\phi(\cdot)$ to decompose the attention score so that we can multiply $K$ and $V$ before involving $Q$:
+
+$$\text{Attention}(Q, K, V) = \frac{\phi(Q) \left( \phi(K)^\top V \right)}{\phi(Q) \sum \phi(K)^\top}$$
+
+By calculating $(\phi(K)^\top V)$ first, we create a fixed-size matrix (determined by the model's hidden dimension, not the sequence length). This result is then multiplied by $\phi(Q)$.
+
+Choosing the right kernel determines how well the model "remembers" information and how stable the training will be. The Performer uses a method called FAVOR+ (Fast Attention Via Positive Orthogonal Random features). It is designed to be a mathematically unbiased approximation of the standard Softmax attention. One of the earliest and simplest approaches (by Katharopoulos et al.) simplifies the attention mechanism by removing the exponential term entirely. Some models, such as the Cosformer, use the similarity of angles rather than dot products to stabilize the linear mapping. Learnable kernel functions are another approach.
+
+Take the Performer as an example, the process works as follows:
+1. The input sequence $x_1, x_2, \dots, x_n$ is projected into standard Query ($Q$), Key ($K$), and Value ($V$) matrices.
+2. The model transforms the Keys using the kernel $\phi(K)$ and multiplies them with the Values to create a "Global Context" matrix $\Phi$:
+$$\Phi = \phi(K)^\top V$$
+This creates a fixed-size matrix that doesn't grow with the sequence length.
+3. To find the output for any specific token $i$, the model simply takes its kernel-transformed Query $\phi(Q_i)$ and multiplies it by the pre-aggregated $\Phi$:
+$$\text{head}_i \approx \frac{\phi(Q_i)\Phi}{\phi(Q_i)z}$$
+$z$ is used here as a normalization factor to ensure the values stay stable, similar to the denominator in standard Softmax.
+4. All individual token outputs are concatenated or stacked together, resulting in a final output similar to traditional Multi-Head Attention but computed much faster.
+
 ## 1.4.6 Sparse Attention
+**Sparse Attention** is a technique designed to reduce the computational complexity of the standard Transformer's self-attention mechanism from quadratic $O(L^2)$ to something more manageable, such as $O(L\sqrt{L})$ or $O(L \log L)$, where $L$ is the sequence length. It optimizes this by pre-defining a "sparsity pattern." Instead of calculating all $L^2$ interactions, each token only attends to a small subset of "important" tokens. Common patterns include:
+- Local/Sliding Window: Tokens only attend to their immediate neighbors.
+- Global Tokens: A few specific tokens (like the [CLS] token) attend to everyone, and everyone attends to them, acting as "hubs" for information flow.
+- Tokens attend to others at fixed intervals (e.g., every 2nd or 4th token) to capture a wider context without the full cost.
+- Random: Tokens attend to a few random locations to allow for unexpected long-range connections.
+
+The general formula for a single head in Sparse Attention is a modification of the Scaled Dot-Product Attention:
+
+$$\text{SparseAttention}(Q, K, V) = \text{Softmax}\left(\frac{QK^\top \odot S}{\sqrt{d_h}}\right)V$$
+
+$S$ is a Binary Mask Matrix: This is the "Sparse" component. $S_{ij} = 1$ if token $i$ is allowed to attend to token $j$. $S_{ij} = 0$ if the connection is prohibited.
+
+In practice, instead of multiplying the full $Q$ and $K^\top$ and then applying a mask, optimized kernels (like those in FlashAttention or BigBird) only compute the dot products where $S_{ij} = 1$. This significantly reduces the memory and time spent on the $QK^\top$ calculation.
+
+Sparse attention is a go-to solution for scenarios where standard Transformers hit their memory limits. It is primarily used in long-form NLP tasks and massive sequence modeling.
