@@ -1831,3 +1831,17 @@ $S$ is a Binary Mask Matrix: This is the "Sparse" component. $S_{ij} = 1$ if tok
 In practice, instead of multiplying the full $Q$ and $K^\top$ and then applying a mask, optimized kernels (like those in FlashAttention or BigBird) only compute the dot products where $S_{ij} = 1$. This significantly reduces the memory and time spent on the $QK^\top$ calculation.
 
 Sparse attention is a go-to solution for scenarios where standard Transformers hit their memory limits. It is primarily used in long-form NLP tasks and massive sequence modeling.
+
+## 1.5 FFN (Feed-Forward Network)
+
+In a Transformer architecture, the Feed-Forward Network (FFN)—also known as the Position-wise Feed-Forward Network—is a crucial component that follows the Multi-Head Attention layer in every Transformer block. While the attention layer helps tokens "communicate" with each other, the FFN is where the model processes each token's information independently to learn higher-level representations. Its primary role is to increase model capacity by projecting the data into a higher-dimensional space (usually 4x the model dimension) to perform complex non-linear transformations, and to apply non-linearity. The classic formula is:
+
+$$\text{FFN}(x) = \text{Activation}(xW_1) \cdot W_2$$
+
+In modern architectures (like Llama or DeepSeek), the activation function often uses SwiGLU or GELU.
+
+### 1.5.1 Activation Function
+
+### 1.5.2 Normalization
+ 
+### 1.5.3 Mask
