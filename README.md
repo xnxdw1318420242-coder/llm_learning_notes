@@ -40,3 +40,10 @@
 * **1.4.4 Multi-head Latent Attention (MLA)**
 * **1.4.5 Linear Attention**
 * **1.4.6 Sparse Attention**
+* **1.4.7 Mask**
+    * **1.4.7.1 Padding Mask**
+    * **1.4.7.2 Casual Mask**
+    * **1.4.7.3 MLM (Masked Language Model) Mask**
+ 
+**1.5 FFN (Feed-Forward Network)**
+* **1.5.1 ReLU**
