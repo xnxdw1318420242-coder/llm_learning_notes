@@ -1830,9 +1830,55 @@ $S$ is a Binary Mask Matrix: This is the "Sparse" component. $S_{ij} = 1$ if tok
 
 In practice, instead of multiplying the full $Q$ and $K^\top$ and then applying a mask, optimized kernels (like those in FlashAttention or BigBird) only compute the dot products where $S_{ij} = 1$. This significantly reduces the memory and time spent on the $QK^\top$ calculation.
 
-Sparse attention is a go-to solution for scenarios where standard Transformers hit their memory limits. It is primarily used in long-form NLP tasks and massive sequence modeling.
+Sparse attention is a go-to solution for scenarios where standard Transformers hit their memory limits. It is primarily used in long-form NLP tasks and massive sequence modeling. A Causal Mask (or Look-ahead Mask) hides all future tokens.
 
 ### 1.4.7 Mask
+
+In Large Language Models (LLMs), "masking" is a mathematical constraint that tells the model which parts of the data it should ignore. There are three primary reasons why we need masks.
+1. Most LLMs (like GPT) are autoregressive, meaning they predict the next word based on previous ones. During training, we give the model an entire sentence at once to be efficient.
+
+2. Computers process data in "batches" for speed. For a batch to work, every sentence in that batch must be the same length. A Padding Mask tells the model to give these tokens zero "attention," effectively making them invisible during calculations.
+
+3. For models like BERT, masking is the actual learning objective. We randomly hide (mask) about 15% of the words in a sentence. The model is then forced to use the surrounding context from both the left and the right to guess what the missing word was.
+
+Before Softmax, the Attention mechanism calculates "scores" (logits) that represent how much one word should focus on another. At this stage, the scores can be any real number. To "hide" a token, we don't just set its score to zero. If we used $0$, the Softmax function would still assign it a small probability. Instead, we apply a mask by adding a very large negative number (effectively $-\infty$) to the scores of the tokens we want to ignore. 
+
+$$Score_{masked} = Score_{original} + Mask$$
+
+Where the mask value is: 
+- 0 for tokens we want to keep.
+- -1e9 (or $-\infty$) for tokens we want to hide.
+
+The Softmax function calculates the probability $P_i$ for an element $x_i$ using the exponential:
+
+$$P_i = \frac{e^{x_i}}{\sum e^{x_j}}$$
+
+Because $e^{-\infty}$ approaches 0, the "masked" tokens are mathematically nullified:
+
+- The Numerator: $e^{-1e9}$ becomes $0$.
+- The Denominator: Adding $0$ doesn't change the sum of the other probabilities.
+
+#### 1.4.7.1 Padding Mask
+
+A Padding Mask is a tool used to tell a transformer which parts of a data batch are "real" information and which parts are just "filler." Because GPUs process data in fixed-size blocks (batches), all sequences in a batch must be the same length. If Sentence A has 5 words and Sentence B has 10, we add 5 "PAD" tokens to Sentence A. The Padding Mask ensures the model ignores these empty slots during its internal calculations.
+
+Padding masks are used differently depending on where you are in the Transformer architecture, mainly self-Attention in the encoder, self-attention in the decoder and cross-attention.
+
+#### 1.4.7.2 Casual Mask
+
+A Causal Mask (also known as a Look-ahead Mask) is a mathematical constraint used in generative models like GPT to ensure the model only looks at the past and never at the "future."
+
+In a standard Transformer, every word can see every other word simultaneously. While this is great for understanding a sentence (Encoder), it’s "cheating" during generation (Decoder). The Causal Mask is a lower-triangular matrix applied to the attention scores before the Softmax layer. It is used in the self-attention in the decoder.
+
+#### 1.4.7.3 MLM (Masked Language Model) Mask
+
+Masked Language Modeling (MLM) is a technique used primarily in "Encoder-only" models like BERT. Unlike the Causal Mask (which hides the future), MLM hides specific words within a sentence to force the model to understand deep, bidirectional context.
+
+During the training phase, the model doesn't just predict the next word; it tries to reconstruct a corrupted version of the input. Approximately 15% of the tokens in a sequence are randomly chosen to be processed. Of those 15% chosen tokens, 80% are replaced with a special [MASK] token, 10% are replaced with a random word (to keep the model on its toes and prevent it from only focusing on [MASK]), and 10% are left unchanged (to bias the representation toward the actual observed word).
+
+Here we introduce two common variations of MLM mask. Both Span Masking and Permuted Language Modeling (XLNet) were developed to solve the "limitation of local context." While basic BERT-style masking is great, it often allows the model to guess a missing word using simple nearby hints. These advanced techniques make the "test" much harder, forcing the model to learn deeper relationships.
+
+Instead of masking individual, random words (like BERT), Span Masking hides contiguous chunks of text (spans). The model picks a random starting point and masks a sequence of $n$ tokens (e.g., "New York City"). XLNet was designed to combine the best of both worlds: the bidirectional context of BERT and the autoregressive (natural generation) style of GPT. Instead of using a [MASK] token (which the model never sees in the real world), XLNet shuffles the order in which it predicts words. For a sentence $[1, 2, 3, 4]$, XLNet might pick a random permutation like $[3, 2, 4, 1]$. The model predicts the words in that specific order. If it's predicting word $4$, it can "see" words $3$ and $2$ (because they came first in the shuffle), but it cannot see word $1$. Because the shuffle is random every time, word $4$ will eventually get to "see" every other word in the sentence across different training steps.
 
 ## 1.5 FFN (Feed-Forward Network)
 
@@ -1840,7 +1886,7 @@ In a Transformer architecture, the Feed-Forward Network (FFN)—also known as th
 
 $$\text{FFN}(x) = \text{Activation}(xW_1) \cdot W_2$$
 
-In modern architectures (like Llama or DeepSeek), the activation function often uses SwiGLU or GELU.
+In modern architectures (like Llama or DeepSeek), the activation function often uses SwiGLU or GELU. In a Feed-Forward Network (FFN), the activation function is the "magic ingredient" that allows the model to learn complex patterns. Without it, the entire Transformer architecture would collapse into a simple linear model. It can also limit the range of the output value as a classifier.
 
 Code example:
 ```python
@@ -1864,6 +1910,19 @@ class TransformerFFN(nn.Module):
         
         return x
 ```
+The design of linear projections (the weight matrices) directly determines the FFN's capacity and expressive power. Generally, a larger $d_{hidden}$ increases the model's ability to represent complex information, though it raises the computational cost. A common rule of thumb is $d_{hidden} = 4 \times d_{model}$. For example, in a base Transformer where the model dimension is 512, the hidden layer inside the FFN is typically 2048. 
 
-### 1.6 Normalization
+For large-scale models, the computational cost of linear projections becomes a significant bottleneck, especially when the hidden dimension ($d_{hidden}$) is much larger than the model dimension ($d_{model}$). To address this, several optimization strategies are used:
+
+1. Weight Sharing: In specific architectures, weight matrices can be shared across multiple layers to reduce the total parameter count. This is famously used in models like ALBERT to keep the model size manageable.
+
+2. Low-Rank Decomposition: Weight matrices $W$ can be approximated using low-rank techniques like SVD (Singular Value Decomposition). This breaks a large matrix into two smaller ones, significantly reducing the number of floating-point operations (FLOPs).
+
+3. Sparsification: By introducing sparse matrices or factorized decompositions, the actual complexity of matrix multiplication can be lowered. This aligns with modern "Sparse Transformer" research where only the most important connections are computed.
+
+4. Mixed-Precision Training: Using half-precision floating-point numbers (FP16) instead of full-precision (FP32) reduces memory usage and speeds up training on modern GPUs. Most current LLMs are trained using FP16 or BFloat16 to maximize hardware efficiency.
+
+### 1.5.1 ReLU
+
+## 1.6 Normalization
  
