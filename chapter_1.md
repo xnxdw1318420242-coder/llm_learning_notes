@@ -1923,6 +1923,78 @@ For large-scale models, the computational cost of linear projections becomes a s
 4. Mixed-Precision Training: Using half-precision floating-point numbers (FP16) instead of full-precision (FP32) reduces memory usage and speeds up training on modern GPUs. Most current LLMs are trained using FP16 or BFloat16 to maximize hardware efficiency.
 
 ### 1.5.1 ReLU
+ReLU (Rectified Linear Unit) is the most widely used activation function in deep learning, including the Feed-Forward Networks (FFN) of the original Transformer architecture. It acts as a mathematical gate that allows positive signals to pass through while blocking negative ones. The function is piecewise linear, defined as:
+
+$$f(x) = \max(0, x)$$
+
+<p align="center">
+  <img width="402" height="265" alt="c98ae885-ea92-4999-a025-5a08abaf92b4" src="https://github.com/user-attachments/assets/972ab461-1dcf-49ad-8966-8d3bedd79743" />
+</p>
+
+**Advantages**
+- Computational Efficiency: Unlike functions like Sigmoid or Tanh, ReLU doesn't require expensive exponential calculations.
+
+- Sparsity: Because it sets all negative values to exactly zero, it naturally creates "sparse" representations.
+
+- Prevents Vanishing Gradients: In the positive domain ($x > 0$), the gradient is a constant $1$. This allows gradients to flow through many layers without shrinking to zero, which is essential for training the deep FFN stacks in Transformers.
+
+**Disadvantages**
+- The "Dying ReLU" Problem: This is its biggest flaw. if a neuron's weights are updated such that it always receives negative input, it will always output zero. Since the gradient of zero is zero, the neuron becomes "dead" and stops learning entirely.
+
+- Non-Zero Centered Output: ReLU outputs are always positive (or zero). This can cause the gradients during backpropagation to all be positive or all be negative, leading to "zig-zagging" and slower convergence during optimization.
+
+- Unbounded Output: Because the output for positive numbers is just $x$, the values can technically grow toward infinity. This sometimes leads to "exploding" activations if not managed by techniques like Layer Normalization.
+
+### 1.5.2 Tanh
+The Tanh (Hyperbolic Tangent) activation function was the industry standard before ReLU became dominant. It is a sigmoidal curve that maps any input value to a range between -1 and 1. The mathematical definition of Tanh is:
+
+$$\tanh(x) = \frac{e^x - e^{-x}}{e^x + e^{-x}}$$
+
+It is essentially a scaled and shifted version of the Sigmoid function ($2\sigma(2x) - 1$).
+
+<p align="center">
+  <img width="265" height="200" alt="691d42e7-5121-4649-843a-bb68a99987b5" src="https://github.com/user-attachments/assets/06a2c499-e2fd-47eb-8f0e-6ad0b6c8ac21" />
+
+</p>
+
+**Advantages**
+- Zero-Centered Output: Unlike ReLU or Sigmoid, Tanh is centered at zero. This means the average output of the neurons is closer to 0, which helps the model converge faster during gradient descent because the weight updates are more balanced.
+
+- Stronger Gradients than Sigmoid: Because the range is -1 to 1 (instead of 0 to 1), the derivative of Tanh is steeper, providing stronger gradients during backpropagation for inputs near zero.
+
+- Like all activation functions in an FFN, it allows the model to learn complex, non-linear relationships that a simple linear projection cannot.
+
+**Disadvantages**
+- Vanishing Gradient Problem: This is the primary reason Tanh is rarely used in deep Transformers today. As the input $x$ becomes very large or very small (the "saturation regions"), the slope of the curve becomes nearly flat.
+
+- Computational Expense: Tanh requires calculating exponential functions ($e^x$), which is significantly more "expensive" and slower for hardware to process than the simple "if-then" logic used in ReLU.
+
+### 1.5.3 Sigmoid
+The Sigmoid function (also known as the Logistic function) is one of the oldest and most fundamental activation functions in neural networks. It maps any real-valued input into a constrained range between 0 and 1, which makes it particularly useful for models that need to output probabilities. The mathematical expression for Sigmoid is:
+
+$$\sigma(x) = \frac{1}{1 + e^{-x}}$$
+
+It is essentially a scaled and shifted version of the Sigmoid function ($2\sigma(2x) - 1$).
+
+<p align="center">
+ <img width="302" height="202" alt="6b9b172c-a28d-4c2c-b244-d3b1ee487a8d" src="https://github.com/user-attachments/assets/1aae592a-32c5-4b8e-b180-0762c800f751" />
+</p>
+
+**Advantages**
+- Probability Interpretation: Because the output is always between 0 and 1, it is ideal for the final layer of binary classification models.
+
+- Smooth Gradient: The function is differentiable everywhere and has a smooth "S" shape, which helps during the early stages of training for small networks.
+
+- Clear Predictions: It tends to push values toward the extremes (0 or 1), creating a clear distinction between classes.
+
+**Disadvantages**
+- Vanishing Gradient Problem: This is its biggest weakness in deep LLMs.
+
+- Computationally Expensive: Like Tanh, it requires calculating an exponential ($e^{-x}$), which is slower than the simple "if-else" logic of ReLU.
+
+- Not Zero-Centered: The outputs are always positive. This can cause the gradients during backpropagation to all have the same sign, leading to inefficient "zig-zagging" during the optimization process.
+
+### 1.5.4 Leaky ReLU
 
 ## 1.6 Normalization
  
