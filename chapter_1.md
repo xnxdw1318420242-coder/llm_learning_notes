@@ -1922,6 +1922,16 @@ For large-scale models, the computational cost of linear projections becomes a s
 
 4. Mixed-Precision Training: Using half-precision floating-point numbers (FP16) instead of full-precision (FP32) reduces memory usage and speeds up training on modern GPUs. Most current LLMs are trained using FP16 or BFloat16 to maximize hardware efficiency.
 
+Various activation functions can be used in FFN. The choice of activation function involves balancing speed, performance, and training stability.
+
+- Speed and Complexity: ReLU is the fastest and simplest to implement. Swish is slightly slower, while GeLU is the slowest due to its more complex mathematical implementation.
+
+- Performance: In Natural Language Processing (NLP) tasks, GeLU and Swish consistently outperform ReLU, particularly in the context of large-scale pre-training models.
+
+- Stability: ReLU suffers from the "dying neuron" problem, where neurons become inactive. GeLU and Swish offer smoother outputs that mitigate this issue, though they require more computational power.
+
+When designing a model, the choice depends on the scale of the task and available resources. For large models, try GeLU. When resources are limited, ReLU or Swish are good choices.
+
 ### 1.5.1 ReLU
 ReLU (Rectified Linear Unit) is the most widely used activation function in deep learning, including the Feed-Forward Networks (FFN) of the original Transformer architecture. It acts as a mathematical gate that allows positive signals to pass through while blocking negative ones. The function is piecewise linear, defined as:
 
@@ -1996,5 +2006,170 @@ It is essentially a scaled and shifted version of the Sigmoid function ($2\sigma
 
 ### 1.5.4 Leaky ReLU
 
-## 1.6 Normalization
+Leaky ReLU is a variant of the standard ReLU function designed specifically to fix the "Dying ReLU" problem. Instead of completely zeroing out negative inputs, it allows a small, non-zero gradient to pass through when the input is less than zero. Leaky ReLU is defined by a small slope ($\alpha$) for negative values (usually $\alpha = 0.01$):
+
+$$f(x) = \begin{cases} x & \text{if } x > 0 \\ \alpha x & \text{if } x \leq 0 \end{cases}$$
+
+<p align="center">
+ <img width="288" height="230" alt="80436038-7f4a-4de0-8609-508d4a088ec7" src="https://github.com/user-attachments/assets/31d465e1-7106-4b3b-95df-dbfd89f510ec" />
+
+</p>
+
+**Advantages**
+- Fixes "Dying ReLU": Because the gradient for negative values is $\alpha$ (e.g., 0.01) rather than 0, neurons that receive negative inputs can still update their weights and "recover" during training.
+
+- Computational Efficiency: Like the original ReLU, it is very fast to calculate compared to exponential-based functions like Tanh or Sigmoid.
+
+- Better Gradient Flow: By providing a consistent slope across the entire input range, it helps stabilize the training of very deep networks.
+
+**Disadvantages**
+- Hyperparameter Sensitivity: You have to choose the value of $\alpha$ (the leakiness). If it is too small, it behaves like a standard ReLU; if it is too large, the model may lose the benefits of sparsity.
+
+- Inconsistent Results: While it solves a theoretical problem, it doesn't always significantly outperform ReLU in practice for every architecture.
+
+- Not Zero-Centered: Like ReLU, its outputs are still primarily positive, which can lead to slightly less efficient optimization compared to functions like ELU or Tanh.
+
+
+### 1.5.5 PReLU
+
+PReLU (Parametric Rectified Linear Unit) is an advanced version of Leaky ReLU where the "leak" is not a fixed number, but a learnable parameter. Instead of a human designer picking the slope for negative values, the model learns the optimal slope itself during training. The function is defined as:
+
+$$f(x) = \max(0, x) + a \cdot \min(0, x)$$
+
+
+**Advantages**
+- Adaptive Learning: The model can decide how much "leakage" it needs for each layer or even each channel.
+
+- Solves "Dying ReLU": Because the slope $a$ is unlikely to be exactly zero, gradients can almost always flow back through the network, preventing neurons from becoming permanently inactive.
+
+- Improved Accuracy: In many deep learning benchmarks (especially in computer vision), PReLU consistently outperforms standard ReLU by allowing the model to retain more information from negative inputs.
+
+**Disadvantages**
+- Risk of Overfitting: Because you are adding more parameters to the model (one $a$ per channel or layer), there is a higher risk that the model will "memorize" the training data rather than generalizing well.
+
+- Increased Memory/Computation: While the extra math is minor, storing and updating the additional $a$ parameters increases the model's memory footprint and slightly slows down the training process compared to a fixed ReLU.
+
+### 1.5.6 ELU
+
+ELU (Exponential Linear Unit) is an activation function designed to combine the best properties of ReLU (speed and gradient flow) with the benefits of being zero-centered, like Tanh. It was specifically created to speed up training and improve accuracy by reducing the "bias shift" effect. ELU uses an exponential curve for negative values and a linear identity for positive values:
+
+$$f(x) = \begin{cases} x & \text{if } x > 0 \\ \alpha(e^x - 1) & \text{if } x \leq 0 \end{cases}$$
+
+<p align="center">
+ <img width="348" height="232" alt="6b13a645-8d9e-4b64-a1b1-9654f2c0f36c" src="https://github.com/user-attachments/assets/f601804f-3532-4be8-9878-0b9e0279f502" />
+</p>
+
+**Advantages**
+- Zero-Centered Mean: Unlike ReLU, ELU can produce negative outputs. This brings the mean activation closer to zero, which speeds up convergence by reducing the bias shift in the following layers.
+
+
+- No "Dying ReLU" Problem: Because the function has a non-zero gradient for all negative values, neurons don't "die" or become permanently inactive during training.
+
+- Saturation for Large Negatives: Unlike Leaky ReLU, which grows infinitely in the negative direction, ELU saturates to $-\alpha$.
+
+- Smooth Gradient: The transition at $x=0$ is smoother than ReLU, which can lead to better optimization behavior.
+
+**Disadvantages**
+- Computational Complexity: Because it involves an exponential function ($e^x$), it is more computationally expensive than ReLU, Leaky ReLU, or PReLU.
+
+- Exploding Gradients: While it handles vanishing gradients well, the exponential nature can sometimes contribute to exploding gradients in very specific, unnormalized architectures if not paired with techniques like Layer Normalization.
+
+### 1.5.7 GELU
+
+The GELU (Gaussian Error Linear Unit) is the current industry standard activation function for modern Large Language Models like GPT-4, BERT, and Llama. Unlike ReLU, which is a deterministic "hard" gate (on or off), GELU is a probabilistic activation. It scales the input $x$ by the likelihood that $x$ is greater than other inputs, assuming a Gaussian (Normal) distribution. Effectively, it drops negative values more smoothly than ReLU. The exact mathematical definition involves the Cumulative Distribution Function (CDF) of a standard normal distribution, $\Phi(x)$:
+
+$$GELU(x) = x \cdot \Phi(x) = x \cdot P(X \le x)$$
+
+Because the exact CDF is computationally expensive, it is usually approximated in FFNs using this formula:
+
+$$0.5x \left(1 + \tanh\left[\sqrt{\frac{2}{\pi}} (x + 0.044715x^3)\right]\right)$$
+
+<p align="center">
+ <img width="280" height="232" alt="bee6937e-a5dc-42c5-8761-e5d2448988ae" src="https://github.com/user-attachments/assets/8d1baae4-e4f0-4953-a9cd-25b89ed28766" />
+
+</p>
+
+**Advantages**
+- Smoothness: GELU is differentiable at all points, including zero.
+
+- Non-Zero Negative Gradient: Unlike ReLU, which has a "hard zero" for all negative values, GELU allows a very small, curved "dip" into the negative range before returning to zero.
+
+
+**Disadvantages**
+- Computational Cost: Even with the $\tanh$ approximation, GELU is more mathematically complex than the simple "if-else" logic of ReLU.
+
+- Complexity in Implementation: It is harder to implement from scratch compared to simpler functions, though this is rarely an issue since it is a standard feature in libraries like PyTorch and TensorFlow.
+
+### 1.5.8 Swish
+
+Swish is a self-gated activation function discovered by researchers at Google Brain. It was designed using automated search techniques to find a function that performs better than ReLU in deep networks. The standard Swish function is defined as the input multiplied by the Sigmoid of the input:
+
+$$f(x) = x \cdot \sigma(\beta x) = \frac{x}{1 + e^{-\beta x}}$$
+
+If $\beta$ is 0, the Sigmoid part of the equation becomes a constant. The function becomes a simple linear function (a straight line with a slope of 0.5). In this state, it provides no non-linearity, which would make a deep network effectively collapse into a single layer. When $\beta = 1$, it is often simply called SiLU (Sigmoid Linear Unit). As $\beta$ becomes extremely large, the Sigmoid function starts acting like a "binary switch" or a step function. It loses its smoothness and becomes a "hard" gate like ReLU. The "dip" disappears, and any negative input is instantly zeroed out.
+
+<p align="center">
+<img width="340" height="265" alt="5da042e4-b4f0-4505-901c-910d58aa4989" src="https://github.com/user-attachments/assets/3f246cea-d970-45d7-9b99-f3d9f194c460" />
+</p>
+
+**Advantages**
+- Smoothness: Unlike ReLU's sharp "elbow" at zero, Swish is smooth and continuously differentiable.
+
+- Non-Monotonicity: One of Swish's unique features is that for small negative values, the output actually decreases before increasing. This property allows the model to retain some small negative information, which can improve expressive power.
+
+- Performance: In many deep learning benchmarks, particularly in Computer Vision (EfficientNet) and modern Transformers (Llama series), Swish (or its variant SiLU) outperforms ReLU.
+
+
+**Disadvantages**
+- Complexity: The non-monotonic nature can occasionally make the training dynamics more complex to analyze compared to the straightforward linear nature of ReLU.
+
+### 1.5.9 GLU
+
+The GLU (Gated Linear Unit) is a powerful architectural component that replaces standard activation functions with a "gating" mechanism. Instead of applying a fixed rule like ReLU to every input, GLU uses one part of the input to decide how much of the other part should pass through. A GLU operates by splitting a linear projection into two paths. Mathematically, for an input $x$:
+
+$$GLU(x, W, V, b, c) = \sigma(xW + b) \otimes (xV + c)$$
+
+If $\beta$ is 0, the Sigmoid part of the equation becomes a constant. The function becomes a simple linear function (a straight line with a slope of 0.5). In this state, it provides no non-linearity, which would make a deep network effectively collapse into a single layer. When $\beta = 1$, it is often simply called SiLU (Sigmoid Linear Unit). As $\beta$ becomes extremely large, the Sigmoid function starts acting like a "binary switch" or a step function. It loses its smoothness and becomes a "hard" gate like ReLU. The "dip" disappears, and any negative input is instantly zeroed out.
+
+The primary reason for using the Hadamard product is to achieve fine-grained, independent control over each individual element in a vector or matrix. In a GLU, the network computes two paths: a linear transformation $(XW_1 + b_1)$ and a gated path using a sigmoid activation $\sigma(XW_2 + b_2)$. By multiplying these two results element-wise, the "gate" path decides exactly how much information from the "content" path is allowed to pass through. The gating mechanism powered by the Hadamard product allows the network to be highly selective about its data processing. The network can dynamically activate or suppress specific signals based on the input. It acts as a refined control mechanism that helps the model focus on critical information while effectively ignoring irrelevant inputs. This flexibility significantly aids in model optimization and overall performance.
+
+The Hadamard product is also a highly efficient choice for large-scale deep learning computations. This simplicity makes it a flexible and fast operator, ideal for the frequent, high-volume calculations required in modern large-scale neural networks.
+
+<p align="center">
+<img width="375" height="231" alt="f3f7202c-3c35-4c64-98ad-2d1f96df0301" src="https://github.com/user-attachments/assets/a54a2a01-e2e4-42b8-a7c4-1374dfc6878b" />
+</p>
+
+**Advantages**
+- Dynamic Gating: Unlike ReLU, which is a static "on/off" switch based on the sign of the number, GLU allows the model to learn complex, context-dependent rules for which information is relevant.
+
+- Vanishing Gradient Mitigation: The gating mechanism provides a linear path for gradients to flow (the $xV$ side), which helps train very deep networks more effectively than Tanh or Sigmoid alone.
+
+- Superior Expressive Power: By using two linear projections, GLU can capture more sophisticated interactions between features.
+
+
+**Disadvantages**
+- Computational Cost: It requires more memory and FLOPs (Floating Point Operations) during the linear projection phase.
+
+- Symmetry Breaking: It requires careful initialization to ensure the "gate" path doesn't start completely closed, which would prevent the "content" path from learning.
+
+
+### 1.5.10 GeGLU
+
+GeGLU (GELU Gated Linear Unit) is a high-performance variant of the Gated Linear Unit (GLU). Instead of using the traditional Sigmoid function for the "gate," GeGLU uses the GELU (Gaussian Error Linear Unit) activation. A GeGLU layer splits its input into two parallel paths, applies a linear transformation to both, "activates" one with GELU, and then merges them using the Hadamard product (element-wise multiplication):
+
+$$\text{GeGLU}(x, W, V, b, c) = \text{GELU}(xW + b) \otimes (xV + c)$$
+
+In modern Transformers, the bias terms ($b, c$) are often omitted for simplicity and efficiency:
+
+$$\text{GeGLU}(x, W, V) = \text{GELU}(xW) \otimes xV$$
+
+### 1.5.11 SwiGLU
+
+SwiGLU (Swish-Gated Linear Unit) is an activation function variant that has become the "gold standard" for the Feed-Forward Networks (FFN) in state-of-the-art Large Language Models like Llama 2/3, Mistral, and PaLM. SwiGLU is a "Gated Linear Unit" that uses the Swish (also known as SiLU) activation function for its gate. It works by splitting the input into two paths, transforming them, and then "gating" one with the other:
+
+$$\text{SwiGLU}(x, W, V) = \text{Swish}_1(xW) \otimes xV$$
+
+Because it is smooth and non-monotonic (it doesn't have a hard zero-cutoff), it avoids the "Dying ReLU" problem and helps gradients flow more effectively through very deep networks.
+
+## 1.6 Add & Normalization
  
