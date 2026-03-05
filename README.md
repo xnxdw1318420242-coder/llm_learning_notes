@@ -47,3 +47,15 @@
  
 **1.5 FFN (Feed-Forward Network)**
 * **1.5.1 ReLU**
+* **1.5.2 Tanh**
+* **1.5.3 Sigmoid**
+* **1.5.4 Leaky ReLU**
+* **1.5.5 PReLU**
+* **1.5.6 ELU**
+* **1.5.7 GELU**
+* **1.5.8 Swish**
+* **1.5.9 GLU**
+* **1.5.10 GeGLU**
+* **1.5.11 SwiGLU**
+
+**1.6 Add & Normalization**
