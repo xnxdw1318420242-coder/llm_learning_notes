@@ -2173,3 +2173,113 @@ Because it is smooth and non-monotonic (it doesn't have a hard zero-cutoff), it 
 
 ## 1.6 Add & Normalization
  
+### 1.6.1 Residual Connection
+
+A Residual Connection (also known as a Skip Connection) is a fundamental architectural component introduced in the ResNet paper (He et al., 2015). It allows the output of an earlier layer to skip one or more intermediate layers and be added directly to the output of a later layer. Instead of forcing the network to learn a brand-new representation from scratch at every layer, the residual connection provides a "highway" for the original signal. The layers $\mathcal{F}$ are now only responsible for learning the residual (the difference) needed to improve the current input, rather than the entire target mapping. If the intermediate layers don't find anything useful to add, they can simply learn to output zero ($\mathcal{F}(x) = 0$), and the input $x$ will pass through unchanged.
+
+During backpropagation, the gradient can flow directly through the "$+ x$" part of the equation without being multiplied by small weights. This ensures that the gradient reaches the earliest layers of the model without "vanishing." In a standard "Plain" network, information can be lost as it passes through many non-linear activations. Residual connections ensure that the model always has access to the original features from previous layers.
+
+The operation is mathematically very simple. If $x$ is the input and $\mathcal{F}(x)$ represents the transformation performed by the intermediate layers (like the FFN or Attention layers mentioned in your images), the output $y$ is:
+
+$$y = \mathcal{F}(x) + x$$
+
+Residual connection has the following advantages.
+
+- Eliminating the vanishing gradient problem. This $+1$ acts as a "gradient highway," allowing error signals to flow unimpeded from the output all the way back to the first layer, regardless of how deep the model is.
+
+- Speeding up convergence. The optimizer can take larger, more confident steps toward the optimal solution without getting stuck or oscillating, leading to faster convergence.
+
+- Enabling model scaling. Residual connections allowed researchers to train the first models with 100, 500, or even 1,000+ layers (like ResNet-152) while still achieving better results than shallower models.
+
+Now we revisit the formula:
+
+$$x_{l+1} = x_l + F(x_l, W_l)$$
+
+Where $x_l$ is the input to the layer and $F(x_l, W_l)$ is the residual function (the learned transformation).
+
+By recursively applying this formula, any deeper layer $L$ can be expressed as the sum of a shallow layer $l$ and all subsequent residual functions:
+
+$$x_L = x_l + \sum_{i=l}^{L-1} F(x_i, W_i)$$
+
+This indicates that the feature $x_L$ at a deep layer is an additive combination of all previous residual outputs and the original shallow feature. This is a fundamental shift from "plain" networks, where features are the result of continuous multiplications, which can lead to signal degradation.
+
+To understand why gradients do not vanish, we look at the derivative of the loss $\varepsilon$ with respect to a shallow layer $x_l$. Using the chain rule:
+
+$$\frac{\partial \varepsilon}{\partial x_l} = \frac{\partial \varepsilon}{\partial x_L} \cdot \frac{\partial x_L}{\partial x_l} = \frac{\partial \varepsilon}{\partial x_L} \left( 1 + \frac{\partial}{\partial x_l} \sum_{i=l}^{L-1} F(x_i, W_i) \right)$$
+
+The gradient is split into two distinct parts:
+1. The "Gradient Highway" ($\frac{\partial \varepsilon}{\partial x_L}$): This part passes information directly back to any shallow layer $x_l$ without going through the weight layers.
+2. The Weighted Path: This part passes through the weight layers and is modulated by the learned parameters.
+
+In traditional deep networks, the gradient is a product of many small numbers; if those numbers are $<1$, the product quickly reaches zero (vanishes).
+In a residual network, the total gradient is $1 + \text{something}$. Even if the weighted path's gradient becomes extremely small, the "1" ensures that the gradient $\frac{\partial \varepsilon}{\partial x_L}$ is preserved and successfully reaches the earlier layers. The only way the gradient would vanish is if $\frac{\partial}{\partial x_l} \sum F(x_i, W_i)$ consistently equaled $-1$, which is extremely unlikely in practice. The "$1$" also ensures that the error signal from the top layer is pushed directly to the bottom layers without being degraded. This allows all layers in a deep model to start learning effectively from the very first iteration.
+
+#### 1.6.1.1 Post-Norm
+
+In modern Transformer architectures, Post-LayerNorm (often referred to as Post-Norm) is the original configuration used in the classic "Attention Is All You Need" paper. It determines where the Layer Normalization (LN) occurs relative to the residual connection and the sub-layers (Attention or FFN). In a Post-Norm setup, the normalization happens after the residual addition:
+
+$$x_{l+1} = \text{LayerNorm}(x_l + F(x_l))$$
+
+<p align="center">
+<img width="724" height="170" alt="6eb5233b-0527-4496-b309-169e53233085" src="https://github.com/user-attachments/assets/ff5827d9-2413-48ff-8027-8a727f42868d" />
+</p>
+
+**Advantages**
+- Better Regularization: Because the normalization is applied at the very end of each block, it keeps the scale of activations consistent across the entire depth of the model.
+
+- Higher Performance Potential: When successfully trained, Post-Norm models often achieve slightly higher accuracy or lower perplexity than Pre-Norm models of the same size.
+
+**Disadvantages**
+- Training Instability (The "Warm-up" Problem): This is the biggest drawback. In Post-Norm, the gradients at the output layer are much larger than those at the input layers. Without a careful "learning rate warm-up" strategy, the model's gradients can explode or become very unstable early in training.
+
+- Vanishing Gradient Risk: As the model gets deeper, the "effective" gradient passing through the residual highway can be dampened by the repeated normalization steps, making it harder to train extremely deep models (e.g., 100+ layers) compared to Pre-Norm.
+
+If you are building a Transformer with a standard number of layers, Post-Norm is a strong choice for maximizing accuracy.
+
+#### 1.6.1.2 Pre-Norm
+
+Pre-LayerNorm (often referred to as Pre-Norm) is the modern standard for arranging layers in Transformer architectures. Unlike the original "Post-Norm" design, Pre-Norm places the normalization layer inside the residual block, before the transformation occurs. In a Pre-Norm setup, the input is normalized before it enters the Attention or Feed-Forward (FFN) layers, and the result is added directly to the "clean" residual stream:
+
+$$x_{l+1} = x_l + F(\text{LayerNorm}(x_l))$$
+
+<p align="center">
+<img width="625" height="160" alt="4fca2881-cd6e-497d-bbe2-592a54fcaf66" src="https://github.com/user-attachments/assets/99d8d965-eaf1-404a-b5c7-ce968eda34b8" />
+</p>
+
+**Advantages**
+- Training Stability: This is the primary reason for its popularity. Because the LayerNorm is applied before the transformation, the gradients remain well-scaled throughout the network from the start of training.
+
+- No Warm-up Required: Unlike Post-Norm, which often requires a carefully tuned "learning rate warm-up" to prevent the model from diverging, Pre-Norm models can often be trained with standard learning rates immediately.
+
+- Scalability to Depth: Pre-Norm is significantly better for training very deep networks (e.g., 50, 100, or 1000 layers). The "identity" path (the $x_l$ in the formula) remains completely untouched by normalization, preserving the gradient flow we discussed in the mathematical proof.
+
+**Disadvantages**
+- Representation "Shrinkage": Because the residual stream is never normalized after the addition, the magnitude of the activations can grow as you go deeper into the network. This can sometimes lead to a slight decrease in final performance compared to a perfectly tuned Post-Norm model.
+
+Almost all state-of-the-art LLMs, including GPT-3/4, Llama 2/3, Mistral, and Gemini, use Pre-Norm. The stability it provides is non-negotiable when training models with billions of parameters. If your architecture exceeds 12–24 layers, Pre-Norm is the safer and more reliable choice to ensure the model actually converges. Most modern Vision Transformers also utilize Pre-Norm to handle the complexities of high-resolution image data.
+
+#### 1.6.1.3 Sandwich-Norm
+
+Sandwich-Norm is an experimental architectural variation designed to combine the strengths of both Pre-Norm and Post-Norm. In a Sandwich-Norm setup, you apply multiple Layer Normalizations (LN). It uses the stable Pre-Norm structure but adds an additional LN at the end of the residual branch (the "sandwich" bread):
+
+$$x_{l+1} = x_l + \text{LayerNorm}_{out}(F(\text{LayerNorm}_{in}(x_l)))$$
+
+It is even more stable than Pre-Norm for training exceptionally deep or wide models that are prone to gradient spikes. In standard Pre-Norm, the values in the residual stream ($x_l$) can grow significantly as they pass through many layers. Sandwich-Norm "reins in" these values by normalizing the output of each sub-layer before it is added back to the stream. 
+
+However, because you are normalizing twice per block, the gradient signal can be "flattened" too much. If not tuned carefully, the model may stop learning effectively because the updates become too small.
+
+### 1.6.2 Normalization
+
+#### 1.6.2.1 Batch Normalization
+
+#### 1.6.2.2 Layer Normalization
+
+#### 1.6.2.3 Instance Normalization
+
+#### 1.6.2.4 Group Normalization
+
+#### 1.6.2.5 RMS Norm
+
+#### 1.6.2.6 pRMS Norm
+
+#### 1.6.2.7 Deep Norm
