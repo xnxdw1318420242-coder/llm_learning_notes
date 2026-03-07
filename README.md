@@ -87,4 +87,4 @@
     * **1.7.4.8 Temperature**
 
 
-### **2. Pretraining**
+### **2. Modern Models**
