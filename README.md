@@ -63,6 +63,7 @@
     * **1.6.1.1 Post-Norm**
     * **1.6.1.2 Pre-Norm**
     * **1.6.1.3 Sandwich-Norm**
+    * **1.6.1.4 Deep Norm**
 * **1.6.2 Normalization**
     * **1.6.2.1 Batch Normalization**
     * **1.6.2.2 Layer Normalization**
@@ -70,4 +71,4 @@
     * **1.6.2.4 Group Normalization**
     * **1.6.2.5 RMS Norm**
     * **1.6.2.6 pRMS Norm**
-    * **1.6.2.7 Deep Norm**
+    
