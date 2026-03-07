@@ -2592,3 +2592,109 @@ $$\bar{x}_i = \frac{x_i}{\text{pRMS}(x)} \cdot \gamma_i$$
 
 
 ## 1.7 Transformer
+
+While we skip the specific architectural details of the Transformer here for the sake of brevity, we will now delve into several key questions regarding its overall structure.
+
+<p align="center">
+<img width="262" height="387" alt="113d9ef0-ed22-4ad1-9273-25b699feb2be" src="https://github.com/user-attachments/assets/470e27e8-5779-4853-ab19-1755290ffb7b" />
+</p>
+
+Here is the summary of the key advantages of the Transformer architecture compared to traditional RNN and LSTM models:
+
+- Parallel Computing Capability: The Transformer architecture uses a Self-Attention mechanism to eliminate sequential dependency, allowing the model to process different parts of a sequence simultaneously. This significantly improves parallel processing and accelerates training for long sequences.
+
+- Handling Long-Distance Dependencies: The Self-Attention mechanism can establish direct global dependencies between any two positions in a sequence, regardless of their distance. This makes the Transformer much more effective at processing long-distance context.
+
+- Modeling Flexibility: It can model the relationship between every position in the entire input sequence at once. This not only enhances the model's representational power but also makes it more flexible in handling complex dependencies.
+
+- Success Across Application Fields: The Transformer has achieved significant success in Natural Language Processing (NLP) and Computer Vision. Modern state-of-the-art models like BERT and GPT are based on the Transformer architecture and consistently outperform traditional RNN/LSTM models across various tasks.
+
+### 1.7.1 Weight Sharing
+
+The Transformer reuses the same weight matrix for:
+- Encoder Input Embedding: Converts input tokens into vectors.
+- Decoder Input Embedding: Converts target tokens into vectors.
+- Pre-Softmax Linear Layer: Projects the final decoder output back to the vocabulary size to predict the next token.
+
+The sharing is possible because the dimensions of these layers are mirrored:
+- Embedding Layer: Shape is $(\text{Vocabulary Size} \times d_{model})$.
+- Linear Output Layer: Shape is $(d_{model} \times \text{Vocabulary Size})$.
+
+The model simply uses the transpose of the embedding matrix as the weights for the final linear layer. Instead of learning two separate large matrices, the model learns one and uses it for both "reading" (input) and "writing" (output).
+
+In the embedding layer, the weight matrix is often scaled by $\sqrt{d_{model}}$. This is specifically necessary because of weight sharing. The embedding matrix is typically initialized with very small values (standard deviation of $1/\sqrt{d_{model}}$). Positional encodings (sines/cosines) have values between -1 and 1. If we added these directly to the "small" raw embeddings, the position information would be "louder" than the actual word meaning, essentially drowning out the semantics. Scaling the embeddings by $\sqrt{d_{model}}$ brings their magnitude up to a range where they can effectively "compete" with the positional encodings and provide a stable signal for the rest of the network.
+
+In models like BERT or GPT, where positions are learned rather than fixed, there is also weight sharing in positional embeddings. Within a stack of 12 or 24 encoder layers, the positional embeddings are only injected once at the very bottom. All subsequent layers "share" the result of that initial injection as the data flows upward. In some modern encoder-decoder models (like T5), the encoder and decoder might or might not share learned positional weights. If not shared, it allows the model to learn that "first position" in a source sentence might carry different grammatical weight than "first position" in a generated response.
+
+In the context of the Decoder Self-Attention layer, weight sharing generally refers to two distinct concepts: the internal weight matrices ($W_Q, W_K, W_V$) and the "vertical" sharing of weights across multiple decoder layers. In a standard Transformer, each self-attention layer has three separate weight matrices: $W_Q$ (Query), $W_K$ (Key), and $W_V$ (Value). However, some advanced variants utilize shared weight self-attention.  Instead of three distinct matrices, the model uses a single shared weight matrix to project the input into $Q$, $K$, and $V$ spaces. Cross-Layer Weight Sharing (SANs) is vertical weight sharing; Since the decoder is the heaviest part of the model during inference (because it generates tokens one by one), researchers often share weights between adjacent layers.
+
+### 1.7.2 Parameters & FLOPs
+
+The parameters in the MHA layer consist of projection matrices for each head and a final linear layer. For $h$ heads, each head has three matrices of size $d_{model} \times (d_{model}/h)$. In total, it is \approx 3 \times d_{model}^2$. Final Linear Layer ($W_O$) has a size of approximately $d_{model} \times d_{model}$. Therefore, total MHA parameters $\approx 4d_{model}^2$. 
+
+The FFN usually consists of two linear transformations with a ReLU activation in between. The internal hidden dimension ($d_{ff}$) is typically 4 times larger than the input dimension ($d_{model}$), so $d_{ff} = 4 \times d_{model}$. The first linear layer projects from $d_{model}$ to $d_{ff}$ ($\approx d_{model} \times 4d_{model}$), and the second projects from $d_{ff}$ back to $d_{model}$ ($\approx 4d_{model} \times d_{model}$). In total, it is $\approx 8d_{model}^2$ parameters. 
+
+According to this analysis, the FFN layer is the "heavyweight" of the Transformer architecture in terms of memory. The embedding layer can also have a large number of parameters if the vocabulary size is big and surpasses all following layers.
+
+FLOPs stands for Floating Point Operations. It is a metric used to measure the amount of computation required for a specific task or model. For the multiplication of two vectors where $A \in \mathbb{R}^{1 \times n}$ and $B \in \mathbb{R}^{n \times 1}$, to calculate the product $AB$, the operation requires $n$ multiplications and $n$ additions. This results in a total of $2n$ floating point operations. Therefore, the computational complexity is $2n$ FLOPs. For the multiplication of two matrices where $A \in \mathbb{R}^{m \times n}$ and $B \in \mathbb{R}^{n \times k}$, the total number of floating point operations required to calculate the product $AB$ is determined by the formula:
+
+$$\text{FLOPs} = 2mnk$$
+
+To calculate the FLOPs of an embedding layer, we have to look at it through two different lenses: how it is actually implemented (efficient lookup) versus how it is theoretically modeled (matrix multiplication) for complexity analysis.
+
+To calculate FLOPs, first we treat the embedding process as a multiplication between a one-hot encoded input and the embedding weight matrix. Each token in a sequence of length $s$ from a batch $b$ is represented as a one-hot vector of size $V$ (Vocabulary size). This creates an input tensor of shape $[b, s, V]$. The embedding matrix $W_{emb}$ has a shape of $[V, h]$, where $h$ is the hidden (embedding) dimension. We perform a matrix multiplication: $[b, s, V] \times [V, h] = [b, s, h]$. In per-element calculation, to produce a single element in the resulting $[b, s, h]$ output, we perform a dot product between a one-hot vector (length $V$) and a column of the embedding matrix (length $V$). It is approximately $2V$ FLOPs. The final output matrix has $b \times s \times h$ total elements. Then we have:
+
+$$\text{Total FLOPs} \approx (b \times s \times h) \times 2V = 2bshV$$
+
+However, while the theoretical complexity is $2bshV$, modern deep learning frameworks do not actually perform this multiplication. Because no actual floating-point arithmetic (multiplication or addition) occurs during a memory lookup, the real-world FLOPs for an embedding layer are effectively zero.
+
+To calculate the FLOPs of a Multi-Head Self-Attention (MHA) layer, for a sequence length $s$, batch size $b$, and hidden dimension $d$ (often called $d_{model}$), the computation is broken down into four main stages:
+
+- Linear Projections ($Q, K, V$). The input $X$ (shape $[b, s, d]$) is multiplied by three weight matrices ($W_Q, W_K, W_V$), each of size $(d \times d)$. Each projection is a $[b, s, d] \times [d, d]$ multiplication. Total FLOPs is $3 \times (2 \cdot b \cdot s \cdot d \cdot d) = \mathbf{6bsd^2}$.
+
+- Computing Attention Scores ($QK^T$). The Query matrix is multiplied by the transpose of the Key matrix. This is a $[b, s, d] \times [b, d, s]$ operation. FLOPs: $2 \cdot b \cdot s \cdot d \cdot s = \mathbf{2bs^2d}$.
+
+- Computing Context Vectors (Score $\times V$). The attention weights (after Softmax) are multiplied by the Value matrix. This is a $[b, s, s] \times [b, s, d]$ operation. FLOPs: $2 \cdot b \cdot s \cdot s \cdot d = \mathbf{2bs^2d}$.
+
+- Final Output Projection ($W_O$). The concatenated heads are projected back to the hidden dimension using matrix $W_O$ (size $d \times d$). FLOPs: $2 \cdot b \cdot s \cdot d \cdot d = \mathbf{2bsd^2}$.
+
+Adding these components together gives the total complexity for one MHA layer: 
+
+$$\text{Total FLOPs} = \mathbf{8bsd^2 + 4bs^2d}$$
+
+When the input sequence is long, even if the FFN layer has more parameters, the MHA layer is computationally more expensive.
+
+To calculate the FLOPs of the Feed-Forward Network (FFN) or MLP layer, we apply the general matrix multiplication formula ($2mnk$) to its two-stage linear transformation process. In a standard Transformer, the FFN consists of two linear layers with an expansion factor, typically $d_{ff} = 4d_{model}$. In up-projection, we multiply the input (batch $b$, sequence $s$, hidden $d$) by the first weight matrix ($d \times d_{ff}$). Using the standard $d_{ff} = 4d$, the FLOPs is $2 \cdot b \cdot s \cdot d \cdot 4d = \mathbf{8bsd^2}$. Similarly, the down-projection has the same FLOPs. Adding both stages together (ignoring the relatively negligible FLOPs from the activation function and biases):
+
+$$\text{Total FFN FLOPs} = 8bsd^2 + 8bsd^2 = \mathbf{16bsd^2}$$
+
+At the end of the Transformer, we have a hidden state matrix of shape $[b, s, d]$, and we multiply it by the output weight matrix $W_{out}$ of shape $[d, V]$ to get the final logits of shape $[b, s, V]$. Total FLOPs:
+
+$$\text{Output Layer FLOPs} = 2bsdV$$
+
+### 1.7.3 Encoder-Only, Decoder-Only, Encoder-Decoder
+
+Encoder-only models focus on understanding the relationship between all words in a provided sequence simultaneously. They are primarily used for Natural Language Understanding (NLU). This includes sentiment analysis, named entity recognition (NER), and sentence classification. BERT (Bidirectional Encoder Representations from Transformers), RoBERTa, and ALBERT are all encoder-only models. This architecture "looks" at both the left and right context of a word at the same time, leading to a deep understanding of word meaning. But it is not designed to generate text one word at a time (autoregression).
+
+Decoder-only models are designed to predict the next token in a sequence based only on the tokens that came before it. They are best for natural language generation (NLG) tasks such as creative writing, code generation, and conversational AI. GPT series (GPT-3, GPT-4), Llama, and Claude are decoder-only models. This architecture cannot see "future" tokens during training because of the causal mask, which can limit its understanding of complex pre-existing context.
+
+Encoder-decoder architecture is the original Transformer structure, combining an encoder to process the input and a decoder to generate the output. It suits conditional generation tasks where the output is a transformation of the input, such as Machine Translation (NMT), text summarization, and question answering. Examples include T5 (Text-to-Text Transfer Transformer) and BART.
+
+### 1.7.4 Decoding Strategy
+
+#### 1.7.4.1 Greedy Search
+
+#### 1.7.4.2 Beam Search
+
+#### 1.7.4.3 Top-K Sampling
+
+#### 1.7.4.4 Top-P Sampling
+
+#### 1.7.4.5 Random Sampling
+
+#### 1.7.4.6 Best-of-N
+
+#### 1.7.4.7 Majority Vote & Self-Consistency
+
+#### 1.7.4.8 Temperature 
+
