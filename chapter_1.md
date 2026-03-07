@@ -2268,18 +2268,316 @@ It is even more stable than Pre-Norm for training exceptionally deep or wide mod
 
 However, because you are normalizing twice per block, the gradient signal can be "flattened" too much. If not tuned carefully, the model may stop learning effectively because the updates become too small.
 
+#### 1.6.1.4 Deep Norm
+
+DeepNorm is a modified version of Post-Layer Normalization (Post-LN). In standard Transformers, you usually choose between Post-LN and Pre-LN. DeepNorm bridges this gap. It provides the stability of Pre-LN with the high performance of Post-LN by adding a scaling constant to the residual connection and using a specific weight initialization strategy.
+
+DeepNorm modifies the standard residual connection. Instead of $x + f(x)$, it scales the residual branch by a constant $\alpha$.
+
+$$x_{l+1} = \text{LayerNorm}(\alpha x_l + f(x_l))$$
+
+$\alpha$ is a constant $> 1$ that depends on the total number of layers.
+
+DeepNorm also scales the weights of the sub-layers (specifically the linear projections) by a factor $\beta$ at the start of training.             
+
+As models get deeper (e.g., beyond 100 layers), the "model updates" (how much the parameters change in one step) tend to explode at the beginning of training. Deep Norm prevents the gradients from becoming too large, allowing models to scale to 1,000+ layers without crashing.
+
 ### 1.6.2 Normalization
+
+Without normalization, deep networks are extremely difficult to train due to internal covariate shift. As weights are updated in early layers, the distribution of inputs to later layers changes constantly. This forces later layers to constantly "chase" a moving target, significantly slowing down the learning process. By keeping activations in a stable range, the optimizer (like Adam) can use higher learning rates, reaching the optimal solution much faster. It prevents gradients from becoming too large (exploding) or too small (vanishing) during backpropagation. It also adds a small amount of "noise" to the activations, which can act as a light form of regularization, helping the model generalize better to new data.
+
+<p align="center">
+<img width="779" height="195" alt="fc22a6e7-1307-46da-a28b-0cd8a8e86016" src="https://github.com/user-attachments/assets/cc501d17-c3bd-442b-ba4c-3fec9ca6e3b5" />
+
+</p>
+
+Batch Normalization (BN) is best for CNNs with medium to large batch sizes. It is not suitable for extremely small batch sizes or Recurrent Neural Network (RNN) scenarios. Layer Normalization (LN) works well on sequence-based scenarios such as RNNs and Transformers as it is not sensitive to batch size, but it is generally less effective than BN in CNN architectures. Instance Normalization (IN) is commonly used in style transfer tasks. It preserves style differences across different images and channels. Group Normalization (GN) suits scenarios with small batch sizes. It does not depend on batch size while still accounting for statistical characteristics between different channels.    
+
 
 #### 1.6.2.1 Batch Normalization
 
-#### 1.6.2.2 Layer Normalization
+Batch Normalization (BN) is a technique used to make training faster and more stable by normalizing the inputs to each layer within a mini-batch. For a mini-batch $\mathcal{B} = \{x_1, \dots, x_m\}$ of size $m$, the transformation follows these four steps:
 
+1. Find the average value of the activations in the current batch.
+
+$$\mu_{\mathcal{B}} = \frac{1}{m} \sum_{i=1}^{m} x_i$$
+
+2. Measure how much the activations deviate from the mean.
+
+$$\sigma_{\mathcal{B}}^2 = \frac{1}{m} \sum_{i=1}^{m} (x_i - \mu_{\mathcal{B}})^2$$
+
+3. Subtract the mean and divide by the standard deviation. This centers the data at 0 with a variance of 1. A tiny constant $\epsilon$ (epsilon) is added to the denominator to prevent division by zero.
+
+$$\hat{x}_i = \frac{x_i - \mu_{\mathcal{B}}}{\sqrt{\sigma_{\mathcal{B}}^2 + \epsilon}}$$
+
+4. This is the "learnable" part. If the model decides that a mean of 0 and variance of 1 is too restrictive (for example, if it needs to use the non-linear parts of a Sigmoid function), it uses two trainable parameters, $\gamma$ (gamma) and $\beta$ (beta), to rescale and reposition the data.
+
+$$y_i = \gamma \hat{x}_i + \beta$$
+
+**Advantages**
+- Accelerated Convergence: BN allows you to use significantly higher learning rates.
+
+- Reduced Sensitivity to Initialization: Before BN, poor weight initialization could easily lead to vanishing or exploding gradients. BN ensures that activations stay within a healthy range, making the starting values of weights less critical.
+
+- Lightweight Regularization: Because the mean and variance are calculated on a per-batch basis, they introduce a small amount of "noise" into the training process.
+
+- Internal Covariate Shift Reduction: By normalizing the mean and variance of each layer’s inputs, it prevents layers from having to constantly adapt to wildly changing input distributions from previous layers.
+
+**Disadvantages**
+- Batch Size Dependency: This is the biggest weakness. BN requires a sufficiently large batch size (usually 32 or more) to accurately estimate the mean and variance. If the batch size is too small (e.g., 2 or 4), the estimates become noisy, and the model's performance can collapse.
+
+- Computational and Memory Overhead: BN requires extra memory to store the running means and variances, and extra compute cycles for the normalization and scale/shift operations.
+
+- Not Suitable for Sequence Models (RNNs/Transformers): In sequences of varying lengths, calculating batch statistics is difficult and inefficient. Furthermore, the statistics in RNNs can vary wildly across time steps, which is why Layer Normalization is preferred for NLP.
+
+```python
+import torch
+import torch.nn as nn
+
+class BatchNorm(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super(BatchNorm, self).__init__()
+        
+        # 1. Learnable parameters (updated by optimizer)
+        self.gamma = nn.Parameter(torch.ones(num_features))  # Scale
+        self.beta = nn.Parameter(torch.zeros(num_features))   # Shift
+        
+        # 2. Running statistics (not updated by optimizer)
+        # requires_grad=False because these are moving averages
+        self.running_mean = nn.Parameter(torch.zeros(num_features), requires_grad=False)
+        self.running_var = nn.Parameter(torch.ones(num_features), requires_grad=False)
+        
+        self.eps = eps
+        self.momentum = momentum
+
+    def forward(self, x):
+        # Compute mean and variance over the batch (dim 0)
+        mean = x.mean(0, keepdim=True)
+        var = x.var(0, unbiased=False, keepdim=True)
+        
+        # Update running stats using Exponential Moving Average
+        # Only happens during forward pass training
+        self.running_mean.data = (1 - self.momentum) * self.running_mean + self.momentum * mean.squeeze()
+        self.running_var.data = (1 - self.momentum) * self.running_var + self.momentum * var.squeeze()
+        
+        # 3. Normalize the input
+        x_hat = (x - mean) / torch.sqrt(var + self.eps)
+        
+        # 4. Apply learnable scale and shift
+        return self.gamma * x_hat + self.beta
+```
+
+#### 1.6.2.2 Layer Normalization
+LayerNorm calculates the mean and variance for all the features of a single input at once. Unlike Batch Normalization, which looks at a whole group (batch) of items, LayerNorm treats every sentence or image independently. It prevents values from becoming so extreme that the mathematical "signals" (gradients) disappear or blow up, which would stop the learning process.
+
+For a single hidden layer (or input vector) $x$ with $d$ features, we first find the average value across all those features.
+
+$$\mu = \frac{1}{d} \sum_{i=1}^{d} x_i$$
+
+We measure how far each feature deviates from that mean:
+
+$$\sigma^2 = \frac{1}{d} \sum_{i=1}^{d} (x_i - \mu)^2$$
+
+Now we rescale the input. We subtract the mean (centering it at zero) and divide by the standard deviation (scaling the spread).We add a tiny value $\epsilon$ (epsilon, usually $1e-5$) inside the square root to ensure we never divide by zero if the variance happens to be exactly 0.
+
+$$\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}$$
+
+At this point, the data is perfectly "standardized." However, forcing every layer to have a mean of 0 and variance of 1 might actually hinder the model's ability to represent complex patterns.
+
+To fix this, we introduce two learnable parameters: $\gamma$ (gamma) for scaling and $\beta$ (beta) for shifting. These are vectors of the same size as the input. During backpropagation, the model learns the "optimal" scale and mean for each layer.
+
+$$y_i = \gamma \hat{x}_i + \beta$$
+
+**Advantages**
+- Batch Size Independent: Works perfectly even if your batch size is 1.
+
+- Long Sequence: The gold standard for Transformers
+
+- Lightweight Regularization: Because the mean and variance are calculated on a per-batch basis, they introduce a small amount of "noise" into the training process.
+
+- Stable Training: Allows for higher learning rates, meaning the model learns faster.
+  
+**Disadvantages**
+- Performance in CNNs: Generally performs worse than Batch Norm for computer vision tasks.
+
+```python
+import torch
+import torch.nn as nn
+
+class LayerNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-12):
+        super(LayerNorm, self).__init__()
+        # Learnable parameters: gamma (scaling) and beta (shifting)
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+
+    def forward(self, x):
+        # Calculate mean and variance across the last dimension (features)
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, unbiased=False, keepdim=True)
+        # '-1' means last dimension.
+
+        # Normalize the input
+        out = (x - mean) / torch.sqrt(var + self.eps)
+        
+        # Scale and shift using learnable parameters
+        out = self.gamma * out + self.beta
+        return out
+```
+
+The reason Layer Normalization (LN) is the gold standard for Natural Language Processing (NLP) while Batch Normalization (BN) is rarely used comes down to how data is structured in language versus images.
+
+Batch Normalization calculates statistics (mean and variance) across the batch dimension for each specific position in a sequence. If one sentence has 5 words and another has 50, the "padding" used to make them the same length messes up the math. LN calculates statistics across the features of a single word. It preserves the original semantic structure within a sentence and will not disrupt the tokens in other sentences. Besides, batch Norm requires a large, diverse batch to get an accurate estimate of the "global" mean and variance. In complex NLP tasks (like training a Transformer), memory constraints often force you to use very small batch sizes. Small batches lead to "noisy" statistics, which can make training unstable. Because LN is calculated per-sample, its performance is identical whether your batch size is 1 or 1,000.
+  
 #### 1.6.2.3 Instance Normalization
+
+Instance Normalization calculates the mean and variance for each channel of each sample independently. If you have a batch of color images, IN will normalize the Red, Green, and Blue channels of Image A completely separately from the Red, Green, and Blue channels of Image B. It was specifically designed for Style Transfer. In tasks where you want to apply the "style" of a Van Gogh painting to a photo of a dog, the network needs to be agnostic to the specific contrast or lighting (the "style statistics") of the original image. Style invariance strips away the specific mean and variance of the input image, which often carry style information. Feature independence prevents the contrast of one image in a batch from affecting how another image is processed.
+
+For an input tensor $x$ with dimensions $(B, C, H, W)$ where $B$ is batch, $C$ is channels, and $H, W$ are spatial dimensions, the mean and variance are calculated only over the $H$ and $W$ dimensions for each $C$:
+
+The Mean ($\mu_{bc}$):
+
+$$\mu_{bc} = \frac{1}{HW} \sum_{h=1}^{H} \sum_{w=1}^{W} x_{bchw}$$
+
+The Variance ($\sigma^2_{bc}$):
+
+$$\sigma^2_{bc} = \frac{1}{HW} \sum_{h=1}^{H} \sum_{w=1}^{W} (x_{bchw} - \mu_{bc})^2$$
+
+The Result:
+
+$$y_{bchw} = \gamma_c \left( \frac{x_{bchw} - \mu_{bc}}{\sqrt{\sigma^2_{bc} + \epsilon}} \right) + \beta_c$$
+
+**Advantages**
+- Superior Style Transfer: Dramatically improves the quality of image-to-image translation.
+
+- Generalization Ability: Makes the model easily generalize on new unseen data.
+  
+**Disadvantages**
+- Loss of Global Context: By normalizing every channel, it can discard useful global brightness/contrast info.
+
+- Narrow Utility: Rarely used in standard classification or detection (where BN is better).
+
+```python
+import torch
+import torch.nn as nn
+
+class InstanceNorm(nn.Module):
+    def __init__(self, num_features, eps=1e-5):
+        super(InstanceNorm, self).__init__()
+        # Unlike LayerNorm which takes d_model, IN takes number of channels
+        self.gamma = nn.Parameter(torch.ones(1, num_features, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, num_features, 1, 1))
+        self.eps = eps
+
+    def forward(self, x):
+        # x shape: [Batch, Channels, Height, Width]
+        
+        # We calculate mean across H and W (dim 2 and 3)
+        # keepdim=True is essential for broadcasting
+        mean = x.mean(dim=(2, 3), keepdim=True)
+        var = x.var(dim=(2, 3), keepdim=True, unbiased=False)
+
+        # Normalize
+        x_normalized = (x - mean) / torch.sqrt(var + self.eps)
+
+        # Scale and shift
+        return self.gamma * x_normalized + self.beta
+```
 
 #### 1.6.2.4 Group Normalization
 
+Group Normalization (GN) is a middle-ground approach between Batch Normalization and Layer Normalization. It was introduced to solve the "small batch size" problem in computer vision tasks like object detection and segmentation. Group Normalization divides the channels ($C$) of an image into $G$ groups. It then calculates the mean and variance for each group independently across the spatial dimensions ($H, W$). 
+
+In visual tasks, many channels represent similar features (e.g., different types of edge detectors or color gradients). By grouping these related channels together, GN can calculate more stable statistics than Instance Norm (which only looks at 1 channel) without being dependent on other images in the batch like Batch Norm. Since the math happens entirely within a single image, the model's performance doesn't degrade when you have a very small batch size (e.g., 1 or 2 images), which is common in high-resolution medical imaging or 8K video processing.
+
+For an input $x$ with $C$ channels, we divide them into $G$ groups. Each group has $C/G$ channels.
+
+1. The Mean ($\mu_g$): Calculated for each group $g$ in a specific image:
+
+$$\mu_g = \frac{1}{(C/G)HW} \sum_{i \in S_g} x_i$$
+
+Where $S_g$ is the set of pixels in the $g$-th group.
+
+2. The Variance ($\sigma^2_g$):
+
+$$\sigma^2_g = \frac{1}{(C/G)HW} \sum_{i \in S_g} (x_i - \mu_g)^2$$
+
+3. The Normalized Output:
+
+$$y_i = \gamma \frac{x_i - \mu_g}{\sqrt{\sigma^2_g + \epsilon}} + \beta$$
+
+When $G = 1$ (One Group), Group Norm becomes Layer Normalization. It calculates the mean and variance across all channels of the image. When $G = C$ ($C$ Groups), Group Norm becomes Instance Normalization. It calculates the mean and variance for each channel individually.
+
+**Advantages**
+- Small Batch: Performs significantly better than Batch Norm when batch size is < 8.
+
+- Transfer Learning: Weights trained with GN transfer better to different batch sizes in new tasks.
+  
+**Disadvantages**
+- Slightly slower than BN: At large batch sizes, BN is still faster and slightly more accurate.
+
+- Hyperparameter $G$: You have to decide how many groups to use (usually 32).
+
+- Memory: Can be slightly more memory-intensive during the grouping operation.
+
+```python
+import torch
+import torch.nn as nn
+
+class GroupNorm(nn.Module):
+    def __init__(self, num_groups, num_channels, eps=1e-5):
+        super(GroupNorm, self).__init__()
+        self.G = num_groups
+        self.C = num_channels
+        self.eps = eps
+        
+        # Learnable parameters per channel
+        self.gamma = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        G = self.G
+        
+        # 1. Reshape to separate channels into groups
+        # New shape: [Batch, Groups, Channels_per_group, H, W]
+        x = x.view(N, G, C // G, H, W)
+        
+        # 2. Calculate mean and var across (C//G, H, W)
+        # dims are 2, 3, 4 after reshaping
+        mean = x.mean(dim=(2, 3, 4), keepdim=True)
+        var = x.var(dim=(2, 3, 4), keepdim=True, unbiased=False)
+        
+        # 3. Normalize
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        
+        # 4. Reshape back to original [N, C, H, W]
+        x = x.view(N, C, H, W)
+        
+        # 5. Scale and shift
+        return x * self.gamma + self.beta
+```
+
 #### 1.6.2.5 RMS Norm
+
+Root Mean Square Layer Normalization (RMSNorm) is a simplified version of Layer Normalization. It was introduced to reduce the computational overhead of standard LayerNorm by removing the "re-centering" (mean subtraction) step, focusing entirely on "re-scaling." Standard LayerNorm centers the data (mean = 0) and then scales it (variance = 1). RMSNorm operates on the hypothesis that the re-centering property is not as important as the re-scaling property. It only scales the activation by the root mean square of the features.
+
+In massive models like Llama 3 or Mistral, every millisecond of computation counts. By removing the mean calculation and subtraction, it reduces the number of operations per layer. It provides the same stabilization benefits as LayerNorm (preventing exploding gradients) but with a simpler mathematical structure.
+
+$$\text{RMS}(x) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}$$
+
+$$\bar{x}_i = \frac{x_i}{\text{RMS}(x)} \cdot \gamma_i$$
+
+RMS Norm has faster computation and reduced parameters, but if the model's data distribution significantly benefits from being centered at zero, RMSNorm might underperform.
 
 #### 1.6.2.6 pRMS Norm
 
-#### 1.6.2.7 Deep Norm
+pRMSNorm is based on the idea that in a large layer, you don't actually need to look at every single feature to understand the general "scale" (the RMS) of the activations. Instead, you can estimate the RMS using only the first $p\%$ of the features. The key change is in how the RMS is calculated. Instead of summing all $d$ features, we only sum up to a partial index $k$ (where $k = p\% \cdot d$).
+
+$$\text{pRMS}(x) = \sqrt{\frac{1}{k} \sum_{i=1}^{k} x_i^2 + \epsilon}$$
+
+$$\bar{x}_i = \frac{x_i}{\text{pRMS}(x)} \cdot \gamma_i$$
+
+
+## 1.7 Transformer
