@@ -2282,6 +2282,17 @@ DeepNorm also scales the weights of the sub-layers (specifically the linear proj
 
 As models get deeper (e.g., beyond 100 layers), the "model updates" (how much the parameters change in one step) tend to explode at the beginning of training. Deep Norm prevents the gradients from becoming too large, allowing models to scale to 1,000+ layers without crashing.
 
+Below illustrates how we choose the parameters.
+<p align="center">
+<img width="900" height="275" alt="71c3232b-836e-439e-ab6e-5bec2374dd66" src="https://github.com/user-attachments/assets/bac47370-3cb3-407c-ae60-cb210d50e084" />
+</p>
+
+Implementation:
+<p align="center">
+<img width="740" height="281" alt="dddd1731-bff0-4494-a65c-8b0badea4d6d" src="https://github.com/user-attachments/assets/8194c4d9-f683-4deb-bb53-b0d38a127e25" />
+
+</p>
+
 ### 1.6.2 Normalization
 
 Without normalization, deep networks are extremely difficult to train due to internal covariate shift. As weights are updated in early layers, the distribution of inputs to later layers changes constantly. This forces later layers to constantly "chase" a moving target, significantly slowing down the learning process. By keeping activations in a stable range, the optimizer (like Adam) can use higher learning rates, reaching the optimal solution much faster. It prevents gradients from becoming too large (exploding) or too small (vanishing) during backpropagation. It also adds a small amount of "noise" to the activations, which can act as a light form of regularization, helping the model generalize better to new data.
