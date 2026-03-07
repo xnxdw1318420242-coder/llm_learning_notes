@@ -72,3 +72,19 @@
     * **1.6.2.5 RMS Norm**
     * **1.6.2.6 pRMS Norm**
     
+**1.7 Transformer**
+* **1.7.1 Weight Sharing**
+* **1.7.2 Parameters & FLOPs**
+* **1.7.3 Encoder-Only, Decoder-Only, Encoder-Decoder**
+* **1.7.4 Decoding Strategy**
+    * **1.7.4.1 Greedy Search**
+    * **1.7.4.2 Beam Search**
+    * **1.7.4.3 Top-K Sampling**
+    * **1.7.4.4 Top-P Sampling**
+    * **1.7.4.5 Random Sampling**
+    * **1.7.4.6 Best-of-N**
+    * **1.7.4.7 Majority Vote & Self-Consistency**
+    * **1.7.4.8 Temperature**
+
+
+### **2. Pretraining**
