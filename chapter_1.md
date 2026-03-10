@@ -2684,17 +2684,117 @@ Encoder-decoder architecture is the original Transformer structure, combining an
 
 #### 1.7.4.1 Greedy Search
 
+Greedy Search is the simplest strategy for generating text. At each step of the generation process, the model selects the token with the highest absolute probability as the next word in the sequence. 
+
+**Advantages**
+- Efficiency: It is computationally inexpensive because the model only needs to track one path.
+
+- Speed: Due to its simplicity, it offers the lowest latency for text generation.
+  
+**Disadvantages**
+- Repetitiveness: Greedy Search is notorious for getting stuck in "lullaby loops," where the model repeats the same phrase or sentence indefinitely.
+
 #### 1.7.4.2 Beam Search
 
+Beam Search is a heuristic search algorithm used in LLM decoding to find a sequence of tokens that is more likely than one found by Greedy Search, without the massive computational cost of an exhaustive search. Instead of only picking the single best word at each step, Beam Search keeps track of the top $k$ most probable sequences (where $k$ is the "beam width").
+
+At the first step, the model selects the $k$ most likely next tokens. For each of those $k$ tokens, the model predicts the next set of possible tokens. It calculates the cumulative probability for every new path. For a sequence $Y = (y_1, y_2, ..., y_t)$, the score is typically the log-probability. The algorithm keeps only the top $k$ sequences with the highest total scores and discards the rest. This repeats until an "End of Sentence" token is reached or a maximum length is met.
+
+<p align="center">
+<img width="275" height="177" alt="4da05a6a-5621-45f6-9b6d-729b7dd79ca4" src="https://github.com/user-attachments/assets/332a7ab6-b405-48fd-9f9c-daa01cb29022" />
+</p>
+
+**Advantages**
+- Global Optimization: It looks ahead. A word that is slightly less likely now might lead to a much more coherent and high-probability sentence later.
+
+- Speed: Due to its simplicity, it offers the lowest latency for text generation.
+  
+**Disadvantages**
+- Lack of Diversity: High-probability sequences are often very safe and generic. In creative tasks, Beam Search can still feel "robotic" compared to sampling methods.
+
+- The "Empty" Problem: Sometimes, Beam Search can favor shorter sequences because every additional word adds a negative value to the log-probability score (though length normalization is often used to fix this).
+  
 #### 1.7.4.3 Top-K Sampling
 
+Top-K Sampling is a "redistributive" decoding strategy that introduces randomness into the generation process. Unlike Greedy or Beam Search, which are deterministic, Top-K allows the model to choose from a pool of likely candidates, making the output more human-like and creative.
+
+- At each step, the model generates a probability distribution for every word in its vocabulary.
+- The algorithm identifies the $K$ most likely tokens (the "top K") based on their probability scores.
+- All tokens outside of this top $K$ have their probabilities set to zero.
+- The probabilities of the remaining $K$ tokens are re-normalized so that they sum to 1.
+- The model then randomly samples the next token from this new, filtered distribution.
+
+<p align="center">
+<img width="358" height="232" alt="e3987382-5b54-492a-a7d7-4320ff024309" src="https://github.com/user-attachments/assets/ddd6baa1-0dee-4671-bad0-3240b98cce44" />
+
+</p>
+
+**Advantages**
+- Reduced Gibberish: By cutting off the "long tail" of low-probability words, it prevents the model from picking nonsensical or highly irrelevant tokens that might otherwise be chosen in pure random sampling.
+
+- Increased Creativity: By allowing the model to occasionally pick a less-likely word (as long as it's in the top $K$), it avoids the repetitive and "safe" nature of Greedy Search.
+  
+**Disadvantages**
+- Fixed Tail Problem: The primary drawback is that $K$ is static. In some contexts, there might be 100 "good" next words, but Top-K will ignore 90 of them. In other contexts, there might only be 2 "good" words, but Top-K will force the model to choose from 8 "bad" ones.
+
+- Potential for Instability: If $K$ is too high, the model may still occasionally drift into incoherent territory by selecting a word that was only "the best of the worst."
+  
 #### 1.7.4.4 Top-P Sampling
+Top-P Sampling, also known as Nucleus Sampling, is a dynamic decoding strategy that addresses the limitations of Top-K. Instead of picking a fixed number of tokens ($K$), it chooses a subset of tokens whose cumulative probability reaches a threshold $P$.
 
+- The model calculates the probability for all possible next tokens and sorts them from highest to lowest.
+- It adds up the probabilities of these sorted tokens one by one (e.g., $0.3 + 0.2 + 0.15...$).
+- It stops as soon as the sum reaches the pre-defined threshold $P$ (usually between 0.9 and 0.95).
+- This small set of tokens is the "nucleus." All tokens outside this set are discarded.
+- The model re-normalizes the probabilities of the nucleus and randomly samples the next token from it.
+
+<p align="center">
+<img width="439" height="202" alt="661c912e-b4be-45aa-9cba-fe6f4e874629" src="https://github.com/user-attachments/assets/d181f91e-2670-4d7f-94b4-f78a5d543749" />
+</p>
+
+**Advantages**
+- Dynamic Breadth: This is the biggest strength. If the model is very confident, the nucleus might only contain 1 or 2 words. If the model is uncertain, the nucleus expands to include dozens of words.
+  
+**Disadvantages**
+- Computational Overhead: Calculating the cumulative sum and sorting the vocabulary at every single step is slightly more intensive than simpler methods like Greedy Search.
+  
+- Hyperparameter Sensitivity: Finding the "sweet spot" for $P$ can be tricky. If $P$ is too high, you risk including "garbage" tokens; if it's too low, the model becomes as boring and deterministic as Greedy Search.
+  
 #### 1.7.4.5 Random Sampling
+Random Sampling is the most basic stochastic decoding strategy. Unlike Greedy Search, which is deterministic, random sampling introduces high variance by selecting the next token based on its predicted probability distribution without any filtering.
 
+- The model calculates the "logits" (raw scores) for every word in its vocabulary and converts them into a probability distribution using a Softmax function.
+- Each word is assigned a probability between 0 and 1 (e.g., "The" = 0.15, "A" = 0.08, "Apple" = 0.0001).
+- The model "rolls a die" weighted by these probabilities. Even a very low-probability word has a non-zero chance of being selected.
+- The chosen word is added to the sequence, and the process repeats for the next token.
+
+**Advantages**
+- This method produces the most diverse and unexpected outputs. It is excellent for brainstorming, poetry, or "out-of-the-box" creative writing.
+
+- Because the model isn't forced into the single highest-probability path, it is much less likely to get stuck repeating the same phrase indefinitely.
+  
+**Disadvantages**
+- Because the model can pick any word in the vocabulary, it might select a totally irrelevant or nonsensical token (the "long tail"), leading to "hallucinations" or gibberish.
+  
+- Without constraints like Top-K or Top-P, the output can quickly drift away from the original prompt or lose grammatical structure.
+  
 #### 1.7.4.6 Best-of-N
+
+Best-of-N (also known as Rejection Sampling) is a decoding strategy where the model generates multiple independent candidate responses and uses a separate "judge" to select the single best one. Unlike strategies that modify the probability distribution at each token (like Top-P or Top-K), Best-of-N operates at the sequence level. 
 
 #### 1.7.4.7 Majority Vote & Self-Consistency
 
+While often mentioned together, these represent a process of consensus-based verification. The core idea is that if multiple independent "chains of thought" lead to the same destination, that destination is likely the correct one.
+
 #### 1.7.4.8 Temperature 
 
+In LLM decoding, Temperature ($T$) is a hyperparameter used to control the "randomness" or "creativity" of the model's output. It works by scaling the raw scores (logits) before they are converted into probabilities. The temperature is applied during the Softmax step. If $z_i$ is the logit for the $i$-th token in the vocabulary, the adjusted probability $q_i$ is calculated as:
+
+$$q_i = \frac{\exp(z_i / T)}{\sum_{j} \exp(z_j / T)}$$
+
+The value of $T$ determines the "shape" of the probability distribution. With low temperature ($T < 1$), it "sharpens" the distribution. The gap between the highest-probability token and the others becomes much larger. The model becomes more deterministic and confident. It almost always picks the top choice, making it ideal for factual tasks, coding, or data extraction. As $T \to 0$, it becomes identical to Greedy Search. With high temperature ($T > 1$), it "flattens" or "smooths" the distribution. The differences between the logits are compressed, making low-probability tokens more likely to be picked. The model becomes more creative and diverse. However, it also increases the risk of hallucinations and grammatical errors. As $T \to \infty$, the distribution becomes Uniform, meaning the model picks tokens completely at random. With default temperature ($T = 1$), the logits are passed through the Softmax function without any scaling. This represents the model's "natural" predicted distribution.
+
+<p align="center">
+<img width="330" height="202" alt="d343d1bb-11e9-4ff7-95e3-4a1d2d4c7a55" src="https://github.com/user-attachments/assets/1f95b2f1-9cc3-4693-93ab-bbd08775a940" />
+
+</p>
