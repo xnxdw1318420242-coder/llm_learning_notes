@@ -56,13 +56,13 @@ Standard BERT wasn't designed to produce high-quality sentence embeddings. While
 To solve these issues and make Cosine Similarity a meaningful metric, SBERT uses a Siamese Network architecture (fine-tuning with paired sentences) under three specific objective functions:
 1. Classification Objective Function. It is used when you have a dataset with discrete labels (e.g., Entailment, Neutral, Contradiction). It concatenates the two sentence embeddings ($u$ and $v$) along with their element-wise difference ($|u - v|$) before the softmax. The difference vector $|u - v|$ is crucial as it highlights the dimensions where the two sentences disagree.
 
-$o = \text{softmax}(W_t(u, v, |u - v|))$
+$$o = \text{softmax}(W_t(u, v, |u - v|))$$
 
 2. Regression Objective Function. It is used to predict a continuous similarity score (e.g., a scale from 0 to 5). It calculates the cosine similarity between the two embeddings directly. It typically uses Mean Squared Error (MSE) to minimize the distance between the predicted similarity and the gold standard label.
 
 3. Triplet Objective Function. It is used to ensure a specific "Anchor" sentence is closer to a "Positive" (similar) sentence than a "Negative" (dissimilar) one.  It forces the distance between the Anchor ($s_a$) and Positive ($s_p$) to be smaller than the distance between the Anchor and Negative ($s_n$) by at least a margin ($\epsilon$).
 
-$o = $\max(\|s_a - s_p\| - \|s_a - s_n\| + \epsilon, 0)$ 
+$$o = \max(\|s_a - s_p\| - \|s_a - s_n\| + \epsilon, 0)$$
 
 #### 2.1.2.1 Sentence-BERT
 
