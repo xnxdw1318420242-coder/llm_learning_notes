@@ -183,6 +183,60 @@ In addition to the standard Masked Language Model (MLM) task, SpanBERT introduce
 Following the findings of models like RoBERTa and ALBERT, SpanBERT also removes the NSP task. SpanBERT is particularly effective for extractive Question Answering (QA) and coreference resolution, tasks where representing a specific "span" of text is critical for accuracy.
 
 #### 2.1.1.5 DeBERTa V1/2
+
+DeBERTa (Decoding-enhanced BERT with Disentangled Attention) is a model introduced by Microsoft in 2021 that achieved superhuman performance on the SuperGLUE benchmark. It is widely used today as a foundation for challenging NLP and even some NLG tasks. DeBERTa's core purpose is to improve BERT’s self-attention mechanism and masking strategies to enhance the model's linguistic understanding and generalization capabilities.
+
+In traditional BERT, each token is represented by a single vector that sums its content and absolute position. DeBERTa argues that word dependencies depend heavily on relative rather than absolute distance (e.g., words are more likely to be related if they are adjacent). To model this, DeBERTa represents each token $i$ using two separate vectors:
+
+- $\{H_i\}$: Representing the word's Content.
+- $\{P_{i|j}\}$: Representing the Relative Position of token $i$ with respect to token $j$.
+
+The cross-product of the Query $Q_i$ and Key $K_j$ is expanded as follows:
+
+$$A_{i,j} = \{H_i, P_{i|j}\} \times \{H_j, P_{j|i}\}^T$$
+
+The total attention weight between token $i$ and token $j$ is calculated by summing four separate types of interactions:
+
+- Content-to-Content ($H_i H_j^T$): How much the meaning of word $i$ relates to the meaning of word $j$.
+- Content-to-Position ($H_i P_{j|i}^T$): How much the meaning of word $i$ relates to the relative position of word $j$.
+- Position-to-Content ($P_{i|j} H_j^T$): How much the relative position of word $i$ relates to the meaning of word $j$.
+- Position-to-Position ($P_{i|j} P_{j|i}^T$): The document notes that because relative position embeddings are already used, this term provides little additional information and is removed in the final implementation to save computation.
+
+The simplified attention score $A_{i,j}$ used in the model is:
+
+$$A_{i,j} = \underbrace{Q_i^c K_j^{c\intercal}}_{\text{Content-to-Content}} + \underbrace{Q_i^c K_{\delta(i,j)}^{r\intercal}}_{\text{Content-to-Position}} + \underbrace{K_j^c Q_{\delta(j,i)}^{r\intercal}}_{\text{Position-to-Content}}$$
+
+
+The model defines relative distance within a maximum range $k$. The relative distance $\delta(i, j)$ is defined by the following mapping:
+
+$$\delta(i, j) = 
+\begin{cases} 
+0 & \text{if } i - j \leq -k \\
+2k - 1 & \text{if } i - j \geq k \\
+i - j + k & \text{otherwise}
+\end{cases}$$
+
+
+This mapping ensures the resulting indices fall within the range $[0, 2k-1]$, allowing the model to distinguish between "left" (past) and "right" (future) contexts relative to the current token.
+
+DeBERTa uses separate projection matrices ($W_{q,c}, W_{k,c}, W_{v,c}$) for content and ($W_{q,r}, W_{k,r}$) for relative positions to generate query and key vectors. Because the attention score is the sum of three distinct components (after removing position-to-position), the final attention matrix is scaled by $\sqrt{3d}$ instead of the standard $\sqrt{d}$ to maintain stability. This approach allows the model to understand that the relationship between "deep" and "learning" is strong because they are adjacent, regardless of where they appear in a sentence.
+
+DeBERTa has better information separation because processing content and position independently reduces mutual interference between these two distinct types of information. DeBERTa achieves a notable increase in performance across various Natural Language Understanding (NLU) tasks compared to the original BERT model.
+
+<p align="center">
+
+
+</p>
+
+The Enhanced Mask Decoder (EMD) is a specialized mechanism in DeBERTa designed to address a critical limitation of the standard BERT model: the reliance on relative positions alone during the pre-training phase. While relative positions help capture local dependencies, certain tasks (like predicting a masked word) require absolute position information to fully understand the sentence structure. For example, in the phrase "a new store opened beside the new mall," both "store" and "mall" follow the word "new," making them indistinguishable if the model only looks at local relative context.
+
+Instead of merging absolute positions at the very first input layer (as BERT does), DeBERTa incorporates them right before the final prediction head. The EMD typically consists of $n$ layers (where $n=2$) that share weights to remain parameter-efficient. It takes two primary inputs:
+
+- $H$: The hidden states (contextual embeddings) from the final Transformer encoder layer.
+- $I$: The specific information needed for decoding. For the first EMD layer, $I$ is the absolute position embedding; for subsequent layers, $I$ is the output from the previous EMD layer.
+
+
+
 #### 2.1.1.6 DeBERTa V3
 #### 2.1.1.7 XLNet
 
