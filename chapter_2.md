@@ -182,7 +182,7 @@ In addition to the standard Masked Language Model (MLM) task, SpanBERT introduce
 
 Following the findings of models like RoBERTa and ALBERT, SpanBERT also removes the NSP task. SpanBERT is particularly effective for extractive Question Answering (QA) and coreference resolution, tasks where representing a specific "span" of text is critical for accuracy.
 
-#### 2.1.1.5 DeBERTa V1/2
+#### 2.1.1.5 DeBERTa 
 
 DeBERTa (Decoding-enhanced BERT with Disentangled Attention) is a model introduced by Microsoft in 2021 that achieved superhuman performance on the SuperGLUE benchmark. It is widely used today as a foundation for challenging NLP and even some NLG tasks. DeBERTa's core purpose is to improve BERT’s self-attention mechanism and masking strategies to enhance the model's linguistic understanding and generalization capabilities.
 
@@ -223,11 +223,6 @@ DeBERTa uses separate projection matrices ($W_{q,c}, W_{k,c}, W_{v,c}$) for cont
 
 DeBERTa has better information separation because processing content and position independently reduces mutual interference between these two distinct types of information. DeBERTa achieves a notable increase in performance across various Natural Language Understanding (NLU) tasks compared to the original BERT model.
 
-<p align="center">
-
-
-</p>
-
 The Enhanced Mask Decoder (EMD) is a specialized mechanism in DeBERTa designed to address a critical limitation of the standard BERT model: the reliance on relative positions alone during the pre-training phase. While relative positions help capture local dependencies, certain tasks (like predicting a masked word) require absolute position information to fully understand the sentence structure. For example, in the phrase "a new store opened beside the new mall," both "store" and "mall" follow the word "new," making them indistinguishable if the model only looks at local relative context.
 
 Instead of merging absolute positions at the very first input layer (as BERT does), DeBERTa incorporates them right before the final prediction head. The EMD typically consists of $n$ layers (where $n=2$) that share weights to remain parameter-efficient. It takes two primary inputs:
@@ -235,10 +230,93 @@ Instead of merging absolute positions at the very first input layer (as BERT doe
 - $H$: The hidden states (contextual embeddings) from the final Transformer encoder layer.
 - $I$: The specific information needed for decoding. For the first EMD layer, $I$ is the absolute position embedding; for subsequent layers, $I$ is the output from the previous EMD layer.
 
+By introducing absolute positions at the end of the stack, the model can use the rich relative-position-aware context it has already learned to "anchor" itself to specific points in the sequence. This is visually represented in the architecture where absolute position embeddings are added only at the decoder stage.
+
+The EMD functions as a flexible decoder that can utilize various types of input information.
+In general case, each EMD layer output becomes the input $I$ for the next:
+
+$$I_{next} = \text{EMD\_Layer}(I, H)$$
+
+If we set $n=1$ and the input $I=H$, the EMD mathematically simplifies to a standard BERT-style decoder. However, by setting $n=2$ and using absolute positions as the initial $I$, DeBERTa gains superior flexibility in modeling complex syntax.
+
+SiFT (Scale-invariant Fine-Tuning) is a robust training technique introduced alongside DeBERTa to improve the model's stability and generalization during the fine-tuning phase. Standard fine-tuning can be unstable because small perturbations in the input can lead to large changes in the model's output. While Virtual Adversarial Training (VAT) helps by adding noise to inputs to make the model more robust, it often suffers from "unstable gradients," especially when dealing with different model scales (like BERT-base vs. BERT-large). SiFT improves upon VAT by applying perturbations to normalized word embeddings rather than the raw embeddings.
+
+Before adding any noise, SiFT normalizes the word embeddings. If $x$ is the word embedding, the normalized version $\hat{x}$ is calculated as:
+
+$$\hat{x} = \text{LayerNorm}(x)$$
+
+This ensures that the embeddings are on a consistent scale, making the subsequent noise application more predictable across different models and tasks. Once normalized, SiFT adds a small amount of adversarial noise ($\delta$) to the embeddings:
+
+$$\tilde{x} = \hat{x} + \delta$$
+
+The goal is to train the model such that the output for the "noisy" input $\tilde{x}$ remains as close as possible to the output for the original input $x$.
+
+The training process uses a specific loss function to enforce this stability:
+
+- Standard Loss: The model is trained to minimize the standard cross-entropy loss for the specific task.
+- Robustness Loss (Kullback-Leibler Divergence): The model also minimizes the KL divergence between the probability distribution of the original input and the perturbed input. This forces the model to be "smooth"—meaning small changes in the embedding space won't cause the model to jump to a different classification.
+  
+$$\min_{\theta} LD(P(y|x; \theta), P(y|x+\delta; \theta))$$
+
+DeBERTa utilizes two main objectives during its pre-training phase:
+- Enhanced Masked Language Model (MLM): Like BERT, DeBERTa is trained to predict masked tokens in a sequence. However, it uses an "Enhanced" version that incorporates the Disentangled Attention mechanism—modeling content and relative positions separately—and the Enhanced Mask Decoder (EMD), which introduces absolute position information at the decoding stage to better distinguish between identical words in different positions.
+- Sentence Order Prediction (SOP): DeBERTa replaces BERT’s Next Sentence Prediction (NSP) task with SOP. This task requires the model to determine if two sentences are in their original order or have been swapped. SOP is considered more challenging than NSP, encouraging the model to learn deeper semantic relationships and cross-sentence coherence.
+
+DeBERTa-v2 shifts its tokenization strategy to handle text more efficiently. It moves away from the previous tokenizer in favor of SentencePiece. The vocabulary size is increased from 50k to 128k. This larger vocabulary allows the model to better represent diverse datasets and reduces the fragmentation of rare words into too many sub-tokens. 
+
+Besides, in the original DeBERTa, the disentangled attention used three terms: Content-to-Content, Content-to-Position, and Position-to-Content. DeBERTa-v2 integrates an additional interaction term: Position-to-Content (often referred to in technical shorthand as n2c or neighbor-to-content). While the original model already had position-aware components, v2 refines how positional information "queries" content, allowing for a more nuanced understanding of syntactic dependencies based on relative distance.
+
+DeBERTa-v2 also introduces significantly larger model variants to push the boundaries of NLU performance: The architecture for the largest version includes 48 layers with a hidden dimension ($H$) of 1536. Unlike BERT or DeBERTa-v1, which often use a simple linear projection for the input, DeBERTa-v2 adds a convolutional layer to the input embedding stage. This "Conv-Stem" acts as a local feature extractor before the global self-attention layers take over. This allows the model to capture immediate n-gram relationships more effectively at the very start of the network, which has been shown to improve the stability of deep transformer stacks.
+
+DeBERTa-v3 is an evolution of the model that changes the core training philosophy while keeping the architectural breakthroughs (like Disentangled Attention) from previous versions. The biggest shift in v3 is moving from a "Guess the Missing Word" task to a "Spot the Fake Word" task. Instead of using the standard Masked Language Model (MLM) where the model predicts a hidden token, DeBERTa-v3 uses RTD, similar to the ELECTRA model. It works like a GAN (Generative Adversarial Network) with two parts:
+
+- The Generator: A small model that performs MLM. It takes a sentence with masked words and fills them in with plausible (but potentially "fake") words.
+
+$$L_{MLM} = \mathbb{E} \left( - \sum_{i \in C} \log p_{\theta_G} (\tilde{x}_{i,G} = x_i | \tilde{X}_G) \right)$$
+
+- The Discriminator: This is the main DeBERTa model. Instead of predicting what the original word was, it must decide for every word in the sentence: "Is this the original word, or was it replaced by the generator?".
+
+$$L_{RTD} = \mathbb{E} \left( - \sum_{i} \log p_{\theta_D} (\mathbb{1}(\tilde{x}_{i,D} = x_i) | \tilde{X}_{D,i}) \right)$$
+
+The model is trained using a multi-task loss function that combines the Generator's attempt to learn language and the Discriminator's attempt to catch fakes:
+
+$$L = L_{MLM} + \lambda L_{RTD}$$
+
+In standard MLM, the model only learns from the ~15% of tokens that are masked. In RTD, the model must make a binary choice for 100% of the tokens in the input, which is a much more efficient use of data. The generator is trained to produce "ambiguous" tokens—fake words that actually fit the context—forcing the discriminator to learn very fine-grained semantic differences to tell them apart.
+
+A major technical challenge in v3 was how the Generator and Discriminator should share their "vocabulary" (embeddings). The authors explored three ways:
+
+- Embedding Sharing (ES): They share the same table, but the two tasks pull the meanings in opposite directions (MLM wants similar words together; RTD wants to separate them).
+- No Sharing (NES): They have completely separate tables. This is faster but hurts overall performance.
+- GDES (The Winner): This is a clever compromise used in v3. The Discriminator "borrows" the embeddings from the Generator but is not allowed to change them directly. Instead, it uses a separate "delta" ($E_\Delta$) to adapt those embeddings for its own needs.
+
+$$E_D = sg(E_G) + E_{\Delta}$$
+
+The Discriminator "borrows" the Generator's knowledge but isn't allowed to change the Generator's weights. $E_{\Delta}$ is a specific "delta" or adjustment layer that the Discriminator learns on its own to fine-tune the borrowed embeddings for the "spot the fake" task.
+
+#### 2.1.1.6 XLNet
+
+The primary goal of XLNet: to combine the strengths of two main language modeling approaches.
+
+- AR LM (Auto-Regressive, like GPT): These models predict tokens from left to right. While they are naturally suited for generative tasks, they suffer from a "context gap" because they can only see information from one direction.
+
+- AE LM (Auto-Encoding, like BERT): These models use bi-directional context by randomly masking tokens and predicting them. However, the use of the [MASK] token creates a mismatch between pre-training (where masks exist) and inference (where they do not).
+
+- The XLNet Solution: It aims to keep the consistency of AR modeling (no masks) while capturing the bi-directional context of AE models through a technique called Permutation Language Modeling (PLM).
+
+Instead of predicting tokens in their natural linear order, XLNet randomly generates a permutation $\pi$ of the sequence indices. The model performs predictions based on the order of the permutation.  At the attention layer level, a mask ensures that the token at position $\pi(j)$ can only access the "prior" tokens $\pi(k)$ where $k < j$ in the permutation. Since tokens appear in different positions across various random permutations, every token eventually gets to "see" every other token in the sequence, achieving a pseudo-bi-directional understanding without using masks.
+
+In standard AR modeling, a prediction at position $z$ depends on both the context and the content of the token at $z$. In XLNet's permutation approach, this creates a paradox: to predict the word at position $z$, the model needs to know the position but must not know the content of that word. To solve this, XLNet uses two separate hidden representations (streams):
+
+- Content Stream ($h_z$): Similar to standard Transformer states, this encodes both the context and the content of token $z$. It is used as context for other tokens.
+  
+- Query Stream ($g_z$): This encodes the context and the target position $z$, but specifically excludes the content of token $z$. This is used to predict the actual word at that position.
 
 
-#### 2.1.1.6 DeBERTa V3
-#### 2.1.1.7 XLNet
+To handle the massive computational requirements of permutations and long-range dependencies, XLNet integrates two more techniques.
+
+1. Predicting every token in every permutation is extremely expensive. XLNet only predicts the last $1/K$ tokens in a given permutation sequence. This focuses the model's learning on tokens that already have a significant amount of context available, which improves training efficiency.
+2. XLNet inherits the "Extra-Long" architecture from Transformer-XL to handle long sequences. Instead of treating segments independently (which causes "context fragmentation"), the model reuses hidden states from previous segments as a memory cache. Since absolute positions (1, 2, 3...) lose meaning when segments are reused, XLNet uses relative distances between tokens to maintain spatial coherence across long texts.
 
 ### 2.1.2 Contrastive Learning Model
 Standard BERT wasn't designed to produce high-quality sentence embeddings. While convenient, SBERT researchers found the [CLS] token performs poorly for semantic similarity. Since the [CLS] token was trained specifically for the NSP (Next Sentence Prediction) task, it captures "logical follow-up" information rather than the actual semantic meaning of the sentence. Taking the mean or max of all token embeddings in a sentence is generally better than using [CLS]. However, it suffers from anisotropy. In a pre-trained BERT space, word embeddings tend to occupy a very narrow cone. This means even unrelated sentences can have a high cosine similarity, making it difficult to distinguish between them based on distance.
@@ -256,12 +334,47 @@ $$o = \max(\|s_a - s_p\| - \|s_a - s_n\| + \epsilon, 0)$$
 
 #### 2.1.2.1 Sentence-BERT
 
+while BERT is a powerful language model, it has significant limitations when it comes to representing entire sentences for similarity or retrieval tasks. Sentence-BERT (SBERT) was developed to overcome these efficiency and performance hurdles.
+
+Using a standard BERT model to find similar sentences is problematic for several reasons. BERT is primarily trained on Masked Language Modeling (MLM) and Next Sentence Prediction (NSP). It is not specifically optimized for sentence-level similarity, meaning its standard output (like the [CLS] token) often yields poor semantic distance measurements.  To compare two sentences, BERT requires them to be concatenated into a single input for a forward pass. If you want to find the most similar pairs among $N$ sentences, you must perform $N(N-1)/2$ forward passes. Because BERT needs to see both sentences at once to calculate their relationship, you cannot pre-calculate and "cache" individual sentence embeddings for quick lookup.
+
+SBERT modifies the BERT architecture using a Siamese or Triplet network structure. This allows the model to process sentences independently but in a way that maps them into a shared vector space where similar sentences are physically close to each other. SBERT encodes each sentence into a fixed-sized vector in a single forward pass. Once encoded, similarity can be calculated instantly using simple math like Cosine Similarity or Dot Product. During training, SBERT is supervised with tasks that explicitly group similar sentence pairs together and push dissimilar ones apart. This results in much higher-quality semantic embeddings compared to vanilla BERT's [CLS] token. Because sentences are encoded individually, you can compute embeddings for a large database once, index them, and perform massive searches in milliseconds.
+
+Because SBERT provides high-quality, efficient sentence vectors, it is widely used for semantic search, clustering and retrieval systems.
+
+SBERT uses a Siamese network (or twin network) architecture. This means it consists of two identical BERT models that share the same weights. During inference or comparison, each sentence is fed into its own BERT branch separately. Because the weights are tied, the model maps both sentences into the same vector space using the exact same transformation logic.
+
+Standard BERT produces an embedding for every token in a sentence. SBERT adds a pooling operation after the BERT output to derive a single, fixed-sized "sentence embedding" ($u$ and $v$). Common pooling strategies include:
+
+- MEAN-strategy (Default): Taking the average of all contextualized word embeddings.
+- MAX-strategy: Taking the maximum value across each dimension of the token embeddings.
+- CLS-token: Using the output of the special [CLS] token (though this is often less effective for similarity).
+
+To ensure the embeddings are semantically meaningful, SBERT is fine-tuned on specific tasks using different objective functions. If the model is trained on labeled pairs (like "Entailment" vs. "Contradiction"), it concatenates the embeddings $u$ and $v$ with their element-wise difference $|u - v|$ and multiplies them by a trainable weight matrix $W$:
+
+$$\text{softmax}(W(u, v, |u - v|))$$
+
+In regression objective, the model calculates the Cosine Similarity between $u$ and $v$. The loss (typically Mean Squared Error) is then computed against a gold standard similarity score (e.g., from 0 to 5).
+
+For triplet objective, the model is given an Anchor sentence ($a$), a Positive sentence ($p$), and a Negative sentence ($n$). It is trained to minimize the distance between $a$ and $p$ while maximizing the distance between $a$ and $n$.
+
+By encoding sentences into vectors once and caching them, SBERT avoids the $O(N^2)$ complexity of standard BERT cross-encoders. Finding the most similar pair among 10,000 sentences is reduced from ~65 hours with BERT to ~5 milliseconds with SBERT.
+
+The improvements and alternatives to SBERT focus on more flexible architectures, contrastive learning techniques, and specialized retrieval strategies.
+
+1. Sentence-T5 / ST5. Unlike SBERT's encoder-only setup, ST5 uses the T5 (Text-To-Text Transfer Transformer) Encoder-Decoder structure. It treats the entire sentence as input and guides the output side to a fixed token form to extract the sentence vector. The Encoder-Decoder structure offers more flexibility for generation-based tasks, though it may not always outperform SBERT in simple similarity scenarios.
+
+2. SimCSE. SimCSE introduces a more lightweight contrastive learning approach compared to SBERT's reliance on labeled classification or regression data. It uses different random dropout masks on the same input sentence to create "positive pairs," training the model to pull these closer while pushing different sentences further apart. When fine-tuned on STS (Semantic Textual Similarity) data, it demonstrates strong performance and is considered a mainstream alternative to SBERT.
+
+3. E5 and Contriever. E5 (Embedding from an Extensible Encoder Effort) utilizes large-scale contrastive learning specifically optimized for retrieval and semantic search tasks, achieving superior results in these domains. Similar to E5, Contriever employs a contrastive learning philosophy with varied pre-training strategies aimed specifically at text-to-text retrieval, showing significant effectiveness.
+
 ## 2.2 Encoder-Decoder
 ### 2.2.1 BART
 ### 2.2.2 T5
 
 ## 2.3 Non-Causal Decoder-Only
 ### 2.3.1 UniLM
+### 2.3.2 GLM
 
 ## 2.4 Causal Decoder-Only
 ### 2.4.1 GPT
