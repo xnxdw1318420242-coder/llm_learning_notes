@@ -369,16 +369,175 @@ The improvements and alternatives to SBERT focus on more flexible architectures,
 3. E5 and Contriever. E5 (Embedding from an Extensible Encoder Effort) utilizes large-scale contrastive learning specifically optimized for retrieval and semantic search tasks, achieving superior results in these domains. Similar to E5, Contriever employs a contrastive learning philosophy with varied pre-training strategies aimed specifically at text-to-text retrieval, showing significant effectiveness.
 
 ## 2.2 Encoder-Decoder
+The core pre-training logic for Encoder-Decoder architectures generally revolves around the concept of Denoising Auto-encoding. In this approach, the model is given a "noisy" or corrupted version of an input sequence and is tasked with reconstructing the original, clean text. 
+
+1. Span Corruption (Text Infilling). This task focuses on teaching the model to predict missing chunks of text. Several spans (usually continuous sequences of tokens) are randomly selected from the input and replaced with a special sentinel or [MASK] token. The Encoder processes the corrupted sequence, and the Decoder is responsible for reconstructing the missing parts or the entire original sequence. This includes T5 and MASS (which specifically focuses on generating only the masked portions).
+2. Denoising Auto-Encoder. This task introduces more varied structural noise to make the model robust to different types of corruption. A variety of noise operations are applied to the input, such as randomly deleting tokens, replacing tokens with random ones, or shuffling the order of sentences. The Encoder reads the noisy "shuffled" sequence, and the Decoder must "denoise" the data to restore the text to its original, coherent form. BART heavily utilizes shuffling and token deletion during its pre-training.
+3. Multi-Task Multi-Target Masking. This approach unifies various natural language tasks into a single framework. It frames all NLP tasks (e.g., translation, summarization, Q&A) as a "text-to-text" problem. Special instruction tags or prefixes are added before the input to guide the model. This teaches the model a universal way to handle different outputs based on the provided command. Typical models include T5, Flan-T5, and mT5 (the multilingual version).
+   
 ### 2.2.1 BART
+
+The model is trained to reconstruct an original document from a version that has been structurally corrupted by random noise functions. Unlike BERT, which is limited to specific masking, BART's architecture allows it to be trained using any form of document corruption. The model uses a Reconstruction Loss, specifically the cross-entropy loss between the Decoder’s predictions and the original document labels.
+
+BART employs five main methods to corrupt text during pre-training:
+1. Token Masking: Similar to BERT, random tokens are sampled and replaced with a [MASK] token.
+
+2. Token Deletion: Tokens are randomly deleted from the sequence. Unlike masking, the model does not know where the missing tokens were, forcing it to learn both the content and the position of the missing data.
+
+3. Text Infilling (Span Masking): Spans of text are sampled using a Poisson distribution (typically with $\lambda=3$). Each entire span is replaced by a single [MASK] token. This is more challenging than BERT (which masks single words) because the model must predict how many tokens were in the original span. While similar, BART's text infilling is considered stricter because it uses a single mask for any span length, whereas SpanBERT often uses multiple masks corresponding to the span length.
+
+4. Sentence Permutation: The order of complete sentences within a document is randomly shuffled. The model must learn the logical flow to restore the sentences to their original positions.
+
+5. Document Rotation: A random token is chosen as the new starting point, and the document is rotated around it. The model must identify the true original starting point of the text.
+
+By learning to reconstruct these various types of structural noise, the Encoder learns deep feature representations while the Decoder learns the generation logic required for tasks like summarization and translation.
+
+BART is built on a standard Encoder-Decoder framework that integrates the bidirectional encoding capabilities of models like BERT with the autoregressive decoding strengths of GPT. The encoder component receives input—often structurally corrupted text during pre-training—and processes it using bidirectional encoding. This approach is similar to the architecture used in BERT. The decoder takes the output representations from the encoder and uses an autoregressive process to predict the original sequence. It functions similarly to GPT, relying on maximum likelihood probabilities similar to those found in N-Gram or NNLM models.
+
+The model is available in two primary sizes: BART-base, which contains 6 layers for both the encoder and decoder, and BART-large, which scales to 12 layers for each. BART utilizes GeLUs for its activation function, opting for it over the common ReLU. Weights are randomly initialized following a normal distribution with a mean of 0 and a variance of 0.02. In contrast to BERT, BART removes one feed-forward network layer before the final output prediction. There is no requirement for strict alignment between the input length of the encoder and the output length of the decoder. When representing an entire document, BART utilizes the final-dimension output of the decoder. This differs from BERT, which uses the final hidden state of the encoder for such representations. During the fine-tuning phase, both the encoder and decoder receive identical, uncorrupted input text. 
+
+BART (Bidirectional and Auto-Regressive Transformers) fine-tuning is designed to handle a variety of NLP tasks by leveraging its unique Encoder-Decoder architecture. The process varies significantly depending on the specific task type.
+
+1. Sequence Classification Tasks. For sentence-level classification (similar to BERT's approach), BART processes the input through both the Encoder and Decoder. The same input is fed into both the Encoder and the Decoder. Unlike BERT, which uses the first token ([CLS]), BART uses the hidden state of the very last token in the Decoder. The authors suggest that using the last token allows its representation to incorporate the semantic information of all preceding tokens. This representation is then fed into a new multi-class linear classifier.
+
+2. Token Classification Tasks. This involves identifying specific labels for individual tokens, such as Named Entity Recognition (NER) or extractive Question Answering. The complete document is fed into the Encoder and Decoder. The model uses the top hidden state of every token from the Decoder as a feature vector to classify each individual word.
+
+3. Sequence Generation Tasks. BART is natively suited for generative tasks like abstractive summarization or dialogue systems because its Decoder is autoregressive. The Encoder receives the source text, and the Decoder generates the target sequence. Fine-tuning is straightforward; the model is provided with the original text and the target text, and the Decoder is trained to minimize the cross-entropy loss between its output and the target.
+
+4. Machine Translation. BART can be adapted for translation by replacing the initial embedding layer with a new, randomly initialized Encoder. The new Encoder allows the model to map a source language (e.g., Chinese) into a space that the pre-trained BART (trained on English) can understand. It has a two-step training strategy. First during freeze and warm-up, most of the BART parameters are frozen. Only the new Encoder, BART's positional embeddings, and the first layer's self-attention projection matrix are updated. Then during joint-finetuning, all parameters are then trained together for a small number of iterations to refine the entire system.
+
 ### 2.2.2 T5
+T5 (Text-To-Text Transfer Transformer) processes datasets using a unified "Text-to-Text" framework. This means that every NLP task—regardless of whether it is traditionally a classification, regression, or generation task—is converted into a string-to-string format. 
+
+Instead of having different output layers for different tasks (like BERT does for classification vs. NER), T5 uses the same model and loss function for everything. The input is a text string containing a Task Prefix. The output is a target text string representing the solution. To tell the model which task it is currently performing, a specific natural language prefix is prepended to the input data. This allows a single model to handle multiple datasets simultaneously. To translate a sentence, the input becomes: "translate English to German: That is good." $\rightarrow$ Target: "Das ist gut." For Linguistic Acceptability (CoLA), instead of outputting a class ID (0 or 1), the model is trained to generate the literal strings "acceptable" or "not_acceptable". In summarization, input is "summarize: [Document text]" $\rightarrow$ Target: [Summary text]. For tasks like the Semantic Textual Similarity Benchmark (STSB), which usually requires a floating-point number (e.g., 3.8 out of 5.0), T5 processes the score as a string representation of the number. It generates the digits as text, and during inference, these strings are converted back into numerical values for evaluation.
+
+C4 is the massive dataset Google created to train T5. The source is years of web crawl data from Common Crawl. T5 applies heavy cleaning to this data. To ensure high quality, the following rules were applied to filter the raw web crawl:
+
+- Line-Level Filtering: Only lines ending with terminal punctuation (e.g., periods, exclamation marks, or question marks) are kept.
+
+- Content Removal: Pages with too few words or those containing "lorem ipsum" placeholder text are discarded.
+
+- Code and Scripting: Lines containing Javascript or pages containing curly braces (common in programming languages) are removed.
+
+- Quality Control: Any website containing "dirty" words is filtered out, and duplicate data entries are deleted.
+
+- Language Detection: Only English-language pages are retained, verified using the langdetect tool.
+
+While training on specialized data improves performance on downstream tasks within that same domain, it limits the model's multi-domain adaptability. The author recommends a three-stage approach: pre-train on the rich C4 dataset first, continue pre-training on domain-specific data, and then perform final fine-tuning. Because the C4 dataset is so vast, most models only see each sample once; however, the authors emphasize that "more data is better" even if the model cannot cover the entire set.
+
+The authors focused on how parameters and computation are distributed across the Encoder and Decoder:
+1. Model 1 (Standard Encoder-Decoder): This is the baseline. It has $L$ layers in the Encoder and $L$ layers in the Decoder. The total parameters are $2P$ and the computation cost is $M$.
+2. Model 2 (Shared Parameter Encoder-Decoder): Similar to Model 1, but the Encoder and Decoder share the same weights. This reduces the parameters to $P$ while keeping computation at $M$.
+3. Model 3 (Mini Encoder-Decoder): Each component has only $L/2$ layers. This keeps parameters at $P$ but halves the computation cost to $M/2$.
+4. Model 4 (Language Model / Decoder-only): A single stack of $L$ layers using a causal mask (similar to GPT). Parameters are $P$ and computation is $M$.
+5. Model 5 (Prefix Language Model): A single stack of $L$ layers that uses a hybrid mask (bidirectional for the input prefix, causal for the target). Parameters are $P$ and computation is $M$.
+
+The experiments showed that the Encoder-Decoder structure (Models 1, 2, and 3) consistently achieved the best results compared to the Decoder-only or Prefix LM variants. They discovered that sharing parameters between the Encoder and Decoder (Model 2) could reduce the model's memory footprint by nearly 50% without a significant drop in performance. They defined the final "T5" as a standard Transformer Encoder-Decoder because it provided the best balance of quality and flexibility for handling diverse tasks (translation, summarization, etc.) through the same interface.
+
+In the context of T5, Prefix LM refers to both a specific attention masking pattern and a pre-training objective. It bridges the gap between bidirectional models (like BERT) and autoregressive models (like GPT). In the first part of the sequence (the "prefix"), the model uses a fully-visible mask. Every token can attend to every other token in this section, allowing for deep, context-aware representations. After the prefix, the model switches to a causal mask (standard autoregressive masking). For these tokens, the $i$-th entry can only attend to the prefix and the tokens that came before it in the output sequence. This is technically a "non-causal decoder." It avoids the "information bottleneck" of standard causal LMs (where the first word can't see the rest of the sentence) while still allowing the model to generate text token-by-token. 
+
+While T5 is an Encoder-Decoder, the author chose to modify it from the original Transformer in three specific ways to ensure it was the "best" version:
+1. Simplified Layer Norm: Removing the bias term ($y = w \cdot \frac{x}{RMS(x)}$) for better stability.
+2. Relative Position Bucketing: Replacing absolute position encodings with a bucketing system to handle various sequence lengths more effectively.
+3. Post-Normalization: Moving the residual connection to occur after the layer normalization.
+
+The author compared three broad categories of self-supervised methods to see which fundamental style of learning worked best:
+- Language Modeling: Predicting the next token from left to right.
+- BERT-style (Denoising): Corrupting parts of the text and then attempting to reconstruct or restore them.
+- Deshuffling: Taking a shuffled sentence and trying to restore its original order.
+  
+BERT-style (Denoising) was found to be the most effective, outperforming both standard language modeling and deshuffling.
+
+Once BERT-style denoising was chosen, the authors explored three specific ways to "corrupt" the input text:
+- Masking: Replacing individual corrupted tokens with a special mask symbol ($[M]$).
+- Replace Spans (Text Infilling): Grouping adjacent masked tokens into a single special sentinel token. Instead of predicting the whole sentence, the model only predicts the missing "spans".
+- Drop Tokens: Simply deleting random tokens from the input without using any replacement symbols.
+  
+Replace Spans was selected as the T5 pre-training objective. While it performed similarly to masking, it was computationally more efficient because the decoder only had to generate the missing spans rather than the entire sentence. 15% was found to be the most effective corruption rate, mirroring the rate famously used by BERT. An average span length of 3 tokens yielded the best results for general language understanding.
+
+The authors of T5 explored several fine-tuning strategies to determine how to best transition a model from general pre-training to specific downstream tasks. They focused on two main areas: the fine-tuning method (which parameters to update) and the multi-task strategy (how to mix different tasks during training).
+
+The authors compared three ways to adapt the pre-trained model to a new task:
+- All-Parameter Fine-Tuning (The Baseline): Updating every single parameter in the model for the new task. Whil
+- Adapter Layers: Instead of updating the whole model, small "adapter" blocks are inserted after each Transformer layer. Only these new blocks are trained, while the original weights remain frozen. This is more parameter-efficient but can increase computational overhead during inference.
+- Gradual Unfreezing: Starting by training only the final layers and slowly "unfreezing" earlier layers until the entire model is being updated. This helped slightly with stability but didn't show massive gains over standard fine-tuning.
+
+T5 is unique because it treats all tasks as "text-to-text." This allowed the authors to experiment with mixing unsupervised (pre-training) and supervised (fine-tuning) tasks together. By a Examples-Proportional Mixing strategy, tasks are sampled based on the size of their dataset. Larger datasets appear more often during training. Larger datasets dominated the training, causing the model to perform poorly on smaller, specialized tasks. In Equal Mixing strategy, every task is sampled with equal frequency, regardless of dataset size. The model overfits on small datasets quickly and underperforms on large ones. The Temperature-Scaled Mixing strategy is a middle ground that uses a "temperature" $(T)$ to flatten the distribution. Higher $T$ makes the sampling more equal; lower $T$ makes it more proportional. This was the most balanced approach for multi-task pre-training
+
+The most successful strategy identified in the paper wasn't just doing one or the other, but a specific sequence:
+1. Multi-Task Pre-training: Train the model on a mix of the C4 unsupervised task and many supervised tasks (using temperature-scaled mixing).
+2. Task-Specific Fine-tuning: After the broad multi-task phase, perform a final round of fine-tuning on a single target task.
+The multi-task phase gives the model a broad "education," while the final fine-tuning phase allows it to specialize and achieve peak performance on a specific benchmark.
+
+FLAN (Fine-tuned Language Net) is a technique developed by Google to make Large Language Models (LLMs) better at following instructions. The core innovation of FLAN is Instruction Tuning. Instead of fine-tuning a model for just one task (like only translation), researchers fine-tuned it on a massive "mixture" of over 1,800 different tasks simultaneously, all formatted as natural language instructions.
+
+The development of Flan-T5 represents the ultimate "scaling up" of the T5 framework. Flan-T5 does not change the core architecture of T5; it uses the standard Transformer Encoder-Decoder (specifically T5 version 1.1). It features GeLU activations, lacks parameter sharing between encoder and decoder, and uses Relative Position Bucketing. It is pre-trained on the C4 dataset using the "Span Corruption" objective—masking 15% of the text and training the model to fill in the missing 3-token spans.
+
+The "Flan" part refers to the instruction-tuning phase. This is what separates Flan-T5 from a regular T5 model. The model is fine-tuned on 1,836 tasks simultaneously. This is a massive jump from the dozens of tasks used in the original T5 paper. For every task, researchers created multiple natural language templates. Instead of just learning [Input] -> [Output], the model learns to follow commands like "Summarize this for a second grader". There are three primary benefits that Flan brings to the T5 model:
+- Downstream Instruction Execution: It allows the model to better parse and execute specific commands (like "Translate this sentence to French") with more accurate and targeted results.
+- Generalization to New Tasks: It significantly improves the model's performance on zero-shot or few-shot tasks—tasks the model was never explicitly trained on—by helping it understand the "logic" of following directions.
+- Retained Flexibility: It maintains the original T5 "text-to-text" flexibility, allowing it to handle any variety of input and output formats.
+
+For generation tasks, the Flan-T5 loss function is:
+
+$$\mathcal{L}_{FlanT5} = \mathbb{E}_{(instr, x, y) \in D} [-\log P_\theta(y \mid instr, x)]$$
+
+The model uses cross-entropy loss calculated at each token timestep to ensure the generated output $y$ matches the target given the instruction and input.
 
 ## 2.3 Non-Causal Decoder-Only
 ### 2.3.1 UniLM
+UniLM (Unified Language Model) is a versatile Transformer-based model designed by Microsoft Research to excel in both Natural Language Understanding (NLU) and Natural Language Generation (NLG). While BERT is great at understanding text (bidirectional) and GPT is great at generating it (unidirectional), UniLM unifies these capabilities into a single set of parameters.
+
+UniLM (Unified pre-trained Language Model) is designed as a single Transformer model that can be configured to act like BERT, GPT, or a Sequence-to-Sequence model simply by changing its Self-Attention Masking. In Bidirectional LM (Understanding), the Mask is a zero matrix ($M=0$), meaning no tokens are blocked. Every token in the sequence can attend to every other token (left and right). It functions like BERT, making it ideal for Natural Language Understanding (NLU) tasks like classification. In Unidirectional LM (Generation), the Mask is a triangular matrix. A token can only attend to itself and tokens to its left. In Sequence-to-Sequence LM (Hybrid), the Mask is a hybrid pattern where the input is split into two segments ($S1$ and $S2$). $S1$ tokens can see each other bidirectionally, while $S2$ tokens can see all of $S1$ but only preceding tokens within $S2$. This allows the model to act like an Encoder-Decoder (T5/BART style) for tasks like summarization and translation. 
+
+UniLM uses a Unified Masked Language Modeling (Masked LM) framework for pre-training, which incorporates four distinct tasks. UniLM cycles through different objectives by adjusting its Mask Matrix within a shared Transformer network: Bidirectional LM, Unidirectional LM, Sequence-to-Sequence (Seq-to-Seq) LM, and Next Sentence Prediction (NSP). 1/3 of the time is dedicated to the Bidirectional LM task. 1/3 of the time is dedicated to the Unidirectional LM task (split equally between left-to-right and right-to-left). 1/3 of the time is dedicated to the Seq-to-Seq LM task. UniLM utilizes the WordPiece tokenization method for its vocabulary.
+
+UniLM adapts its single Transformer stack for two primary types of finetuning tasks:
+- Natural Language Understanding (NLU): The model is treated as an encoder. A [SOS] token is used to extract a sentence-level feature vector, which is then fed into a newly added classification layer.
+- Natural Language Generation (NLG): The task is formatted as a sequence: [SOS] S1 [EOS] S2 [EOS], where $S1$ is the source and $S2$ is the target. For NLG, the model randomly masks parts of the target sequence ($S2$) and minimizes cross-entropy loss using a teacher-forcing approach with random sampling.
 ### 2.3.2 GLM
 
+GLM (General Language Model) is a versatile Transformer-based architecture designed to unify the strengths of BERT (understanding) and GPT (generation) into a single model. While most early models specialized in either understanding or generation, GLM uses a unique autoregressive blank infilling objective that allows it to perform competitively across Natural Language Understanding (NLU), unconditional generation, and conditional generation.
+
+Unlike BERT, which predicts masked tokens independently, or GPT, which only looks at previous tokens, GLM handles "blanks" (masked spans of text) as follows:
+1. Blanking Out Spans: Random spans of tokens are removed from the input and replaced with a single [MASK] token.
+2. Part A and Part B: The model splits the task into two parts. Part A is the corrupted text (the original sentence with masks), and Part B consists of the missing spans.
+3. Autoregressive Generation: The model generates the spans in Part B one by one. Crucially, it can see the entire context of Part A but generates the missing parts in an autoregressive (step-by-step) manner.
+   
 ## 2.4 Causal Decoder-Only
 ### 2.4.1 GPT
+#### 2.4.1.1 GPT-1
+#### 2.4.1.2 GPT-2
+#### 2.4.1.3 GPT-3
+#### 2.4.1.4 GPT-3.5
+#### 2.4.1.5 GPT-4
+#### 2.4.1.6 OpenAI o1
+#### 2.4.1.7 GPT-OSS
+
 ### 2.4.2 LLaMA
+#### 2.4.2.1 LLaMA-1
+#### 2.4.2.2 LLaMA-2
+#### 2.4.2.3 LLaMA-3
+#### 2.4.2.4 LLaMA-4
+#### 2.4.2.5 Alpaca
+#### 2.4.2.6 Code LLaMA
+
 ### 2.4.3 DeepSeek
+#### 2.4.3.1 DeepSeek-V1
+#### 2.4.3.2 DeepSeek-V2
+#### 2.4.3.3 DeepSeek-V2.5
+#### 2.4.3.4 DeepSeek-V3
+#### 2.4.3.5 DeepSeek-V3.2-EXP
+#### 2.4.3.6 DeepSeek-R1
+
 ### 2.4.4 Qwen
+#### 2.4.4.1 Qwen1
+#### 2.4.4.2 Qwen1.5
+#### 2.4.4.3 Qwen2
+#### 2.4.4.4 Qwen2.5
+#### 2.4.4.5 Qwen3
+#### 2.4.4.6 Qwen3 Next
+#### 2.4.4.7 GTE-Qwen3
+#### 2.4.4.8 Qwen3 Embedding & Reranker
+
 ### 2.4.5 Gemini
