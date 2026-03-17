@@ -173,7 +173,6 @@ SpanBERT focuses on improving how the model represents contiguous spans of text 
 
 <p align="center">
 <img width="760" height="306" alt="44bb5556-1337-490a-a020-f1ebc5c4fb22" src="https://github.com/user-attachments/assets/282c3a70-399c-4c27-aecc-72d81c2c2faa" />
-
 </p>
 
 SpanBERT shifts from individual Token-level Masking to Span-level Masking. The model first determines a "span length" and then randomly selects a starting position in the sentence to mask a continuous sequence of tokens. This forces the model to rely more heavily on the surrounding global context to predict the entire missing segment. It reduces the randomness associated with masking isolated local positions and better aligns with tasks requiring a deep understanding of entire phrases or coreference resolution.
@@ -235,7 +234,7 @@ By introducing absolute positions at the end of the stack, the model can use the
 The EMD functions as a flexible decoder that can utilize various types of input information.
 In general case, each EMD layer output becomes the input $I$ for the next:
 
-$$I_{next} = \text{EMD\_Layer}(I, H)$$
+$$I_{next} = \text{EMD\_{Layer}}(I, H)$$
 
 If we set $n=1$ and the input $I=H$, the EMD mathematically simplifies to a standard BERT-style decoder. However, by setting $n=2$ and using absolute positions as the initial $I$, DeBERTa gains superior flexibility in modeling complex syntax.
 
@@ -506,14 +505,178 @@ Unlike BERT, which predicts masked tokens independently, or GPT, which only look
    
 ## 2.4 Causal Decoder-Only
 ### 2.4.1 GPT
+GPT is the Transformer Decoder with the "Encoder-Decoder Attention" layer removed. It is also equivalent to a Transformer Encoder layer, but with the standard Multi-Head Attention replaced by Masked Multi-Head Attention (also known as Masked Self-Attention).
 #### 2.4.1.1 GPT-1
+The pre-training of GPT-1 is a classic example of Generative Pre-training using a causal language modeling objective. The primary goal of GPT-1 pre-training is to maximize the likelihood of the next token given its preceding context. This is mathematically expressed as:
+
+$$L_1(\mathcal{U}) = \sum_{i} \log P(u_i | u_{i-k}, \dots, u_{i-1}; \Theta)$$
+
+- $\mathcal{U} = \{u_1, \dots, u_n\}$: The unlabeled corpus of tokens.
+- $k$: The size of the context window.
+- $P$: The conditional probability modeled by a neural network with parameters $\Theta$.
+
+The model achieves Autoregression through a Causal Mask, which ensures that token $t$ can only attend to tokens at positions $< t$. The mask is defined as:
+
+$$
+\text{Casual Mask}(i, j) = 
+\begin{cases} 
+0, & j \leq i \\ 
+-\infty, & j > i 
+\end{cases}
+$$
+
+GPT-1 utilizes a multi-layer Transformer Decoder (specifically 12 layers). Unlike the original Transformer, it only uses the decoder block and removes the encoder-decoder attention layer. The initial hidden state $h_0$ in the input embedding is formed by combining token embeddings and learned positional embeddings:
+
+$$h_0 = UW_e + W_p$$
+
+Where $U$ is the context vector of tokens, $W_e$ is the token embedding matrix, and $W_p$ is the position embedding matrix.
+
+In the Transformer blocks, the hidden state is processed through $n$ layers of Transformer blocks. The final distribution over the vocabulary is calculated via a Softmax layer:
+
+$$P(u) = \text{Softmax}(h_n W_e^T)$$
+
+The model was trained with a focus on stability and performance scaling, including 12 layers, 768-dimensional hidden states, and 12 attention heads. In the feed-forward layer there are 3072 hidden units. It uses the Adam optimizer with a max learning rate of $2.5 \times 10^{-4}$. The learning rate followed a linear warmup for the first 2,000 steps, followed by a cosine annealing decay to 0. For regularization, it is dropout with a rate of 0.1 and a modified version of $L_2$ regularization ($w=0.01$). GELU (Gaussian Error Linear Unit) was used instead of standard ReLU. Byte Pair Encoding (BPE) with a vocabulary size of 40,000 was used for tokenization. GPT-1 also used post-normalization.
+
+Training stops based on accuracy. The model compares its generated text with the original text; if the accuracy reaches the expected threshold or begins to fluctuate without improvement (plateauing), the pre-training phase is concluded.
+
+The primary dataset BooksCorpus containing over 7,000 unpublished books (approx. 800 million words). This corpus was chosen specifically because it contains long sequences of continuous text, which allows the model to learn long-range linguistic dependencies. A secondary dataset (1B Word Benchmark) used for comparison (though it is noted that this dataset is shuffled at the sentence level, destroying long-range structures).
+
+Fine-tuning adapts the pre-trained model to a labeled dataset $\mathcal{C}$, where each instance consists of an input sequence $x^1, \dots, x^m$ and a corresponding label $y$. The input sequence is passed through the pre-trained Transformer layers to obtain the final hidden state (embedding) of the last token, denoted as $h_l^m$. This embedding is fed into an added Linear Output Layer with parameters $W_y$:
+
+$$P(y | x^1, \dots, x^m) = \text{softmax}(h_l^m W_y)$$
+
+The goal is to maximize the likelihood of the correct labels across the dataset:
+
+$$L_2(\mathcal{C}) = \sum_{(x,y)} \log P(y | x^1, \dots, x^m)$$
+
+A key finding in GPT-1 is that including the original language modeling objective as an auxiliary task during fine-tuning improves generalization and accelerates convergence. The final optimization target $L_3(\mathcal{C})$ is a weighted sum:
+
+$$L_3(\mathcal{C}) = L_2(\mathcal{C}) + \lambda * L_1(\mathcal{C})$$
+
+Where $\lambda = 0.5$.
+
+To handle different NLP tasks without changing the model architecture, GPT-1 uses specific input formats, often utilizing "Delimiters" to separate text segments. 
+- Classification: The input is standard text; the vector of the last token is used for the final classification.
+
+- Inference (Entailment): The input is formatted as Premise + Delimiter + Hypothesis. The last token’s vector determines if the relationship holds (binary classification).
+
+- Similarity: Since similarity is symmetric, the model processes two versions: Sentence A + Delimiter + Sentence B and Sentence B + Delimiter + Sentence A. The resulting vectors are added before passing through the linear layer.
+
+- Question Answering (QA): The context and question are concatenated with each possible answer using delimiters (e.g., [Context; Question; Answer i]). Each sequence is processed independently, and a softmax is applied across all answer scores to find the most probable result.
+
+Typically 3 epochs of training are sufficient. Linear learning rate decay with a warmup over the first 0.2% of training. Dropout is added to the classifier with a rate of 0.1. The learning rate is $6.25 \times 10^{-5}$. Batch size is 32. 
+
+GPT-1 outperformed state-of-the-art models in 9 out of 12 benchmark supervised tasks. 
+
+**Advantages**
+- Two-Stage Training Framework: By combining large-scale unsupervised pre-training with supervised fine-tuning, the model significantly improved performance across a wide variety of NLP tasks.
+
+- Strong Capture of Long-Range Dependencies: Utilizing the Transformer architecture's self-attention mechanism allowed the model to capture complex linguistic dependencies over long distances more effectively than previous RNN-based models.
+
+- Excellent Transfer Learning: Once pre-trained, the model demonstrated high adaptability, requiring only task-specific fine-tuning to excel in various downstream applications.
+
+**Disadvantages**
+- Unidirectional Constraint: As a unidirectional language model, it only considers context from left to right. This limits its ability to fully understand information that relies on bidirectional context (unlike BERT).
+
+- Limited Model Capacity: With 117 million parameters, the model scale is relatively small by modern standards. This limited capacity affects its ability to model highly complex or nuanced linguistic phenomena.
+
+- Heavy Reliance on Fine-tuning: GPT-1 is not a "universal linguist" out of the box. It requires specific fine-tuning for every individual downstream task, which increases the complexity and computational cost of deployment.
+
 #### 2.4.1.2 GPT-2
+
+GPT-2 represents a significant shift from GPT-1 by moving toward a Zero-shot learning paradigm, predicated on the idea that supervised learning is a subset of language modeling when the model capacity is large enough. While GPT-1 relied on a two-stage process of pre-training and fine-tuning, GPT-2 focuses on Zero-shot capabilities. It removes the task-specific fine-tuning layer entirely. GPT-2 uses natural language prompts to identify tasks automatically. For example, if the model is trained on text like "Michael Jordan is the best basketball player in history," it naturally learns to answer the question "Who is the best basketball player in history?" without being explicitly fine-tuned for Q&A. 
+
+GPT-2 increased the number of Transformer layers to 48 and the hidden layer dimension to 1600. The total parameter count reached 1.5 billion, a 15x increase over GPT-1's 117 million. GPT-2 moved from the 5GB BooksCorpus to a much larger 40GB dataset called WebText, consisting of approximately 8 million high-quality articles scraped from Reddit. To avoid data leakage, all Wikipedia articles were removed from WebText. The Byte Pair Encoding (BPE) vocabulary size was expanded from 40,000 to 50,257.
+
+GPT-2 moved Layer Normalization to the start of each sub-block (Pre-norm) rather than the end (Post-norm) to stabilize and simplify the training process. An additional Layer Normalization was added after the final Self-Attention block. The initial values of the residual layers are scaled by a factor of $\frac{1}{\sqrt{N}}$, where $N$ is the number of residual layers. The batch size was increased from 64 to 512, and the context window (maximum sequence length) was doubled from 512 to 1024 tokens.
+
+GPT-2 pre-training follows a traditional language modeling objective scaled to a larger, more diverse dataset with specific handling for document sequences. GPT-2 uses the same fundamental objective as traditional language models: predicting the next token in a sequence. The training objective is to minimize the negative log-likelihood of the next token given all previous tokens in the sequence:
+
+$$\mathcal{L}_{\text{LM}} = \mathbb{E}_{\mathbf{x} \sim \text{Data}} \left[ -\sum_{t=1}^{|\mathbf{x}|} \log P(x_t \mid x_{1..t-1}) \right]$$
+
+To ensure the model only looks at past information and not future tokens, it utilizes a causal mask. This mask (inherited from GPT-1) allows a token at position $i$ to attend to positions $j \leq i$, while setting attention to $-\infty$ for any $j > i$.
+
+To manage long documents within the model's architectural limits, GPT-2 employs a specific block-based strategy. Documents are sliced into fixed-length "blocks" of 1024 tokens. If a document is shorter than the 1024-token limit, it is either padded or merged with other documents to fill the block. The model performs the standard left-to-right Language Modeling objective on these randomized blocks during training.
+
+**Advantages**
+- Powerful Generation Capabilities: GPT-2 excels at generating coherent, smooth text, including stories and even code snippets.
+
+- Contextual Understanding: By learning from massive amounts of text data, the model can understand context and generate logically consistent responses.
+
+- Multi-domain Application: The model shows good suitability for tasks in various fields, such as machine translation, summarization, and dialogue systems.
+
+- Proof of Concept for LLMs: Its Zero-shot training approach effectively proved the possibility of a universal model, marking the early stages of the LLM and AIGC era.
+
+**Disadvantages**
+- Potential for Inappropriate Content: Because the training data is scraped from the internet, the model may generate content that contains bias or is inappropriate.
+  
+- High Computational Resource Demand: Due to its large model size, both the training and inference processes require significant computational resources.
+
+- Lack of Common Sense Reasoning: GPT-2’s performance can be unsatisfactory when handling tasks that require deep common-sense reasoning.
+
 #### 2.4.1.3 GPT-3
+
+GPT-3 introduces several massive leaps in scale and capability over GPT-2, primarily focusing on model size, data diversity, and the emergence of in-context learning. The most apparent improvement is the exponential increase in parameters. Parameter counts in GPT-2 ranged from 150 million to 1.5 billion (Small to XL). GPT-3 reached a maximum scale of 175 billion parameters, representing a massive expansion in model capacity. GPT-3 was trained on a much broader and larger corpus compared to the WebText used for its predecessor. It used hundreds of gigabytes of multi-source data, including CommonCrawl, WebText2, Books, and Wikipedia, providing much wider domain coverage. For GPT-3, the scale is so vast that training requires extreme computational power and memory resources that only a very few organizations can afford; inference costs are similarly high.
+
+While GPT-2 showed some potential in zero-shot scenarios, it often required fine-tuning to be truly effective. GPT-3 revolutionized this with training-free capabilities. GPT-3 can perform tasks like translation, Q&A, and summarization simply by providing a few examples or instructions in the prompt, without any gradient updates or fine-tuning. This in-context learning happens entirely during the inference stage. Instead of using backpropagation to update weights (as in fine-tuning), the model uses its existing self-attention mechanism to "locate" the relevant task within its pre-trained latent space. You provide the model with a task description followed by a few demonstration pairs (Input: $x$, Output: $y$) and a final query $x'$. The model reads these examples like a sequence, identifying consistent relationships in structure, meaning, or logic. Then it uses the examples as a semantic prior. It calculates the probability of the next token by conditioning on the entire history of the prompt, effectively "copying" the demonstrated pattern for the new input.
+
+Some researchers argue that the Transformer's attention mechanism acts as an "inner loop" of an optimization process. In this view, the model produces "meta-gradients" during the forward pass that behave similarly to the explicit gradients calculated during fine-tuning. Another view suggests the model uses the prompt to narrow down which "latent concept" (learned during its massive pre-training on the web) it should use for the current task.
+
+GPT-3 introduces a specific modification to the standard Transformer attention mechanism to handle its massive scale and long context window. The most significant change in GPT-3's attention compared to GPT-2 is the use of Alternating Dense and Sparse Attention patterns.
+
+- Standard (Dense) Attention. Every token attends to every single previous token in the sequence. This is represented by a fully "filled" or dark lower-triangular matrix. It provides the most comprehensive "Global View," allowing the model to find relationships between any two words, no matter how far apart. To calculate the correlations between any two vectors, a matrix of size $n^2$ is required. Theoretically, both the calculation time and memory occupancy grow at a rate of $O(n^2)$, where $n$ is the sequence length.
+
+- Dilated Self-Attention. Inspired by dilated convolutions, this type restricts correlation so that each element only connects to other elements at specific relative distances (e.g., $k, 2k, 3k, \dots$). $k > 1$ is a pre-set hyperparameter. Each element only calculates correlations with $n/k$ other elements. In ideal conditions, the operational efficiency and memory occupancy are reduced to $O(n^2/k)$, which is $1/k$ of the original requirement.
+
+- Local Self-Attention. This introduces local correlations by restricting each element to attend only to its immediate $k$ neighbors before and after it. It maintains a window of size $2k + 1$. Each element only interacts with $2k + 1$ other elements, causing complexity to grow linearly ($O(kn)$) with sequence length $n$. While ideal for efficiency, this approach sacrifices the ability to capture long-range dependencies.
+
+- Sparse Self-Attention. This is a hybrid approach that merges the characteristics of Dilated and Local self-attention. In the attention matrix, all correlations are set to 0 except for those within a relative distance of $k$ (Local) or at specific intervals like $k, 2k, 3k, \dots$ (Dilated). It combines "locally dense" and "remotely sparse" correlations. This reduces computational complexity, saves memory/power, and allows the model to process much longer input sequences while focusing most heavily on nearby context. Because it relies on the assumption that truly dense long-range dependencies are rare, it may perform poorly on long-text modeling tasks where those global relationships are actually essential.
+
+GPT-3 significantly increases the depth and width of the Transformer architecture compared to its predecessors. It utilizes 96 layers of multi-head self-attention. Each layer contains 96 attention heads. The embedding dimension features a word vector length of 12,888. The context window is expanded to 2,048 tokens, double that of GPT-2.
+
+The model was trained on a massive, diverse collection of text totaling hundreds of gigabytes, with specific weights assigned to different sources based on quality.
+- C4 (Common Crawl): Filtered version of Common Crawl (570GB) making up 60% of the training data.
+
+- WebText2: High-quality web content making up 22%.
+
+- Books1 & Books2: Two internet-based book corpora accounting for 16%.
+
+- Wikipedia: English Wikipedia content making up 3%.
+
+Like previous GPT models, GPT-3 uses an unsupervised, self-supervised learning objective. The model is trained to predict the next token given all previous tokens in a sequence. It uses a causal mask to ensure that during training, each token can only "attend" to current and previous positions, preventing it from seeing future information. To handle the large context window efficiently, it alternates between dense self-attention and Sparse Self-Attention patterns (combining local and dilated attention) to reduce computational complexity.
+
+The primary goal of GPT-3's massive pre-training was to achieve In-context Learning, a form of meta-learning where the model adapts to new tasks without updating its parameters.
+
+- Zero-shot: The model performs a task based only on a natural language description (e.g., "Translate English to French:").
+
+- One-shot: The model is given the description plus a single example.
+
+- Few-shot: The model is given a description and several examples within the prompt.
+
+ICL is described as a form of "learning how to learn". During massive unsupervised pre-training, the model develops broad strategies to adapt to unseen tasks quickly. As model size increases, the ability to learn from context becomes more efficient. Large models show a "steeper" learning curve, meaning they use the information in the prompt much more effectively than smaller models. There is a smooth, positive correlation between model capacity and performance across Zero, One, and Few-shot scenarios. Larger models are fundamentally better at "Meta-learning". 
+
+**Advantages**
+- Powerful Language Generation Capabilities: GPT-3 can generate coherent and creative text, making it suitable for writing assistance and content creation.
+
+- Few-shot Learning Ability: It demonstrates excellent performance in few-shot scenarios, where it can perform specific tasks provided with only a small number of examples.
+
+- Wide Range of Application Scenarios: The model can be applied to diverse Natural Language Processing (NLP) tasks, including text classification, sentiment analysis, and code generation.
+
+- Superior Contextual Understanding: Compared to GPT-2, GPT-3 maintains higher coherence over long contexts and provides more consistent answers.
+
+**Disadvantages**
+- High Computational Resource Requirements: Due to its massive parameter count (175 billion), training and deploying GPT-3 requires significant computing power and storage space.
+  
+- Potential for Inappropriate Content: The model may generate text containing biases or inappropriate content, reflecting the biases present in its original training data.
+
+- Lack of Common Sense Reasoning: Like its predecessors, GPT-3 may still perform unsatisfactorily on tasks that require deep common sense reasoning.
+
+- High Costs: The extreme scale of the model means that only a few organizations can afford the immense computational and memory resources required for its training.
+  
 #### 2.4.1.4 GPT-3.5
 #### 2.4.1.5 GPT-4
 #### 2.4.1.6 OpenAI o1
 #### 2.4.1.7 GPT-OSS
-
 ### 2.4.2 LLaMA
 #### 2.4.2.1 LLaMA-1
 #### 2.4.2.2 LLaMA-2
