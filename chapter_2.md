@@ -674,16 +674,203 @@ ICL is described as a form of "learning how to learn". During massive unsupervis
 - High Costs: The extreme scale of the model means that only a few organizations can afford the immense computational and memory resources required for its training.
   
 #### 2.4.1.4 GPT-3.5
+
+While GPT-3 has strong zero-shot understanding, it struggles specifically in conversational settings. The model does not inherently possess human values, making its answers sometimes lack diplomacy or "smoothness". The way the model generates text often deviates from what humans naturally expect in a conversation. Also, the model has a tendency to make things up. The fundamental reason for these flaws is that GPT-3 is purely a language model. While it has mastered grammar rules and built vast knowledge networks from massive datasets, it fundamentally does not understand human preferences. It was trained to predict the next word, not to please a human user. GPT-3.5 introduces RLHF as a fix.
+
+Because the base model is a generative model based on prompt learning, the GPT SFT dataset is constructed entirely of prompt-response pairs. The data comes from two main sources: users of OpenAI's Playground and 40 specifically hired and trained human labelers. During this SFT phase, the human labelers annotated a total of 13k (prompt, completion) pairs. The labelers were tasked with writing instructions that fulfilled three specific criteria to ensure the model learned to handle a variety of requests:
+
+1. Simple Tasks: Labelers were asked to come up with arbitrary, simple tasks while ensuring a wide diversity of task types.
+
+2. Few-shot Tasks: Labelers provided an instruction followed by multiple "query-response" pairs to demonstrate how to complete that specific instruction.
+
+3. User-related Tasks: Labelers were given real use cases pulled from OpenAI's API and wrote instructions based on those actual user scenarios.
+
+The SFT phase uses the exact same network architecture as the initial pre-training phase. The model is trained by maximizing the likelihood function. The mathematical objective shown in the text is:
+
+$$L(\theta) = \prod_{i=1}^{N} \pi^{SFT}(y_i|x_i; \theta)$$
+
+The core goal of the Reward Model is to act as a mathematical proxy for human preference. It learns to score text based on what humans find helpful, safe, and accurate, penalizing things like bias or toxic content. Instead of just asking the model for one answer, the system takes a random prompt and asks the previously trained Supervised Fine-Tuned (SFT) model to generate several different responses. Specifically, it generates $K$ answers (where $K$ is usually between 4 and 9). Human labelers step in and review these $K$ answers. Their job isn't to write a better answer, but simply to rank the generated answers from best to worst based on quality and alignment guidelines. 
+
+To train the model, the system breaks these rankings down into pairs. From the $K$ ranked answers, it creates every possible combination of two answers, resulting in $\binom{K}{2}$ pairs. For example, if the model generated answers A, B, and C, and the human ranked them A > B > C, the training data becomes three pairs:
+- (Prompt, A is better than B)
+- (Prompt, A is better than C)
+- (Prompt, B is better than C)
+
+The Reward Model itself is a neural network that takes in a prompt and a response, and outputs a single scalar number (a score). The training objective is to minimize the Pairwise Ranking Loss. The mathematical formula shown in the image is:
+
+$$L(\theta) = -\frac{1}{\binom{K}{2}} E_{(x, y_w, y_l) \sim D} [\log(\sigma(r_\theta(x, y_w) - r_\theta(x, y_l)))]$$
+
+$r_\theta(x, y_w)$ is the score the model gives to the "winning" (better) response. $r_\theta(x, y_l)$ is the score the model gives to the "losing" (worse) response. The model learns by trying to make the difference between the winning score and the losing score as large as possible. The $-\frac{1}{\binom{K}{2}}$ at the beginning simply averages the loss across all the pairs for that specific prompt. This ensures that a prompt which happened to have 9 generated answers doesn't overpower a prompt that only had 4 generated answers during training.
+
+Instead of feeding each pair into the model one at a time, all pairs associated with a single prompt are fed into the model simultaneously as a single batch. This solves two major problems:
+
+- Prevents Overfitting: If processed sequentially, a single response would be used in multiple separate gradient updates ($K-1$ times), which risks the model overfitting to that specific text. By doing it in one batch, it only participates in one combined gradient calculation.
+
+- Massive Speed Increase: Calculating the score $r_\theta(x, y)$ is computationally heavy. If done sequentially (updating the model's parameters after every pair), you have to recalculate the score for the exact same text over and over—taking $K(K-1)$ calculations. By batching them, the model parameters don't change during the batch, so the model only has to calculate the score for each answer exactly once ($K$ times).
+
+Once this Reward Model is fully trained, it can instantly look at any new text GPT generates and grade it like a human would.
+
+In this third step of RLHF, the system uses the Reward Model (RM) to continuously train and fine-tune the Supervised Fine-Tuned (SFT) model so it better aligns with human intent. Unlike previous steps, the data used here does not rely on human labelers. Instead, it uses a massive dataset of real, unlabelled prompts submitted by users through the GPT-3 API (broken down into generative tasks, Q&A, brainstorming, etc.). It relies on PPO (Proximal Policy Optimization). Standard Policy Gradient algorithms are highly sensitive to step size, making training volatile. PPO solves this by enabling small, stable batch updates over multiple training steps. The ultimate goal of this phase is to maximize the following objective function. The formula balances three competing goals to ensure the model gets smarter without breaking:
+
+$$\text{objective}(\phi) = E_{(x,y)\sim D_{\pi_\phi^{\text{RL}}}} \left[ r_\theta(x, y) - \beta \log \left( \frac{\pi_\phi^{\text{RL}}(y \mid x)}{\pi^{\text{SFT}}(y \mid x)} \right) \right] + \gamma E_{x \sim D_{\text{pretrain}}} \left[ \log (\pi_\phi^{\text{RL}}(x)) \right]$$
+
+The current RL model ($\pi_\phi^{\text{RL}}$) generates a response ($y$) for a given prompt ($x$). The Reward Model ($r_\theta$) evaluates this and assigns a score. The primary objective is to push the model to generate text that earns the highest possible score. If the model only chases the highest reward, it will eventually "game" the system, finding weird linguistic shortcuts that trick the Reward Model into giving high scores but result in unnatural text for humans. To prevent this, the formula includes a KL Divergence penalty ($\beta \log(\dots)$). It constantly compares the output distribution of the new RL model with the output distribution of the original SFT model ($\pi^{\text{SFT}}$). If the new model's behavior deviates too far from the original, safe SFT model, it gets mathematically penalized. The parameter $\beta$ controls the strictness of this penalty. (Using just Goal 1 and Goal 2 is standard PPO). To further ensure the model doesn't suffer from "mode collapse" (forgetting its general language understanding while hyper-focusing on human alignment), the system feeds it original GPT-3 pre-training data ($D_{\text{pretrain}}$). The term $\gamma E_{x \sim D_{\text{pretrain}}} \dots$ evaluates how well the RL model still performs on these foundational language tasks. If its foundational performance drops, it faces another penalty, controlled by the parameter $\gamma$.
+
+
+**Advantages**
+- Enhanced Truthfulness and Value Alignment: Because of the human annotation introduced during the training process, GPT-3.5 generates outputs that are significantly more factual and better aligned with human values and expectations.
+
+- More Natural Responses: By building on GPT-3’s strong foundation for generalization and text generation, and pairing it with human-written prompts and ranked results, the model produces responses that feel much more natural and conversational.
+  
+- Improved Harmlessness: While the improvement is noted as somewhat limited, GPT-3.5 is still measurably better at reducing the amount of harmful or toxic content it generates compared to its predecessors.
+
+**Disadvantages**
+- Performance Drop on General NLP Tasks: This is often referred to as the "alignment tax." Because the model was heavily optimized for specific conversational and instruction-following tasks, its performance on other, more general Natural Language Processing (NLP) benchmarks actually decreased.
+  
+- Potential for Absurd Outputs: Even with human feedback (RLHF), the model isn't perfect. It can still "hallucinate" and generate content that is completely untrue, illogical, or nonsensical.
+
+- Over-sensitivity to Instructions: The model is highly sensitive to the exact phrasing of input prompts. Because of this, it can sometimes overthink or misinterpret very simple concepts, leading to answers that completely miss what the user actually wanted.
+
 #### 2.4.1.5 GPT-4
+GPT-4 is a multimodal model. Compared to GPT-3.5 or ChatGPT, it can process both image and text inputs to generate text outputs. Despite its ability to handle multiple media types, its output mechanism remains an autoregressive next-token prediction task.
+
+GPT-4 utilizes a Mixture of Experts (MoE) architecture rather than a standard dense model. This means that instead of every part of the model processing every piece of data, different specialized components (experts) work together to produce the final output. The model contains approximately 1.76 trillion parameters overall. Its basic width and depth are roughly the same as GPT-3 (which had 175B parameters), with the primary difference being that GPT-4 has 16 times as many Multi-Layer Perceptrons (MLPs). It is built on 120 Transformer layers.
+
+Inside each Transformer layer, the parameter distribution is split between two main mechanisms. 55 Billion (55B) parameters are in the attention mechanism. GPT-4 consists of 16 distinct expert models. Each individual expert has 111 Billion (111B) parameters. (Totaling $111\text{B} \times 16$). When text (tokens) passes through the model, it does not activate all 16 experts at once. A routing algorithm evaluates each token and sends it to exactly two of the 16 MLPs for computation. The sequence length (seq_len) is 8,000 (8k) tokens, and the routing is distributed so that each individual MLP ends up handling roughly 1,000 (1k) tokens during the process. 
+
+The pretraining of GPT-4 requires an immense amount of computational power and complex engineering to manage its massive size. The model was trained using an estimated 3,125 machines, which totals around 25,000 A100 GPUs. It uses a massive batch size of 60 Million tokens per step, with a sequence length (seq_len) of 8k. To physically fit the model into memory and compute it efficiently, the training uses a combination of three standard parallelism methods:
+
+- Tensor Parallelism (8-way): The matrix operations for a single layer are split across 8 GPUs simultaneously. Communication overhead for this is kept under 15%.
+
+- Pipeline Parallelism (16-way): The model's layers are sliced vertically across 16 different machines. For instance, Machine 0 computes Layers 0-7, passes the output down to Machine 1 for Layers 8-15, all the way to Machine 15 for the final layers (120-127).
+
+- Data Parallelism (196-way): This entire pipeline and tensor setup is replicated 196 times so that the system can process different chunks of the 60M token batch at the same time.
+
+Because GPT-4 uses a Mixture of Experts (MoE) architecture, standard 3D parallelism isn't enough to prevent out-of-memory errors. Even when split across 8-way Tensor and 16-way Pipeline parallelism, a single GPU still needs to manage about 14 Billion parameters. If calculating gradients in standard FP32 precision, this requires 84 GB of VRAM per GPU. A standard A100 GPU cannot hold this. To solve this memory crisis, the training implements Expert Parallelism. Instead of every GPU holding all the MoE Multi-Layer Perceptrons (MLPs), the individual "experts" are distributed across different GPUs. During training, an Attentive Gating Network determines which expert needs to process which token. The system then uses "all-to-all" communication networks to physically route the data from the attention layers on one GPU to the specific MLP expert sitting on a different GPU, allowing the massive model to train without crashing the hardware.
+
+**Advantages**
+- Stronger Reasoning Ability: GPT-4 shows significant improvement over its predecessors in logical reasoning, grasping complex contexts, and managing multi-turn conversations. This allows it to tackle much harder problems and provide more accurate answers.
+  
+- Multimodal Support: It accepts both text and image inputs. This drastically broadens its real-world application, allowing it to perform tasks like describing images or answering questions based on a combination of visual and text data.
+  
+- Better Knowledge Integration and Accuracy: When handling factual questions, GPT-4 is noticeably more accurate than GPT-3 or GPT-3.5. It is better at synthesizing information from various sources and is less prone to generating false information (hallucinations).
+
+**Disadvantages**
+- High Computational Resource Consumption: Because the model is incredibly massive, the computing power and storage required to train and deploy it are far higher than previous generations. This creates major financial and hardware challenges for researchers and developers.
+  
+- Still Produces Biased and Harmful Output: While it has improved guardrails, GPT-4 is not immune to generating biased, inappropriate, or harmful content. This issue becomes even more complicated to manage with the addition of multimodal (image) generation.
+
+- Reasoning is Still Limited: Despite its massive upgrades, it is not perfect. It can still make mistakes when faced with highly complex logical problems, particularly if it lacks sufficient context or niche knowledge, which lowers its reliability in those specific edge cases.
+  
 #### 2.4.1.6 OpenAI o1
+
+Unlike previous models that immediately start predicting the next word to form an answer, o1 is designed to "think" first. It generates a chain of logical reasoning before producing the final output. This significantly boosts its performance on complex reasoning tasks and makes its outputs more safe and consistent.
+
+The training process has been overhauled using Reinforcement Learning. Rather than just learning to mimic data, o1 is actively trained to try out different strategies, identify and correct its own mistakes, and improve its overall decision-making quality. This is paired with highly diverse datasets and a very strict data filtering pipeline to remove personal information and ensure content safety.
+
+Older models often suffered from "over-refusal" (accidentally blocking safe, harmless requests just to be safe). o1 introduces a new "Deliberative Alignment" technique. Because the model can reason, it is trained to explicitly evaluate whether its planned answer matches safety policies before it speaks. This optimizes the model to successfully block actual policy violations while drastically reducing the false-positive rejection of harmless prompts.
+
 #### 2.4.1.7 GPT-OSS
+GPT-OSS is an Autoregressive Mixture of Experts (MoE) Transformer model built upon the foundational designs of GPT-2 and GPT-3. OpenAI released two different sizes for this model:
+- GPT-OSS-120B: 36 layers, 116.8 Billion total parameters, with 5.1 Billion active parameters during generation.
+- GPT-OSS-20B: 24 layers, 20.9 Billion total parameters, with 3.6 Billion active parameters.
+Both model sizes share a hidden layer dimension of 2880. They use RMSNorm on the activations before every Attention and MoE module, following the Pre-LN (Pre-Layer Normalization) setup used in GPT-2. The MoE modules utilize a gated SwiGLU activation function.
+
+The attention mechanism inherits GPT-3's attention design, alternating between a banded window mode (with a window width of 128 tokens) and a fully connected mode. Each layer contains 64 Query Heads (each with a dimension of 64) paired with 8 Key-Value Heads. Additionally, every attention head has a learnable bias. It uses RoPE (Rotary Position Embedding) and leverages YaRN to extend the dense context window up to 131,072 tokens. The core purpose of this is to ensure numerical stability and aggregate information. In standard attention mechanisms, the softmax function mathematically forces the total sum of attention weights across a sequence to equal exactly 1. The problem arises when the model decides it does not want to reference any of the tokens in the current sequence. Because the weights must still add up to 1, a conventional setup forces the model to arbitrarily distribute that remaining weight across random tokens, which introduces unwanted noise into the data. By adding a specific learnable scalar value (the "sink") to each Query Head, the model is given a safe place to "dump" its attention. When the model wants to ignore all the actual tokens, it simply shifts the bulk of the attention weight onto this sink. This naturally compresses the attention weights on the real tokens to near 0, completely avoiding the noise issue. Beyond just absorbing unwanted attention, the sink serves a secondary role for information aggregation. It acts as a "global pooling" mechanism, gathering and summarizing the broader contextual information from the sequence before passing it efficiently down to the downstream layers.
+
+In GPT-OSS, each MoE module contains a fixed number of experts and uses a standard linear routing projection layer to score the activations. For every single token, the router selects the top 4 scoring experts. It then applies softmax weighting exclusively to the outputs of those 4 selected experts. The routing mechanism decides which "expert" handles which token. In GPT-OSS, this is handled simply but effectively at the token level using a linear layer with a bias. The experts themselves are built using SiGLU (Sigmoid-gated Linear Unit) networks. To balance VRAM consumption, the calculation process changes depending on what the model is doing. To save memory, the model processes tokens sequentially, expert by expert. It iterates through the experts and accumulates the activations for the tokens that hit each one. When generating text (where speed is critical and memory pressure is slightly different), the model copies the inputs $E$ times (where $E$ is the number of experts) to compute everything in parallel, trading VRAM for speed. A common problem in MoE models is that the router might start favoring one or two experts for everything, leaving the others unused. To prevent this, GPT-OSS uses an Auxiliary Loss function, heavily inspired by the Switch Transformer design. The total loss is calculated as:
+
+$$Loss = KL\_Loss + \alpha \cdot Aux\_Loss$$
+
+The auxiliary loss ($\mathcal{L}_{\text{load}}$) is defined as:
+
+$$\mathcal{L}_{\text{load}} = \alpha N \sum_{i=1}^{N} f_i P_i$$
+
+- $f_i$: The actual proportion of tokens in the batch that were routed to expert $i$.
+- $P_i$: The average probability assigned by the router to expert $i$ across the whole batch.
+
+This mathematical setup acts as a penalty. The auxiliary loss hits its absolute minimum when both $f_i$ (the actual token distribution) and $P_i$ (the predicted probability) are perfectly uniform (meaning ideally, every expert gets $1/N$ of the traffic). By adding this to the total loss, the training process is mathematically forced to distribute tokens evenly across all experts, ensuring no single expert becomes overloaded while others sit idle.
+
+GPT-OSS uses an open-source BPE tokenizer called o200k_harmony (available in the TikToken library). It expands upon the o200k tokenizer used in GPT-4o and OpenAI o4-mini by adding special tokens dedicated to the "harmony" chat format, resulting in a total vocabulary size of 201,088.
 ### 2.4.2 LLaMA
 #### 2.4.2.1 LLaMA-1
+LLaMA's architecture fundamentally follows the Decoder-only structure used by the GPT series. However, it incorporates three major architectural improvements borrowed from other advanced models (GPT-3, PaLM, and GPTNeo) to boost training stability, performance, and computational speed.
+
+Instead of normalizing the output of the attention layers, LLaMA borrows a technique from GPT-3 and applies normalization to the input of each Transformer sub-layer (Pre-normalization) to improve training stability. Furthermore, it replaces standard LayerNorm with RMSNorm (Root Mean Square Layer Normalization). By skipping the mean calculation, the RMSNorm math is simpler. This saves between 7% and 64% of the calculation workload for that step, resulting in an overall speedup of about 40% without losing training stability. 
+
+While Layer Norm helps prevent vanishing or exploding gradients, its reliance on calculating the mean makes it susceptible to noise and input shifts, which can sometimes lead to unstable gradient propagation. By omitting the mean and relying only on RMS, LLaMa-1 provides a much smoother gradient flow. This minimizes the negative impact that mean fluctuations can have on gradients, ultimately enhancing both the stability and speed of the training process, particularly in deeper network layers.
+
+LLaMA overhauls the traditional Feed-Forward Network (FFN) and ReLU activation, borrowing the SwiGLU structure from PaLM. LLaMA explicitly uses no bias terms in its FFN. The final mathematical representation for LLaMA's FFN layer is:
+
+$$FFN_{SwiGLU}(x, W, V, W_2) = (\text{SiLU}(xW) \otimes xV)W_2$$
+
+Because calculating two matrices ($W$ and $V$) would normally increase the number of parameters, LLaMA reduces the hidden unit dimension size to $\frac{8}{3}d$ (instead of the $4d$ used in PaLM) to strictly maintain the same overall parameter count as a standard FFN.
+
+Finally, LLaMA changes how the model understands the order of words. Borrowing from GPTNeo, LLaMA completely removes the standard absolute positional embeddings that are usually added to the initial input. Instead, it injects RoPE (Rotary Positional Embeddings) at every single layer of the network, which helps the model better grasp the relative distance between tokens as the data passes deeper into the network.
+
+The model was trained on a massive, carefully filtered dataset drawn from seven distinct sources. A key detail is that while most of the data was only seen by the model once (1 epoch), data from Wikipedia and Books were looped through about twice (2 epochs).
+
+- CommonCrawl (67.0%): The largest chunk of data, taken from five datasets between 2017 and 2020. It underwent heavy deduplication, language identification, and quality filtering.
+- C4 (15.0%): A public dataset that was processed using heuristic rules for quality control.
+- GitHub (4.5%): Code from specific open-source licenses, filtered to remove boilerplate and low-quality files, deduplicated at the file level.
+- Wikipedia (4.5%): Mid-2022 data across 20 languages, with formatting stripped out.
+- Books (4.5%): A deduplicated combination of the Gutenberg project and the Books3 dataset.
+- ArXiv (2.5%): Scientific papers processed from LaTeX files to remove unnecessary sections and improve text consistency.
+- Stack Exchange (2.0%): Q&A data spanning multiple domains, with answers cleaned and sorted.
+
+LLaMA-1 was trained purely through self-supervised learning, meaning it was not fine-tuned for any specific tasks or instructions during this phase. It used the AdamW optimizer, specifically tuning the $\beta_1$ and $\beta_2$ parameters to ensure stable convergence. It utilized a cosine learning rate schedule, which gradually reduces the learning rate to smoothly guide the model to convergence. It also used a "warmup" step to stabilize the early, volatile stages of training. To prevent overfitting and ensure numerical stability, the team applied a weight decay of 0.1 and a gradient clipping of 1.0. Learning rates and batch sizes were dynamically adjusted based on the specific size of the model being trained.
+
+Training a model with up to 65 Billion parameters requires massive compute, so Meta implemented several engineering tricks to save memory and time. They used a highly optimized version of the causal multi-head attention mechanism to reduce memory usage and compute time. Instead of relying entirely on standard automatic differentiation systems, they manually implemented the backpropagation functions to be more efficient. They also used Activation Checkpointing to avoid storing expensive activation computations in memory, recalculating them only when necessary. This drastically reduces resource consumption. Furthermore, they heavily utilized model and sequence parallelism, alongside optimized GPU-to-GPU communication, to speed up the overall training process.
+
 #### 2.4.2.2 LLaMA-2
+
+LLaMA-2 scales up its fundamental training parameters to provide a more robust baseline. The training corpus was expanded to 2.0 Trillion tokens (roughly a 40% increase over LLaMA-1's 1.4T tokens), with a heavy focus on removing non-compliant or low-quality data. Meta applied legal and privacy filters to deliberately exclude data from websites known to contain large amounts of personal information. Crucially, they did not heavily filter the remaining data. They wanted to avoid "demographic erasure" (accidentally removing minority voices by over-scrubbing the data), ensuring the model remained broadly capable. The pre-training data is predominantly English. Because non-English data was limited, the model's proficiency in other languages is relatively weak and should be used with caution.
+
+To turn the base model into the conversational LLaMA-2-Chat, the team applied Supervised Fine-Tuning. They created 27,540 highly curated "prompt-response" pairs. They found that using this smaller set of exceptionally high-quality data yielded better results than using massive, lower-quality third-party datasets. During this training phase, the loss calculation for the user's input prompt tokens was "zeroed out." This forces the model to ignore the prompt when calculating its error rate and focus 100% of its learning capacity on generating the best possible response. After SFT, the model underwent extensive alignment to ensure it was helpful and safe. They used over 1.4 million Meta-created examples, combined with 7 other datasets (like Anthropic Helpful/Harmless, StackExchange, etc., totaling nearly 3 million comparisons). The Meta examples featured deep multi-turn conversations (averaging 3.9 turns per dialogue), while the other datasets were mostly single-turn. The RLHF process wasn't a single step. It iteratively improved the model using two specific techniques:
+
+- Rejection Sampling: Generating multiple responses and selecting the best one based on a reward model to update the main model.
+- PPO (Proximal Policy Optimization): Further fine-tuning the model's policy to maximize rewards.
+
+While the model was training, the human preference data was constantly being updated in parallel to ensure the Reward Models guiding the RLHF process stayed accurate and up-to-date. The model can now process and remember twice as much text in a single prompt, expanding the context window from 2048 to 4096 tokens. Unlike LLaMA-1's strict research-only restriction, LLaMA-2 introduced a base model and a chat-optimized model that are available for conditional commercial use.
+
+For the larger 34B and 70B parameter models, LLaMA-2 replaces standard Multi-Head Attention (MHA) with Grouped-Query Attention (GQA) to drastically improve inference speed. LLaMA-2 uses GQA-8. It divides the queries into groups, and each group shares one KV pair (using 8 KV projections total). This offers the best of both worlds: inference speeds that rival MQA, while maintaining output quality that matches MHA.
+
+Because LLaMA-2 generates text autoregressively (meaning it predicts token $y_3$ based on tokens $y_1$ and $y_2$), it uses a KV Cache optimization. Instead of recalculating the Attention Keys and Values for the entire sequence every time it wants to generate a new word, it caches the previously calculated KVs in memory. This is a classic "trade space for time" maneuver, vastly accelerating the generation process at the cost of consuming more VRAM. (This makes the transition to the more memory-efficient GQA mentioned above especially important).
+
+To further boost performance, the matrix dimensions within the Feed-Forward Network (FFN) modules were expanded. While this increases the overall parameter count of the model, it directly enhances the model's ability to generalize information and handle complex tasks.
 #### 2.4.2.3 LLaMA-3
-#### 2.4.2.4 LLaMA-4
-#### 2.4.2.5 Alpaca
-#### 2.4.2.6 Code LLaMA
+LLaMA-3 maintains the same fundamental Decoder-only architecture as LLaMA-2 but introduces massive upgrades in data scale, tokenizer efficiency, and post-training pipelines. 
+
+While the core architecture (RMSNorm, SwiGLU, RoPE) remains mostly unchanged, Meta made a few highly impactful adjustments. In LLaMA-2, Grouped-Query Attention (GQA) was only used for the larger 34B and 70B models. In LLaMA-3, GQA is used across all model sizes (including the smaller 8B model) to significantly boost inference speed. LLaMA-3 switches from the SentencePiece tokenizer to tiktoken. The vocabulary size was quadrupled from 32K to 128K. This allows the model to encode text much more efficiently, yielding better downstream performance (though it does increase the parameter count slightly in the embedding layers). The standard sequence length was doubled, moving from LLaMA-2's 4,096 tokens to 8,192 tokens (8k).
+
+The most significant driver of LLaMA-3's performance leap is its training data. LLaMA-3 was trained on over 15 Trillion tokens (compared to LLaMA-2's 2 Trillion). The dataset includes 4 times more code data (drastically improving its coding and logic capabilities) and incorporates high-quality data from over 30 non-English languages to lay the groundwork for multilingual support. To ensure this massive dataset was high quality, Meta built advanced filtering pipelines. Interestingly, they found previous LLaMA models were great at identifying good text, so they actually used LLaMA-2 as a text quality classifier to filter the training data for LLaMA-3. 
+
+During pre-training, the team made a fascinating discovery regarding AI scaling laws (specifically the Chinchilla scaling law). The Chinchilla law previously suggested that for an 8 Billion parameter model, the optimal amount of training data is roughly 200 Billion tokens. However, Meta found that even after pushing past that limit by two orders of magnitude (training on up to 15 Trillion tokens), the performance of both the 8B and 70B models continued to increase in a log-linear fashion. 
+
+LLaMA-3's post-training process (which turns the base model into the Chat/Instruct version) is far more sophisticated than LLaMA-2's. A Multi-Method Approach: Instead of just standard RLHF, LLaMA-3 uses a complex combination of Supervised Fine-Tuning (SFT), Rejection Sampling, PPO (Proximal Policy Optimization), and a new addition: DPO (Direct Preference Optimization). The biggest improvements in model quality didn't just come from the algorithms, but from carefully curating the prompts for SFT and running rigorous, multi-round quality assurance on the human-annotated preference rankings.
+
+LLaMA-3 greatly improved its alignment, significantly reducing the "false refusal" rate where LLaMA-2 would stubbornly refuse to answer completely safe prompts. It introduced a suite of new trust and safety tools, including Llama Guard 2, Code Shield, and CyberSec Eval 2.
+#### 2.4.2.4 Alpaca
+
+The Stanford Alpaca model was created using a highly cost-effective, three-step fine-tuning process. The authors managed to train a model that performs similarly to OpenAI's text-davinci-003 for less than $600 total ($500 for generating data and $100 for computing power).
+
+The process began with humans manually writing 175 "self-instruct" seed tasks. Each of these tasks was formatted into a specific JSON structure containing three main components:
+
+- Instruction: The actual command or task description (e.g., "Find the four smallest perfect numbers.").
+- Input (Optional): Additional context needed to complete the task. For example, if the instruction was "summarize this article," the input would be the text of the article itself.
+- Output: The correct answer or expected response.
+
+Instead of paying humans to write thousands of more examples, the team used OpenAI's powerful text-davinci-003 model to automate the data creation. They fed the 175 seed tasks into text-davinci-003 using specific instruction templates (one template for tasks with an input field, and one for tasks without). They provided strict generation rules, asking the model to create new, similar instruction data while ensuring diversity, adhering to word counts and language requirements, and including examples of refusing inappropriate instructions. Through this "Modified Self-instruct" generation process, they expanded their 175 seeds into a massive dataset of 52,000 instruction-following examples.
+
+Finally, they took the base Meta LLaMA 7B model (which had only been pre-trained to predict the next word) and applied Supervised Fine-Tuning using the newly generated 52K instruction dataset. By training LLaMA 7B on how text-davinci-003 responds to various prompts, the resulting model—Alpaca 7B—learned to follow instructions and converse in a highly capable manner. 
+#### 2.4.2.5 Code LLaMA
+Code Llama does not start from scratch. All versions are initialized using the pre-trained Llama 2 foundation models (specifically the 7B, 13B, and 34B parameter sizes). The Llama 2 base is fed a massive dataset of 500 Billion tokens of general code data. After the initial 500B code training, the pipeline splits to create three highly specialized versions of Code Llama:
+
+- Code Llama - Python: The model takes a left turn and is trained on an additional 100 Billion tokens made exclusively of Python code. This creates a hyper-specialized Python expert.
+- Code Llama (Base): The model undergoes Long Context Fine-Tuning using 20 Billion tokens. This expands its memory window, allowing it to read, process, and generate much larger files and codebases at once.
+- Code Llama - Instruct: This version takes the Long Context model and applies Instruction Fine-Tuning using 5 Billion tokens. This trains the model to act like a chatbot, ensuring it can understand human conversational prompts and execute specific commands.
+
+Applied only to the 7B and 13B models during the initial training phase, this task teaches the AI how to "fill in the blanks" within an existing file. The system takes a complete piece of code, hides a specific chunk of it, and replaces it with a <MASK> symbol. Using an autoregressive method, the model analyzes the surrounding context (the code both before and after the mask) and is forced to predict exactly what the missing code should be.
 
 ### 2.4.3 DeepSeek
 #### 2.4.3.1 DeepSeek-V1
