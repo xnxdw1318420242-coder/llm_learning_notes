@@ -937,7 +937,113 @@ Because $a$ is significantly larger than $b$, DeepSeek proved that when you have
 The DeepSeek team successfully trained and released a highly capable open-source model built on a massive 2 Trillion token dataset, focusing primarily on English and Chinese. While the model made significant breakthroughs in training efficiency and scaling laws, it still suffered from a few notable disadvantages in everyday use. Because the model relies on a static dataset with a strict cutoff date, it cannot access real-time information or answer questions about recent events. Like most LLMs of its generation, DeepSeek Chat is still prone to confidently inventing facts or generating non-factual information. Besides, because they hyper-focused their 2 Trillion training tokens almost exclusively on English and Chinese, the model's proficiency in other languages is significantly underdeveloped.
 
 #### 2.4.3.2 DeepSeek-V2
+
+DeepSeek-V2 transitions to a Mixture of Experts (MoE) architecture. It has a massive total parameter count of 236 Billion (236B). However, because it's an MoE model, it doesn't use all of them at once. For any given token, it only activates 21 Billion (21B) parameters, keeping computational costs manageable. It supports a massive context length of 128K tokens.
+
+To solve the memory bottleneck caused by the KV Cache during inference (a common issue in standard Multi-Head Attention), DeepSeek-V2 introduces a brand new architecture called MLA (Multi-head Latent Attention). MLA compresses the massive KV cache down into a single "latent vector." This ensures highly efficient inference by drastically reducing the memory footprint required to remember previous tokens.The combination of MoE and MLA results in staggering efficiency improvements over their previous V1 dense model (DeepSeek 67B).
+
+<p align="center">
+  <img width="447" height="365" alt="24d42ced-7245-4867-abcd-7439973af550" src="https://github.com/user-attachments/assets/c36f79aa-404e-4349-aee6-d1d895565a0c" />
+</p>
+
+DeepSeekMoE overhauls the standard MoE layout using two primary strategies.
+
+1. Fine-Grained Expert Segmentation: Instead of using a few massive experts, DeepSeek splits the experts into much smaller, more granular units. This keeps the total parameter count the same but drastically increases the number of experts available. This allows each individual expert to become highly specialized in a very narrow knowledge domain. This fixes "Knowledge Mixing": In traditional MoE, a single expert is forced to learn multiple distinct types of knowledge. Finer segmentation allows each expert to specialize deeply in one specific domain.
+2. Shared Expert Isolation: It designates a specific set of experts as "Shared Experts." These are always activated for every single token. Their job is to capture and process broad, common contextual knowledge. By offloading general knowledge to these shared experts, the other routed experts are free to focus exclusively on highly unique, specialized tasks without redundant overlap. This fixes "Knowledge Redundancy": In traditional MoE, different experts often need the same foundational knowledge, leading to wasted parameters as multiple experts memorize the same things. Shared experts handle this common knowledge, freeing routed experts to focus on unique domains.
+
+In DeepSeek-V2, this translates to 2 Shared Experts and 160 Routed Experts per layer. Each token activates the 2 Shared Experts and the top 6 scoring Routed Experts. The MoE architecture replaces the standard FFN layers in all layers except the first layer. The intermediate hidden dimension for each expert is $1536$. 
+
+Because low-rank compression (in MLA) and fine-grained expert segmentation (in MoE) alter the mathematical scale of a layer's output, DeepSeek applies two fixes to guarantee training stability. First, they add an extra RMSNorm layer right after the compression latent vector. They also multiply the data by an extra scaling factor at the "width bottlenecks" (specifically, at the intermediate hidden states of both the compression latent vector and the routed experts).
+
+Because DeepSeek-V2 has so many fine-grained experts, they are physically distributed across multiple GPUs (devices). Sending tokens back and forth across a massive GPU cluster creates extreme communication bottlenecks. To solve this, DeepSeek uses Device-Limited Routing. Before selecting the absolute top-K experts for a token, the router first restricts the token to a maximum of $M$ devices (usually $M \ge 3$). It selects the top-K experts only from those chosen devices. This drastically reduces network communication costs while maintaining top-tier performance.
+
+If the router heavily favors a few experts and ignores the rest, the network suffers from "routing collapse" and compute bottlenecks. DeepSeek implements three distinct mathematical penalties (Auxiliary Losses) during training to force the model to balance the workload:
+- Expert-Level Balance Loss ($\mathcal{L}_{ExpBal}$): Forces tokens to be distributed evenly across all 160 individual experts.
+
+$$\mathcal{L}_{ExpBal} = \alpha_1 \sum_{i=1}^{N_r} f_i P_i$$
+
+Where:
+
+$$f_i = \frac{N_r}{K_r T} \sum_{t=1}^{T} \mathbb{1}(\text{Token } t \text{ selects Expert } i)$$
+
+This calculates the actual fraction of tokens routed to expert $i$.
+
+$$P_i = \frac{1}{T} \sum_{t=1}^{T} s_{i,t}$$
+
+This calculates the average routing probability/affinity score assigned to expert $i$ across all tokens.
+
+Variables:
+
+$\alpha_1$: Hyperparameter for the expert-level balance factor.
+
+$N_r$: Total number of routed experts.
+
+$K_r$: Number of activated routed experts per token.
+
+$T$: Total number of tokens in the sequence.
+
+$\mathbb{1}(\cdot)$: Indicator function (equals 1 if true, 0 if false).
+
+$s_{i,t}$: The affinity score between token $t$ and expert $i$.
+
+- Device-Level Balance Loss ($\mathcal{L}_{DevBal}$): Ensures that the computational workload is distributed evenly across the physical GPUs, preventing any single machine from overheating or bottlenecking the cluster.
+
+$$\mathcal{L}_{DevBal} = \alpha_2 \sum_{i=1}^{D} f'_i P'_i$$
+
+Where:
+
+$$f'_i = \frac{1}{|\mathcal{E}_i|} \sum_{j \in \mathcal{E}_i} f_j$$
+
+The average actual token fraction sent to the experts residing on device $i$.
+
+$$P'_i = \sum_{j \in \mathcal{E}_i} P_j$$
+
+The sum of the routing probabilities for all experts residing on device $i$.
+
+Variables:
+
+$\alpha_2$: Hyperparameter for the device-level balance factor.
+
+$D$: Total number of devices.
+
+$\mathcal{E}_i$: The set of experts deployed on device $i$.
+
+- Communication Balance Loss ($\mathcal{L}_{CommBal}$): Ensures that the actual network traffic (the sending and receiving of tokens between GPUs) remains balanced, preventing network traffic jams.
+
+$$\mathcal{L}_{CommBal} = \alpha_3 \sum_{i=1}^{D} f''_i P''_i$$
+
+Where:
+
+$$f''_i = \frac{D}{M T} \sum_{t=1}^{T} \mathbb{1}(\text{Token } t \text{ is sent to Device } i)$$
+
+Calculates the actual fraction of communication traffic directed to device $i$.
+
+$$P''_i = \sum_{j \in \mathcal{E}_i} P_j$$
+
+The same probability sum used in the device-level loss.
+
+Variables:
+
+$\alpha_3$: Hyperparameter for the communication balance factor.
+
+$M$: The maximum number of devices a token is allowed to be sent to under the Device-Limited Routing mechanism.
+
+Because auxiliary loss relies on probabilities, it cannot guarantee a perfectly balanced workload. To strictly enforce compute limits and prevent wasted resources, DeepSeek uses a Device-Level Token-Dropping strategy during training. The system calculates an exact compute budget for each physical device. If a device receives too many tokens, it simply drops the tokens with the lowest "affinity scores" until it fits the budget. (To ensure training stability, the system guarantees that roughly 10% of the training sequence will never be dropped).
+
+DeepSeek-V2 used GRPO as its RL post-training method. This method will be introduced in the following chapters. To make Reinforcement Learning effective, DeepSeek needed a highly reliable "Reward Model." They built this by carefully curating and filtering preference data. For the code preferences, they gathered using direct feedback from compilers. For the math preferences, they gathered using actual ground-truth labels (verifiable right/wrong answers). They initialized this Reward Model using the DeepSeek-V2 Chat (SFT) model and trained it using point-wise or pair-wise loss. This RL training phase is crucial because it fully unlocks the model's potential, teaching it how to consistently choose the most accurate and satisfactory response out of all possible answers.
+
+Running RL on a model of this massive scale puts immense pressure on GPU memory and RAM. To keep training speeds fast without crashing the system, the team implemented three major engineering optimizations:
+- Hybrid Engine: They developed a system that uses completely different parallel-processing strategies for the training phase versus the inference phase, drastically improving overall GPU utilization.
+- vLLM Integration: They used vLLM with large batch sizes as their inference backend to significantly speed up processing.
+- Smart CPU Offloading: They designed a meticulous scheduling strategy that constantly offloads parts of the model to the CPU and loads them back onto the GPU as needed. This achieved a near-perfect balance between saving memory and maintaining training speed.
+
 #### 2.4.3.3 DeepSeek-V2.5
+DeepSeek-V2.5 is not built from scratch; it is the ultimate merger of two specialized models: the conversational DeepSeek-V2-Chat and the programming-focused DeepSeek-Coder-V2. By combining them, V2.5 retains the general conversational fluency of the Chat model while inheriting the heavy-duty programming capabilities of the Coder model.
+
+DeepSeek took the original DeepSeek-V2-Chat and ripped out its base model, replacing it with the DeepSeek-Coder-V2-Base. This cross-pollination massively boosted the Chat model's coding and reasoning skills, resulting in the DeepSeek-V2-0628 version. Meanwhile, the DeepSeek-Coder-V2 underwent alignment optimization to improve its general, everyday capabilities, resulting in the DeepSeek-Coder-V2-0724 version. These two highly optimized branches (0628 and 0724) were fused together to create the final unified DeepSeek-V2.5.
+
+DeepSeek-V2.5 outperforms both of its direct predecessors (0628 and 0724) across four standard English and Chinese benchmarks. In internal arena testing (judged by GPT-4o), its win rate against models like GPT-4o mini and ChatGPT-4o-latest improved noticeably, particularly in creative writing and Q&A. It features much clearer boundaries for what constitutes a safety violation. While its defense against malicious "jailbreak" attacks was strengthened, it simultaneously reduced its "false refusal" rate (where safety protocols overly generalize and block completely normal, safe questions). It showed significant score jumps in Python-specific evaluations (HumanEval Python) and LiveCodeBench. Its Fill-In-the-Middle (FIM) autocomplete capabilities improved by 5.1%.
+
 #### 2.4.3.4 DeepSeek-V3
 #### 2.4.3.5 DeepSeek-V3.2-EXP
 #### 2.4.3.6 DeepSeek-R1
