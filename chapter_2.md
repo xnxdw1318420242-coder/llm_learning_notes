@@ -874,6 +874,68 @@ Applied only to the 7B and 13B models during the initial training phase, this ta
 
 ### 2.4.3 DeepSeek
 #### 2.4.3.1 DeepSeek-V1
+The DeepSeek LLM architecture heavily borrows from the successful LLaMA blueprint but introduces a distinct strategy for how it scales up its larger models. At the fundamental level, DeepSeek uses the same proven components as LLaMA to ensure stability and performance:
+- Normalization: It uses a Pre-Norm structure equipped with the RMSNorm function.
+- Activation & FFN: It uses SwiGLU as the activation function for its Feed-Forward Networks (FFN). The intermediate dimension of these FFN layers is strictly set to $\frac{8}{3}d_{model}$.
+- Positional Encoding: It uses RoPE (Rotary Positional Embeddings) to understand token positions.
+- Attention Mechanism: While the smaller models use standard Multi-Head Attention (MHA), the massive 67B model uses Grouped-Query Attention (GQA) to optimize inference costs and reduce memory bottlenecks.
+
+The most unique aspect of DeepSeek's architecture is how it scales its 67B model. When most developers build larger models, they usually widen the intermediate layers of the FFN. DeepSeek took a different approach: they expanded the parameter count by increasing the network's depth (adding more layers) rather than its width. They found this specific structural choice yielded better overall performance.
+
+Adjusting the layers this way achieves a couple of goals. First, it keeps their overall parameter counts perfectly aligned with other standard open-source models (like LLaMA's 7B and 65B/70B). Second, having these specific layer counts makes it much easier to slice the model up for pipeline partitioning (distributing the model efficiently across multiple GPUs). This carefully balanced design guarantees high computational efficiency while giving the model the flexibility and expressive power needed to handle highly complex tasks.
+
+DeepSeek's pretraining process is heavily focused on two main pillars: a rigorous three-step data processing pipeline and a highly optimized, custom training infrastructure. DeepSeek's pretraining process is heavily focused on two main pillars: a rigorous three-step data processing pipeline and a highly optimized, custom training infrastructure.
+
+1. Aggressive Deduplication: Instead of just removing duplicate files within small, localized batches, DeepSeek runs deduplication across the entire massive Common Crawl dataset. They found this global approach removes about four times as many duplicate documents, achieving an almost 90% deduplication rate across 91 data dumps.
+2. Quality Filtering: The team applies robust evaluation standards, combining both linguistic and semantic analysis to view the data quality from both a microscopic and macroscopic level.
+3. Remixing for Balance: To ensure the model doesn't become biased toward the most common topics, they intentionally adjust the data mix to artificially boost the presence of underrepresented domains, ensuring a more inclusive baseline.
+
+DeepSeek-V1 use a Byte-Level BPE (BBPE) tokenizer with a base vocabulary of 100,000 words. It is designed with special rules to prevent merging different character types (like splitting numbers into individual digits). They specifically padded the final vocabulary size to 102,400 to maximize computational efficiency on GPUs during training.
+
+To train massive models efficiently, DeepSeek uses their own lightweight, high-efficiency training framework called HAI-LLM. The framework seamlessly integrates Data Parallelism, Tensor Parallelism, Sequence Parallelism, and 1F1B Pipeline Parallelism. It also uses ZeRO-1 to partition optimizer states and reduce communication overhead. To eliminate "waiting" time, the system overlaps calculations with data transfers. For example, while the GPUs are crunching matrix math (GEMM), the system is simultaneously gathering or scattering data across the network. They also fuse multiple operations (like LayerNorm, GEMM, and Adam updates) together to speed up processing and utilize Flash Attention to maximize hardware utilization.
+
+The model is trained in BF16 precision to save memory, but critical gradient calculations are done in FP32 to ensure training stability. They also invented an "in-place cross-entropy" trick that calculates losses directly in the CUDA kernel—saving precious GPU memory (HBM) by instantly overwriting old data rather than storing it. The system asynchronously saves the model's progress every 5 minutes. If the hardware crashes, they lose a maximum of 5 minutes of training. Furthermore, the system is flexible enough to resume training even if the physical GPU cluster configuration changes.
+
+DeepSeek v1’s post-training is divided into two main stages: Supervised Fine-Tuning (SFT) and Direct Preference Optimization (DPO). They assembled a highly curated dataset of 1.5 Million bilingual (English and Chinese) instruction instances, including helpful data (1.2M instances broken down into Math problems (46.6%), General language tasks (31.2%), and Coding exercises (22.2%)) and safety data (300K instances designed to cover various sensitive topics to ensure harmless responses).
+
+During the SFT phase, the author discovered that the two model sizes required very different training treatments to prevent breaking. The smaller 7B model was fine-tuned for 4 epochs (Learning Rate: 1e-5). However, the massive 67B model suffered from severe overfitting, so they restricted its fine-tuning to only 2 epochs (Learning Rate: 5e-6). The team noticed a strange bug: as they added more Math SFT data, the model started generating infinite, repetitive text loops. They concluded this happened because weaker models struggled to fully grasp complex mathematical reasoning patterns, causing them to get stuck. To cure this repetition loop without losing mathematical capability, they relied heavily on the next step (DPO).
+
+In the DPO phase, the team created pairs of "good" and "bad" responses for both helpfulness (creative writing, Q&A, instruction following) and harmlessness. They used their own DeepSeek Chat model to generate these candidate responses. The DPO training ran for exactly 1 epoch with a batch size of 512 and a learning rate of 5e-6. They also used a learning rate warmup combined with a cosine scheduler. DPO successfully cured the text-repetition issue from the SFT phase and significantly enhanced the model's open-ended generation capabilities, all while maintaining high scores on standard benchmarks.
+
+In older scaling laws (like DeepMind's famous Chinchilla paper), model size was simply represented by its number of parameters ($N$). The formula for total compute budget ($C$) was roughly:
+
+$$C \approx 6ND$$
+
+Where $N$ is parameters, and $D$ is the number of training tokens.
+
+DeepSeek realized this approximation was actually causing massive statistical errors (sometimes up to 50% discrepancy in smaller models). There are two reasons.
+
+- It ignores Attention costs: The $6N$ formula completely ignores the heavy computational overhead required to calculate the attention mechanism across long sequences of text.
+- It overvalues Vocabulary: It includes the calculations for the embedding/vocabulary layer. While vocabulary matrices have a ton of parameters, they don't actually contribute much to the model's "thinking" or reasoning capacity.
+
+To fix this, DeepSeek threw out parameter counting ($N$) and introduced $M$, which stands for Non-Embedding FLOPs per token. It calculates the exact amount of computational work done per token, explicitly ignoring vocabulary and explicitly including attention costs. The new formula for model scale became:
+
+$$M = 72 n_{layer} d_{model}^2 + 12 n_{layer} d_{model} l_{seq}$$
+
+Notice how vocabulary size is completely gone, but sequence length ($l_{seq}$) is now a core part of the math. This allowed them to rewrite the compute budget formula much more accurately as:
+
+$$C = MD$$
+
+With this highly accurate math, DeepSeek ran massive "IsoFLOP" experiments. They tested varying combinations of model sizes ($M$) and data sizes ($D$) under fixed compute budgets ($C$) ranging from $1\text{e}17$ to $3\text{e}20$ FLOPs to find the absolute minimum error rate. They found that the optimal model scale ($M_{opt}$) and optimal data scale ($D_{opt}$) grow exponentially based on the compute budget ($C$), represented as:
+
+$$M_{opt} \propto C^a$$
+
+$$D_{opt} \propto C^b$$
+
+The Chinchilla paper previously suggested that as your compute budget grows, you should split it roughly 50/50 between making the model bigger and adding more data ($a \approx 0.49$, $b \approx 0.51$). However, DeepSeek found that the higher the quality of your training data, the more these coefficients change. Using their highly refined "Current Data", their coefficients were:
+
+- $a = 0.524$ (Model Scaling factor)
+- $b = 0.476$ (Data Scaling factor)
+
+Because $a$ is significantly larger than $b$, DeepSeek proved that when you have highly logical, high-quality data, any extra compute budget should be spent more aggressively on making the model larger, rather than just forcing it to read more tokens.
+
+The DeepSeek team successfully trained and released a highly capable open-source model built on a massive 2 Trillion token dataset, focusing primarily on English and Chinese. While the model made significant breakthroughs in training efficiency and scaling laws, it still suffered from a few notable disadvantages in everyday use. Because the model relies on a static dataset with a strict cutoff date, it cannot access real-time information or answer questions about recent events. Like most LLMs of its generation, DeepSeek Chat is still prone to confidently inventing facts or generating non-factual information. Besides, because they hyper-focused their 2 Trillion training tokens almost exclusively on English and Chinese, the model's proficiency in other languages is significantly underdeveloped.
+
 #### 2.4.3.2 DeepSeek-V2
 #### 2.4.3.3 DeepSeek-V2.5
 #### 2.4.3.4 DeepSeek-V3
