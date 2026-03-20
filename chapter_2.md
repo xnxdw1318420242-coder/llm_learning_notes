@@ -1045,8 +1045,229 @@ DeepSeek took the original DeepSeek-V2-Chat and ripped out its base model, repla
 DeepSeek-V2.5 outperforms both of its direct predecessors (0628 and 0724) across four standard English and Chinese benchmarks. In internal arena testing (judged by GPT-4o), its win rate against models like GPT-4o mini and ChatGPT-4o-latest improved noticeably, particularly in creative writing and Q&A. It features much clearer boundaries for what constitutes a safety violation. While its defense against malicious "jailbreak" attacks was strengthened, it simultaneously reduced its "false refusal" rate (where safety protocols overly generalize and block completely normal, safe questions). It showed significant score jumps in Python-specific evaluations (HumanEval Python) and LiveCodeBench. Its Fill-In-the-Middle (FIM) autocomplete capabilities improved by 5.1%.
 
 #### 2.4.3.4 DeepSeek-V3
+
+DeepSeek-V3 represents a massive scale-up from previous iterations, introducing significant new training innovations while keeping compute costs remarkably low. It is a colossal Mixture of Experts (MoE) model with 671 Billion total parameters. Despite its massive size, it only activates 37 Billion parameters per token, keeping it highly efficient to run. It retains the successful MLA (Multi-head Latent Attention) and DeepSeekMoE architectures pioneered in DeepSeek-V2 to guarantee efficient inference and economical training. DeepSeek-V3 introduces two brand-new strategies to the training process: Auxiliary-Loss-Free Load Balancing and Multi-Token Prediction.
+
+<p align="center">
+  <img width="434" height="356" alt="a096952f-0ab4-446e-b87c-30bba7012275" src="https://github.com/user-attachments/assets/2184e4a6-90c3-4796-af0d-bc3861084dd1" />
+
+</p>
+
+DeepSeek-V3 continues to use the core DeepSeekMoE structure for its Feed-Forward Networks (FFN), which relies on fine-grained experts and the isolation of shared experts. The baseline FFN output $h'_t$ for the $t$-th token $u_t$ is calculated as:
+
+$$h'_t = u_t + \sum_{i=1}^{N_s} \text{FFN}_{i}^{(s)}(u_t) + \sum_{i=1}^{N_r} g_{i,t} \text{FFN}_{i}^{(r)}(u_t)$$
+
+The gate value $g_{i,t}$ for the routed experts is calculated as:
+
+$$g_{i,t} = \frac{g'_{i,t}}{\sum_{j=1}^{N_r} g'_{j,t}}$$
+
+$$g'_{i,t} = \begin{cases} s_{i,t}, & s_{i,t} \in \text{Topk}(\{s_{j,t} | 1 \le j \le N_r\}, K_r) \\ 0, & \text{otherwise} \end{cases}$$
+
+$$s_{i,t} = \text{Sigmoid}(u_t^\top e_i)$$
+
+$N_s$ and $N_r$: The number of shared experts and routed experts, respectively.
+$K_r$: The number of activated routed experts.
+$s_{i,t}$: The token-to-expert affinity score.
+$e_i$: The centroid vector of the $i$-th routed expert.
+$\text{Topk}(\cdot, K)$: The set comprising the highest $K$ affinity scores.
+
+In a deliberate shift from DeepSeek-V2, V3 specifically uses the Sigmoid function to calculate the affinity scores ($s_{i,t}$) and normalizes all selected affinity scores to generate the final gate values.
+
+Traditional MoE models rely on auxiliary losses to prevent "routing collapse" (where a few experts get all the tokens). However, setting this auxiliary loss too high introduces non-negligible interfering gradients that actively damage model performance. To achieve load balancing without these interfering gradients, DeepSeek-V3 introduces a dynamic bias term ($b_i$) added to the affinity score strictly for routing purposes:
+
+$$g'_{i,t} = \begin{cases} s_{i,t}, & s_{i,t} + b_i \in \text{Topk}(\{s_{j,t} + b_j | 1 \le j \le N_r\}, K_r) \\ 0, & \text{otherwise} \end{cases}$$
+
+This bias term $b_i$ is only used for the routing decision. The actual gate value multiplied with the FFN output is still derived from the original, un-biased affinity score $s_{i,t}$. The model monitors expert load at the end of every training step. If an expert is overloaded, its bias $b_i$ is decreased by $\gamma$. If an expert is underloaded, its bias is increased by $\gamma$. Here, $\gamma$ is a hyperparameter known as the bias update rate.
+
+While V3 relies almost entirely on the loss-free bias strategy for global load balancing, it still applies a safety net to prevent extreme imbalances within any single sequence. It uses a sequence-level auxiliary loss, but assigns the balance factor $\alpha$ an extremely small value so it doesn't interfere with general training:
+
+$$\mathcal{L}_{Bal} = \alpha \sum_{i=1}^{N_r} f_i P_i$$
+
+Where:
+
+$$f_i = \frac{N_r}{K_r T} \sum_{t=1}^T \mathbb{1}(s_{i,t} \in \text{Topk}(\{s_{j,t} | 1 \le j \le N_r\}, K_r))$$
+
+$$s'_{i,t} = \frac{s_{i,t}}{\sum_{j=1}^{N_r} s_{j,t}}$$
+
+$$P_i = \frac{1}{T} \sum_{t=1}^T s'_{i,t}$$
+
+Where $T$ is the number of tokens in the sequence, and $\mathbb{1}(\cdot)$ is the indicator function.
+
+To control the massive communication overhead during training, DeepSeek-V3 retains the Node-Limited Routing strategy. It ensures that each token is sent to a maximum of $M$ nodes. To decide which nodes to send the token to, the system looks at the experts distributed across each node and selects the nodes based on the sum of their highest $\frac{K_r}{M}$ affinity scores. This specific constraint allows the MoE training framework to achieve near-perfect overlap between computation and communication.
+
+Because the new bias-driven load balancing strategy is so efficient, DeepSeek-V3 maintains excellent balance throughout the entire training process. Consequently, it abandons the Token Dropping strategy used in V2. DeepSeek-V3 drops absolutely zero tokens during training, and utilizes specialized deployment strategies to ensure no tokens are dropped during inference either.
+
+Multi-Token Prediction (MTP) is a strategy where the model is trained to predict multiple future tokens at each position, rather than just the single next token. Predicting multiple tokens at once operates similarly to speculative decoding. This approach significantly reduces memory access pressure during the Decode phase. Notably, when the prediction accuracy exceeds 85%, it achieves a 1.8x Decode Speed acceleration. On one hand, the MTP objective makes the training signals denser, which holds the promise of improving data utilization efficiency. On the other hand, MTP allows the model to pre-plan its representations, thereby better predicting future tokens.
+
+<p align="center">
+ <img width="725" height="339" alt="d542d9e9-539a-4b0c-8172-8f4be09207b6" src="https://github.com/user-attachments/assets/8afdf10d-2d06-4a35-a311-c423ad3916c9" />
+</p>
+
+DeepSeek-V3 uses $D$ sequential MTP modules to predict $D$ extra future tokens while maintaining the complete causal chain of predictions at each depth. The $k$-th MTP module consists of four parts. Notice how it shares certain layers with the Main Model to save resources:
+- A shared Embedding Layer: $\text{Emb}(\cdot)$
+- A shared Output Head: $\text{OutHead}(\cdot)$
+- An independent Transformer Block: $\text{TRM}_k(\cdot)$
+- An independent Linear Projection Matrix: $M_k \in \mathbb{R}^{d \times 2d}$
+
+When processing the $i$-th input token $t_i$ at the $k$-th prediction depth, the system first combines two representation vectors: the representation of the $i$-th token from the previous depth ($h_i^{k-1} \in \mathbb{R}^d$) and the embedding of the actual $i+k$ token ($\text{Emb}(t_{i+k}) \in \mathbb{R}^d$). This combination is done via linear projection and concatenation ($[:]$):
+
+$$h'^k_i = M_k [\text{RMSNorm}(h_i^{k-1}); \text{RMSNorm}(\text{Emb}(t_{i+k}))]$$
+
+When $k=1$, $h_i^{k-1}$ is simply the output representation from the Main Model. This combined input $h'^k_i$ is then fed into the $k$-th depth Transformer Block to generate the current depth's output representation:
+
+$$h_{1:T-k}^k = \text{TRM}_k(h'^{k}_{1:T-k})$$
+
+Where $T$ represents the input sequence length, and $1:T-k$ denotes a slice operation including boundaries
+
+Finally, the system feeds $h_i^k$ into the shared output head to calculate the probability distribution $P_{i+k+1}^k \in \mathbb{R}^V$ (where $V$ is the vocabulary size) for the $k$-th extra predicted token:
+
+$$P_{i+k+1}^k = \text{OutHead}(h_i^k)$$
+
+The shared $\text{OutHead}(\cdot)$ linearly maps the representation to logits, and then applies a $\text{Softmax}(\cdot)$ function to calculate the prediction probability of the $i$-th extra token.
+
+At each prediction depth, the model calculates a Cross-Entropy loss ($\mathcal{L}_{\text{MTP}}^k$):
+
+$$\mathcal{L}_{\text{MTP}}^k = \text{CrossEntropy}(P_{2+k:T+1}^k, t_{2+k:T+1}) = - \frac{1}{T} \sum_{i=2+k}^{T+1} \log P_i^k [t_i]$$
+
+Where $t_i$ represents the ground-truth Token at the $i$-th position, and $P_i^k[t_i]$ is the predicted probability for $t_i$ given by the $k$-th MTP module. To get the final supplementary training objective for DeepSeek-V3, the system averages the MTP losses across all depths and multiplies them by a weight factor $\lambda$ (referred to as $\varepsilon$ in some text descriptions):
+
+$$\mathcal{L}_{\text{MTP}} = \frac{\lambda}{D} \sum_{k=1}^D \mathcal{L}_{\text{MTP}}^k$$
+
+Because the primary goal of the MTP strategy is to enhance the core capabilities of the Main Model during training, the deployment strategy is highly flexible. During standard inference, you can directly discard the MTP modules, allowing the main model to operate independently and normally. Alternatively, you can repurpose these MTP modules for speculative decoding to further improve generation latency.
+
+DeepSeek-V3 introduces a massive overhaul to its infrastructure, focusing heavily on maximizing GPU utilization, implementing ultra-efficient FP8 mixed-precision training, and fundamentally redesigning how data moves across its clusters. DeepSeek-V3 was trained on a massive cluster of 2048 NVIDIA H800 GPUs. Each node contains 8 GPUs interconnected via NVLink/NVSwitch, while the nodes themselves are connected using IB (InfiniBand). To manage this, the HAI-LLM framework uses a combination of 16-way Pipeline Parallelism (PP), 64-way Expert Parallelism (EP) across 8 nodes, and ZeRO-1 Data Parallelism (DP).
+
+The biggest breakthrough here is the DualPipe algorithm. Previously, cross-node expert parallelism suffered from a terrible 1:1 computation-to-communication ratio. DualPipe fixes this by perfectly overlapping forward/backward computation with communication to eliminate pipeline bubbles. It innovatively splits chunks into four parts: attention, all-to-all dispatch, MLP, and all-to-all combine. The backward pass further divides attention and MLP into input and weight backward phases. By manually tweaking the GPU Streaming Multiprocessor (SM) allocation, it successfully masks the communication overhead. A standard DualPipe schedule contains 8 PP stages and 20 micro-batches fed from both directions.
+
+DeepSeek developed custom cross-node all-to-all communication kernels. Because intra-node NVLink bandwidth (160 GB/s) is about 3.2 times faster than cross-node IB bandwidth (50 GB/s), they limit each token to a maximum of 4 nodes. By aggressively overlapping IB and NVLink traffic, a token can hit up to 13 experts without any extra NVLink overhead. This highly efficient routing requires only 20 SMs, managed dynamically via warp specialization. To save VRAM during the backward pass, the system completely recomputes the RMSNorm and MLA up-projection instead of storing their activations. The model's Exponential Moving Average (EMA) parameters are stored entirely in CPU memory and updated asynchronously, costing zero extra GPU memory.
+
+DeepSeek-V3 successfully implements a fine-grained FP8 mixed-precision training framework. To prevent the limited dynamic range of FP8 from breaking the model, they use a highly specific quantization strategy, keeping the relative loss error strictly below 0.25%. The heavily compute-intensive linear matrix multiplications—specifically the forward pass (Fprop), activation backward pass (Dgrad), and weight backward pass (Wgrad)—are all executed in FP8. To maintain numerical stability, sensitive components like the embedding module, output head, MoE gating, normalization, and attention operators are kept in original BF16 or FP32 precision. Instead of scaling entire massive tensors, they group activations into 1x128 tile chunks, and weights into 128x128 block chunks ($1 \times N_c$ tile-wise or $N_c \times N_c$ block-wise). Unlike prior work that mixed formats (e.g., using E5M2 for gradients), DeepSeek strictly uses the E4M3 format across all tensors to secure higher precision. Because FP8 GEMM on H800 restricts accumulation precision to roughly 14 bits, DeepSeek forces the Tensor Cores to bump intermediate results up to the CUDA Cores' FP32 registers at a specific interval K to achieve full-precision accumulation.
+
+Because linear operators after attention are ultra-sensitive, the DeepSeek-V3 use a custom E5M6 format and convert the 128x128 quantized blocks into 128x1 blocks during the backward pass. AdamW moments are tracked in BF16, while the main weights and gradients are kept safely in FP32.
+
+To guarantee strict Service Level Objectives (SLO) for online users, DeepSeek entirely separates the "Prefill" (reading the prompt) and "Decode" (generating the answer) phases onto different hardware configurations. The prefill phase runs on a minimum unit of 4 nodes (32 GPUs). It uses TP4 + SP + DP8 for attention, and EP32 for MoE. To balance the load, it uses a redundant expert strategy, copying high-load experts every 10 minutes. Each GPU hosts its original 8 experts plus 1 redundant expert. The decode phase runs on a massive minimum unit of 40 nodes (320 GPUs). Here, the shared expert is just treated like another routed expert (a token picks 9 experts, and the shared one is always one of them). It uses TP4 + SP + DP80 for attention, and EP320 for MoE. Each GPU only hosts 1 expert. It relies on IB point-to-point transfers and IBGDA technology to slash generation latency.
+
+DeepSeek-V3’s pretraining process is a highly orchestrated pipeline involving optimized data curation, meticulous hyperparameter scheduling, and post-pretraining context extension. DeepSeek-V3 was trained on a massive 14.8T high-quality, diverse tokens. They increased the proportion of math and programming samples and expanded multilingual coverage beyond just English and Chinese. They used a document packing method to ensure data integrity but deliberately avoided using cross-sample attention masking during training. Borrowing from DeepSeekCoder-V2, they implemented FIM because it enables the model to predict middle text based on surrounding context without harming its standard next-token prediction capabilities. The FIM application rate is 0.1, implemented at the document-packing level using the PSM (Prefix-Suffix-Middle) framework:
+
+<|fim_begin|>  $f_{pre}$ <|fim_hole|> $f_{suf}$ <|fim_end|> $f_{middle}$  <|eos_token|>
+
+DeepSeek-V3 uses BBPE (Byte-Level BPE) with the vocabulary expanded to 128K tokens. To fix a specific token boundary bias caused by new tokens that combine punctuation and newlines, they randomly split a certain proportion of these combined tokens during training to expose the model to broader edge cases.
+
+The Transformer has 61 layers with a hidden dimension of 7168. All learnable parameters are initialized with a standard deviation of 0.006. Number of attention heads is 128, with each head dimension being 128. The KV compression dimension is 512, and the Query compression dimension is 1536. The decoupled Query and Key heads have a dimension of 64. All FFN layers are replaced by MoE layers except for the first 3 layers. Each MoE layer has 1 Shared Expert and 256 Routed Experts. The intermediate hidden dimension for each expert is 2048. Every token activates 8 experts and is sent to a maximum of 4 nodes. The MTP (Multi-Token Prediction) depth is set to 1. The model boasts 671B total parameters, with only 37B parameters activated per token.
+
+Pretraining was executed using the AdamW optimizer ($\beta_1 = 0.9$, $\beta_2 = 0.95$, weight_decay = 0.1) with a gradient clipping norm of 1.0 and a max sequence length of 4K. For the first 2K steps, the learning rate schedule linearly increases to $2.2 \times 10^{-4}$. It maintains this peak rate until consuming 10T tokens. For the next 4.3T tokens, it gradually decays to $2.2 \times 10^{-5}$ following a cosine decay curve. In the final 500B tokens, for the first 333B, it holds at $2.2 \times 10^{-5}$. For the remaining 167B, it drops to $7.3 \times 10^{-6}$. The batch size steps up gradually from 3072 at the start to 15360, and then remains constant. Routed experts are uniformly distributed across 64 GPUs on 8 nodes. The Loss-Free Balancing bias update rate is set to 0.001 for the first 14.3T tokens, and drops to 0 for the final 500B. The sequence-level balance loss weight is a tiny 0.0001. The MTP loss weight is 0.3 for the first 10T tokens, and drops to 0.1 for the remaining 4.8T. 
+
+After standard pretraining, DeepSeek-V3 extended its context window using the YaRN method applied only to the decoupled shared keys. This was done in two distinct training stages of 1000 steps each. In the first stage, sequence length was extended to 32K, with a batch size of 1920. In the second stage, sequence length was extended to 128K, with the batch size reduced to 480. Across both stages, the learning rate was kept at $7.3 \times 10^{-6}$ (matching the end of pretraining). The YaRN hyperparameters were: $s = 40$, $\alpha = 1$, $\beta = 32$, with a scaling factor of:
+
+$$\sqrt{t} = 0.1 \ln s + 1$$
+
+DeepSeek-V3’s post-training process is a highly sophisticated pipeline split into two main phases: Supervised Fine-Tuning (SFT) and Reinforcement Learning (RL) powered by the specialized algorithm GRPO. The team meticulously curated an SFT dataset of exactly 1.5M instances covering multiple domains. They used two distinct strategies to generate this data:
+
+- Reasoning Data: For logic-heavy tasks like math, coding competitions, and puzzles, they used their internal DeepSeek-R1 model to generate the data. While R1 produces highly accurate answers, it tends to overthink, format poorly, and write overly long responses. The SFT goal here was to filter this data to balance R1's accuracy with proper formatting and conciseness.
+
+- Non-Reasoning Data: For creative writing, role-playing, and simple Q&A, they used DeepSeek-V2.5 to generate responses, which were then strictly verified by human annotators for accuracy and correctness.
+
+They fine-tuned the DeepSeek-V3-Base model on this dataset for exactly 2 epochs. They used a cosine decay learning rate schedule, starting at an initial rate of $5 \times 10^{-6}$ and gradually decaying down to $1 \times 10^{-6}$. They packed multiple separate sequences into single training samples to save time, but applied a strict attention masking strategy to ensure these packed examples remained completely isolated and invisible to one another.
+
+To prepare for Reinforcement Learning, they built two different types of Reward Models to judge the AI's output:
+
+- Rule-Based Reward Model: Used for objective problems (like math or LeetCode). It relies on deterministic rules or actual compilers to verify if an answer is perfectly correct. This method provides immense reliability and makes it very hard for the AI to "hack" the reward system.
+
+- Model-Based Reward Model: Used for subjective, free-form tasks (like creative writing). Initialized from the DeepSeek-V3 SFT checkpoint, this model takes the prompt and the answer and outputs a judgment. To make it more reliable and resistant to reward hacking, the preference data used to train it includes the entire "Chain of Thought" that led to the reward, not just a final score.
+
+Just like in V2, DeepSeek-V3 completely abandons the traditional, memory-heavy "critic model" used in standard PPO. Instead, it uses GRPO, which estimates the baseline reward by looking at the relative scores of a group of outputs. By feeding this GRPO framework a diverse set of prompts across coding, math, and writing, they successfully aligned DeepSeek-V3 to human preferences and significantly boosted its benchmark performance, proving this method works exceptionally well even when supervised fine-tuning data is limited.
+
 #### 2.4.3.5 DeepSeek-V3.2-EXP
+
+DeepSeek V3.2 introduces two major architectural differences compared to its predecessors (DeepSeek-V2 and DeepSeek-V3). Unlike previous versions that used different attention mechanisms (like MLA or GQA), V3.2 utilizes MQA. In this new architecture, there is no splitting of the Key-Value (KV) heads. DeepSeek-V3.2-EXP also adopts a brand new sparse attention architecture called DSA.
+
+<p align="center">
+ <img width="783" height="405" alt="b2e4691c-8b81-427e-b017-f5db6c16cd72" src="https://github.com/user-attachments/assets/37c92d36-d028-4936-94f6-1bf7517cb39d" />
+</p>
+
+DSA (DeepSeek Sparse Attention) operates using a highly efficient two-step process: scoring the relevance of past tokens and then selectively applying attention only to the most important ones. Because DeepSeek-V3.2-Exp was continuously trained starting from the V3.1-Terminus checkpoint, the developers specifically instantiated DSA based on the existing MLA (Multi-head Latent Attention) architecture.
+
+The Lightning Indexer aims to quickly filter out the key historical tokens that are relevant to the current query. For a given Query token hidden vector $h_{t} \in R^{d}$ and a historical preceding token $h_{s} \in R^d$, the system derives an Index Query Vector ($q_{t,j}^I \in R^{d_I}$), an Index Key Vector ($k_{s}^I \in R^{d_I}$), and a weight coefficient ($w_{t,j}^I \in R$). It then calculates the Index Score ($I_{t,s}$) using this formula:
+
+$$I_{t,s} = \sum_{j=1}^{H_I} w_{t,j}^I \cdot \text{ReLU}\left(\mathbf{q}_{t,j}^I \cdot \mathbf{k}_s^I\right)$$
+
+Where $H_I$ represents the number of index heads.
+
+The system explicitly uses a ReLU activation function to ensure a high computational throughput. Because the indexer uses a small number of index heads (meaning low computational overhead) and fully supports FP8 implementation, its computational efficiency is exceptional.
+
+Top-$k$ Token Selection leverages the advantages of sparsity to avoid calculating attention across the full set of tokens, which significantly reduces VRAM consumption and computational power requirements. Based on the index scores ($I_{t,s}$), a fine-grained selection mechanism filters and retains only the Top-$k$ compressed key-value items $\{\mathbf{c}_s\}$ corresponding to the Query token $\mathbf{h}_t$. The model then performs the actual attention calculation only on these selected sparse key-value pairs. The final attention output ($\mathbf{u}_t$) is calculated as:
+
+$$\mathbf{u}_t = \text{Attn}\left(\mathbf{h}_t, \{\mathbf{c}_s \mid I_{t,s} \in \text{Top-}k(I_{t,:})\}\right)$$
+
+To further elevate computational efficiency at the kernel level, DSA is implemented within MLA's MQA (Multi-Query Attention) mode. This structural choice means that each key-value item (the Latent Vector in the MLA framework) is shared across all Query heads.
+
+DeepSeek-V3.2-Exp does not start its pretraining from scratch. Instead, it undergoes Continuous Pretraining starting from the exact weights of the DeepSeek-V3.1-Terminus checkpoint. The entire continuous pretraining process relies strictly on the 128K extended context data distribution previously used by V3.1-Terminus. It is divided into two highly specific stages to safely introduce the new sparse attention architecture.
+
+1. Dense Warm-up Phase. It safely initializes the new "Lightning Indexer" without breaking the model's existing knowledge. During this phase, the model keeps its standard, dense attention mechanism active. To prevent catastrophic forgetting, the system freezes all model parameters except for the new Lightning Indexer. To train the Indexer, its output is forced to align with the main attention distribution. The system sums the attention scores across all heads, applies L1 normalization, and gets a target distribution ($\mathbf{p}_{t,:}$). The training objective is a KL divergence loss between the target distribution and the Indexer's softmax output. This is a very fast phase. It runs for only 1000 steps with a learning rate of 10^-3. Each step processes 16 sequences of 128K length, consuming a total of just 2.1B tokens.
+
+$$\mathcal{L}^I = \sum_t D_{\text{KL}}(\mathbf{p}_{t,:} \parallel \text{Softmax}(I_{t,:}))$$
+
+2. Stage 2: Sparse Training Phase. It transitions the entire model into the new DSA (DeepSeek Sparse Attention) mode. With the Indexer warmed up, the fine-grained token selection mechanism is turned on. Crucially, all model parameters are unfrozen and optimized so the main model can adapt to working with sparse data. The alignment loss is updated so it only cares about the specific tokens that were actually selected by the Indexer (the set $S_t$). To keep training stable, the Indexer's input is detached from the main computation graph. This means the Indexer is optimized exclusively by the KL divergence loss ($\mathcal{L}^I$), while the main model is optimized exclusively by the standard language modeling loss. Their training signals do not cross-contaminate. This is the heavy-lifting phase. The learning rate is dropped to 7.3 x 10^-6. The Indexer is set to select exactly 2048 key-value tokens for every Query. It co-trains the main model and the Indexer for 15000 steps. Each step processes a massive 480 sequences of 128K length, consuming approximately 943.7B tokens in total.
+
+$$\mathcal{L}^I = \sum_t D_{\text{KL}}(\mathbf{p}_{t,S_t} \parallel \text{Softmax}(I_{t,S_t}))$$
+
+The post-training for DeepSeek-V3.2-Exp retains the exact same sparse attention mechanism used in its pretraining phase. Furthermore, its entire post-training workflow, algorithms, and data perfectly mirror those of DeepSeek-V3.1-Terminus. The process is divided into two primary phases.
+
+1. Expert Distillation. Rather than trying to teach the unified model everything all at once, the team first trains specialized Expert Models for specific tasks, all initialized from the base DeepSeek-V3.2 weights. Beyond standard writing and general Q&A, they developed experts for 5 highly technical domains: Math, Competitive Programming, General Logical Reasoning, Agent Coding, and Agent Search. Each of these expert models undergoes massive, independent Reinforcement Learning (RL) training. They are specifically trained to generate data for both complex, long-chain reasoning (thinking mode) and direct, immediate answers (non-thinking mode). Once these experts reach peak performance, they are used to generate high-quality data. This data is then used to train the final, unified model. While this newly unified model initially performs slightly worse than the individual experts, the next RL phase effectively eliminates that performance gap.
+
+2. Mixed Reinforcement Learning. The final unified model undergoes a massive RL phase using the GRPO algorithm. Unlike older models that use multi-stage RL (training one skill, then the next), DeepSeek combined reasoning, agent capabilities, and human alignment into a single, unified RL stage. This successfully balances performance across all domains and completely avoids the "catastrophic forgetting" that plagues multi-stage training. It still has a dual reward system. For reasoning & agent tasks, the system applies strict rule-based rewards tied to the actual outcome, alongside length penalties and rewards for keeping the language consistent. For general tasks, it uses a generative reward model, where every single prompt has its own specialized evaluation criteria. The entire reward design was meticulously tuned to balance two specific conflicts: Length vs. Accuracy and Language Consistency vs. Accuracy.
+   
 #### 2.4.3.6 DeepSeek-R1
+Previously, academia believed that massive amounts of Supervised Fine-Tuning (SFT) data were strictly necessary to "unlock" a model's reasoning abilities before Reinforcement Learning (RL) could be applied. DeepSeek proved this false. Their main breakthrough is demonstrating that unsupervised RL alone can teach an LLM how to reason. 
+
+1. Post-Training Innovations
+- DeepSeek-R1-Zero (Pure RL): They successfully created a model that mastered reasoning behavior using pure RL, completely skipping the traditional SFT phase. It used absolutely zero supervised data.
+- DeepSeek-R1 (The 4-Stage Pipeline): While the pure RL model could reason, it suffered from poor readability and "language mixing" (switching languages mid-sentence). To fix this, they developed a new two-stage SFT and two-stage RL pipeline to create the final DeepSeek-R1. The exact pipeline is: Cold Start SFT $\rightarrow$ RL $\rightarrow$ COT (Chain of Thought) + General Data SFT (800k samples) $\rightarrow$ All-scenario RL.
+  
+2. Distillation
+- They proved that taking the massive, fully-trained R1 model and using it to generate reasoning data to teach smaller models (Distillation) produces significantly better results than trying to run RL directly on those smaller models.
+- By fine-tuning smaller models with R1's reasoning data, they successfully created a series of powerful compact models, such as R1-Distill-Qwen-7B.
+ 
+The base foundation for DeepSeek-R1-Zero is DeepSeek-V3-Base. The name "Zero" is a nod to AlphaZero. It means the model was trained from scratch to self-iterate without any human-annotated data. It completely skipped the traditional Supervised Fine-Tuning (SFT) phase and was trained using Pure Reinforcement Learning (RL).
+
+Instead of using complex AI "reward models" to judge its outputs (which can lead to the AI "hacking" the rewards), DeepSeek used a strict, rule-based reward system with two main pillars: 
+
+- Accuracy Rewards: The system feeds the model unannotated data (like a math problem and its final correct answer). If the model's final answer matches the correct one (e.g., for solving $x^2 - 4x + 1 = 0$, if the answer is $-3$), it gets a reward of +1. If it's wrong, it gets -1. The system is smart enough to recognize equivalent mathematical expressions.
+
+- Format Rewards: The model is forced to use a strict, unified training template for every single question. It must output its internal reasoning inside <think> ... </think> tags, and its final solution inside <answer> ... </answer> tags.
+
+Because the model was left alone to maximize its rewards without human mimicking, it spontaneously developed fascinating, advanced problem-solving strategies. As training progressed, the model's average response length naturally skyrocketed from hundreds of tokens to thousands. It taught itself that taking more time to "think" leads to better rewards. 
+
+The model naturally started "talking to itself." After generating a partial answer, it would pause, revisit earlier steps, and reevaluate its logic. The most striking phenomenon was the model developing an anthropomorphic "epiphany" tone. The model also catches its own mistake mid-thought and literally writes: "Wait, wait. Wait. That's an aha moment I can flag here. Let's reevaluate..." This proved that pure RL can automatically unlock complex human-like reasoning.
+
+R1-Zero achieved highly impressive benchmark scores, proving its reasoning chops. For example, it scored 71.0 on AIME 2024 and an incredible 95.9 on MATH-500, putting its raw reasoning capabilities in the same league as models like OpenAI's o1. However, despite its brilliant reasoning, pure RL without human supervision caused severe usability issues:
+
+- Poor Readability: The text was often repetitive, excessively long, or structurally messy.
+- Language Mixing: The model would unintentionally switch back and forth between different languages mid-sentence, ruining the user experience.
+- Unstable Reasoning Chains: Sometimes it would get stuck in endless loops or generate repetitive content.
+- Flawed Reflection: Its newfound "self-reflection" ability wasn't always perfect and could sometimes lead it down the wrong path to an incorrect conclusion.
+
+Ultimately, these exact flaws are why the developers went on to build the standard DeepSeek-R1 model, which re-introduces a small amount of Supervised Fine-Tuning (SFT) to fix the readability and language mixing issues while preserving the brilliant reasoning unlocked by the "Zero" experiment.
+
+DeepSeek-R1 is a highly advanced reasoning model built on the DeepSeek-V3-Base architecture. Its creation was directly inspired by the successes and failures of its experimental predecessor, DeepSeek-R1-Zero. By carefully injecting Supervised Fine-Tuning (SFT) into the RL process, R1 bridges the gap between raw, experimental reasoning power and a stable, highly readable, production-ready model (comparable to the OpenAI-o1 class).
+
+To achieve this balance, DeepSeek-R1 abandons the "pure RL" approach and instead uses a meticulously designed 4-Stage Pipeline:
+
+1. Stage 1: Cold Start (SFT). Before throwing the model into Reinforcement Learning, it undergoes a "Cold Start" phase using a small amount of highly curated, long Chain-of-Thought (CoT) data. The cold start stabilizes the early RL training phase, improves human readability, and forces the model to learn proper formatting right out of the gate, avoiding the messy outputs seen in R1-Zero. The team prompted R1-Zero to generate detailed answers (including reflection steps), filtered the best ones, and had human annotators refine them. The model is trained to strictly output its thoughts and summaries in a specific format: |special_token|<reasoning_process>|special_token|<summary>.
+
+2. Stage 2: Reasoning-Oriented RL. Once the model is "warmed up" and understands how to format its thoughts, it enters a large-scale RL phase focused entirely on enhancing its reasoning capabilities. To cure the "language mixing" problem of R1-Zero, this stage introduces a new reward. It calculates the proportion of words in the target language within the CoT. If the model starts mixing languages, it is penalized. While enforcing this language consistency slightly drops the model's raw reasoning performance, the RL vastly improves human readability and user experience. The final reward function here is simply the Accuracy Reward + Language Consistency Reward.
+
+3. Stage 3: Rejection Sampling and Comprehensive SFT. Once the Stage 2 RL model converges, the team pauses RL and uses that checkpoint to generate a massive, high-quality dataset to improve the model's comprehensive skills (writing, role-play, Q&A), not just its math/logic skills. They use the Stage 2 model to generate multiple reasoning trajectories. A generative reward model (DeepSeek-V3) evaluates them, filtering out mixed languages, overly long paragraphs, and flawed logic. They keep only the correct responses, resulting in ~600,000 high-quality reasoning samples. They also pull ~200,000 non-reasoning samples (like creative writing or simple translation) from the DeepSeek-V3 SFT dataset. For simple queries (e.g., "Hello"), the model is taught not to use a complex Chain of Thought. The original DeepSeek-V3-Base model is then fine-tuned on this combined 800k dataset for 2 epochs.
+
+4. Stage 4: All-Scenario RL. The newly fine-tuned model enters one final RL phase to polish its performance across all scenarios, ensuring safety and helpfulness. It uses Rule-based rewards for reasoning data (math/code), and Reward Models for general, subjective data (writing/alignment).
+
+A major contribution of the R1 project is proving the power of Distillation. DeepSeek took the 800k high-quality samples generated in Stage 3 and used them to directly fine-tune smaller, open-source models (like Qwen-7B). They discovered that distilling the "reasoning trajectories" of a massive model into a small model works significantly better—and is vastly cheaper—than trying to run RL on a small model from scratch. Small models simply lack the capacity to discover high-level reasoning patterns on their own, but they are excellent at mimicking them once shown the way.
+
+A very important takeaway is that these distilled models were ONLY put through the Supervised Fine-Tuning (SFT) stage; they did NOT undergo an RL phase. The DeepSeek team acknowledges that adding RL to these small models would significantly improve their performance even further, but they intentionally left that as an open opportunity for the open-source community to tackle.
+
+The team was highly transparent about their failed experiments. While training R1, they attempted to use Process Reward Models (PRM) and Monte Carlo Tree Search (MCTS)—techniques often associated with complex AI reasoning. They found that PRM introduced too much computational overhead and was highly susceptible to "reward hacking" by the AI. MCTS struggled because the search space of human language is astronomically larger than traditional MCTS applications (like the game of Chess), causing the model to get stuck in local optimums. Therefore, the final DeepSeek-R1 relies purely on the robust SFT + RL pipeline detailed above.
+
+To optimizing PRM design, future research needs to refine the architecture and training methods of PRM to reduce its heavy computational cost. A major focus must also be placed on designing better reward signals to prevent the AI from "reward hacking." To upgrading the MCTS algorithm, because the possibilities in human language are astronomically vast, standard MCTS struggles. Researchers need to invent smarter node-selection strategies and dynamic search depths tailored specifically for language models to make the search process actually efficient. Merging PRM and MCTS with other advanced AI training techniques, like self-supervised learning or contrastive learning, could also spark new breakthroughs in reasoning. While they might struggle as general-purpose tools right now, PRM and MCTS might be highly effective when applied to very specific, specialized domains. Future research should explore these niche use cases.
 
 ### 2.4.4 Qwen
 #### 2.4.4.1 Qwen1
