@@ -1271,12 +1271,340 @@ To optimizing PRM design, future research needs to refine the architecture and t
 
 ### 2.4.4 Qwen
 #### 2.4.4.1 Qwen1
-#### 2.4.4.2 Qwen1.5
-#### 2.4.4.3 Qwen2
-#### 2.4.4.4 Qwen2.5
-#### 2.4.4.5 Qwen3
-#### 2.4.4.6 Qwen3 Next
-#### 2.4.4.7 GTE-Qwen3
-#### 2.4.4.8 Qwen3 Embedding & Reranker
+Qwen utilizes a modified Transformer architecture and adopts training methodologies similar to the highly popular LLaMA model. 
 
-### 2.4.5 Gemini
+Qwen uses BPE (Byte-Pair Encoding) as its tokenization method, utilizing the open-source fast tokenizer tiktoken (specifically starting from its cl100k base vocabulary) as its foundation. It splits numbers into individual digits (e.g., splitting 123 into 1, 2, and 3). This allows the model to better understand and process different number combinations instead of just memorizing specific chunks, improving performance on unseen data. Besides, Treating every number combination as a distinct token would explode the vocabulary size. Splitting them significantly reduces the size, boosting training efficiency and inference speed. The final vocabulary size is roughly 152K. Experiments demonstrate that Qwen achieves higher compression efficiency compared to other tokenizers, resulting in better information transfer efficiency across most languages. Furthermore, expanding the vocabulary size did not negatively impact downstream task performance.
+
+Qwen explicitly does not share weights between the input Embedding and the output Projection. Because they serve different functional needs, using independent weights provides more flexibility to improve the model's overall performance. However, the trade-off is increased memory consumption. Qwen incorporates sequence position information using Rotary Positional Encoding (RoPE). Crucially, Qwen calculates the inverse frequency matrix for RoPE using FP32 precision rather than lower precisions like BF16 or FP16. This is because RoPE relies heavily on the exact mathematical relationship between position and frequency to calculate rotation matrices. If the precision isn't high enough, it causes inaccurate positional encoding. FP32 ensures high-precision calculation, reducing numerical errors and improving the model's stability and accuracy on position-sensitive tasks.
+
+Qwen removes the linear bias terms from most layers. This reduces parameter count, lowers the risk of overfitting, and improves general stability. However, it specifically adds bias terms back into the QKV (Query, Key, Value) layers in the attention mechanism. This targeted addition enhances the model's extrapolation ability, helping it better capture input features and handle complex, unseen data inputs.
+
+Qwen uses Pre-Norm (normalizing before the layers) as it is the most common and proven method for improving training stability in Transformer architectures, compared to Post-Norm. Qwen completely replaces traditional LayerNorm with RMSNorm. While LayerNorm calculates both mean and standard deviation (which is computationally complex), RMSNorm only calculates the root mean square. This delivers the exact same performance level while significantly improving computational efficiency and maintaining training stability (though it does risk minor information loss regarding input distribution).
+
+Qwen uses SwiGLU (a combination of Swish and Gated Linear Units). Qwen's experiments proved that GLU-based activation functions generally outperform other baselines like GeLU. SwiGLU is better than ReLU, because Swish provides a small response to negative values, overcoming ReLU's issue of "dead" neurons outputting zero. The GLU gate decides what information passes and what gets filtered, helping the network learn representations more effectively. This is incredibly useful for long-sequence texts and long-distance dependencies in large language models. The internal parameters (W1, W2, W3, b1, b2, b3) can be dynamically adjusted through training to adapt to different tasks and datasets, enhancing flexibility. SwiGLU is computationally more efficient than complex functions like GELU while maintaining high performance.
+
+Following modern best practices, Qwen reduces the dimensionality of the FFN from the traditional 4 times the hidden size to 8/3 times the hidden size.
+
+<p align="center">
+<img width="276" height="312" alt="99292c8b-1e34-4ecf-88d3-e4e229e4efbc" src="https://github.com/user-attachments/assets/78fb78ba-d562-492d-a26e-68eb788412d1" />
+</p>
+
+To ensure an extensive understanding of the world and various complex tasks, Qwen was pre-trained on a massive dataset of up to 3 trillion tokens. The data includes public web documents, encyclopedias, books, and code, primarily focusing on Chinese and English. The research team implemented a rigorous 8-step data preprocessing pipeline:
+
+1. Text Extraction: Extracting text content from HTML web data.
+
+2. Language Identification: Using tools to determine the language of the text.
+
+3. Deduplication: Enhancing data diversity by applying exact match deduplication (after language normalization) and fuzzy deduplication using MinHash and LSH algorithms.
+
+4. Quality Filtering: Combining rule-based and machine learning methods to filter low-quality data. This involves scoring content using multiple models, including language models and text quality scorers.
+
+5. Safety Control: Using models to identify and filter out offensive content such as violence, bias, and pornography.
+
+6. Upsampling: Upsampling certain high-quality data sources to ensure diverse, top-tier content.
+
+7. Instruction Data Injection: Introducing high-quality instruction datasets.
+
+8. Data Contamination Prevention: To eliminate any overlap with the test sets used for evaluation, the team aggressively removed any text content from the training data that matched instruction samples in the test set beyond a 13-gram threshold.
+
+Qwen's training relies on a standard autoregressive language modeling objective with the following specific configurations. It is trained with a sequence length of 2048. The attention mechanism utilizes Flash Attention technology to boost computational efficiency and reduce memory footprint. The optimizer employs the AdamW optimizer, with hyperparameters set to $\beta_1 = 0.9$, $\beta_2 = 0.95$, and $\epsilon = 1e-8$. The learning rate schedule uses a cosine learning rate schedule, where the learning rate eventually decays to 10% of the peak value. Qwen's training is accelerated using BFloat16 mixed-precision training.
+
+Due to the quadratic complexity of the Transformer architecture, training directly on long context windows causes an exponential increase in computational and memory costs. To solve this, Qwen extrapolates the context length during the inference stage rather than during training. While Qwen uses RoPE (Rotary Positional Encoding) which inherently supports some extrapolation, direct extrapolation causes the Attention Score to increase significantly, causing performance drops. This happens for two reasons:
+
+- Periodicity of Sine/Cosine: In the training data (e.g., positions $0$ to 2048), the positional encodings only cover a specific part of the sine/cosine periods. When the position exceeds this range (e.g., position $3000$), it enters a different period. Because these encoded values drastically differ from the training distribution, it causes violent fluctuations in the attention scores.
+
+- High-Frequency Components: In RoPE, higher-dimensional encodings (high-frequency components) are extremely sensitive to position changes. As position values increase, these high-frequency components change rapidly, leading to significant fluctuations in the Attention Score.
+
+To solve the excessive attention scores and the loss of high-frequency information caused by standard interpolation, Qwen implements Dynamic NTK-aware interpolation.
+
+The core philosophy of NTK-aware interpolation is: Extrapolate high frequencies, interpolate low frequencies. Unlike standard Position Interpolation (PI)—which scales every dimension evenly by a factor of $S$—NTK-aware spreads the interpolation pressure across multiple dimensions by decreasing high-frequency scaling and increasing low-frequency scaling. The simplest way to achieve this is by altering the base value $\theta$.
+
+The $i$-th dimension has $\theta_i = b^{-2(i-1)/d}$, where $b = 10000$ and $i = 1, 2, \dots, d/2$. Position Interpolation (PI) divides the position index by the expansion ratio $S$, making no changes to the rotation angles:
+
+$$f_{PI}(x_m, m, \theta) = f\left(x_m, g(m) = \frac{m}{S}, h(\theta_i) = \theta_i\right)$$
+
+Instead of changing the position index, NTK-aware Interpolation modifies the original RoPE base calculation:
+
+$$f_{NTK}(x_m, m, \theta) = f\left(x_m, g(m) = m, h(\theta_i) = (b \cdot S^{\frac{d}{d-2}})^{\frac{-2(i-1)}{d}}\right)$$
+
+The fundamental difference is that NTK-aware multiplies the base by a constant related to the expansion ratio $S$: $S^{\frac{d}{d-2}}$. While it performs better than PI on non-fine-tuned models, its main drawback is that it slightly pushes some dimensions out of bounds (it is not a pure interpolation scheme). Therefore, for a target context expansion, the scale value $S$ must practically be set higher than the expected theoretical scale.
+
+For autoregressive generation where the sequence length grows step-by-step from $1$ to the maximum context size, using a fixed scale factor $S$ causes degraded performance on shorter sequences. Qwen solves this by using Dynamic NTK-aware interpolation. Instead of a fixed $S = L'/L$ (where $L'$ is the target maximum length and $L$ is the trained length), the model dynamically updates the scaling factor at every forward pass:
+
+$$S = \max(1, l'/L)$$
+
+where $l'$ is the current sequence length.
+
+Based on entropy invariance and reasonable assumptions, a new scaling factor is applied to create a Scaled Dot-Product Attention:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{\kappa \log n}{d} Q K^\top\right) V$$
+
+Here, $\kappa$ is a hyperparameter independent of $n$ and $d$. According to the text, LogN-Scaling rescales the dot product of $Q$ and $V$ based on the ratio of the context length to the training length, ensuring the entropy of the attention values remains perfectly stable as the context grows.
+
+To prevent the model from attending to overly distant tokens, Qwen restricts attention within specific context windows. The Qwen team observed that lower layers in the network are much more sensitive to context length expansion than higher layers. To handle this, they applied Hierarchical Window Self-Attention, assigning shorter windows to lower layers and longer windows to higher layers.
+
+Qwen-1's post-training process is designed to align the pre-trained model with natural human behavior and safety standards. It achieves this through a structured pipeline of Supervised Fine-Tuning (SFT) and Reinforcement Learning from Human Feedback (RLHF), specifically focusing on building a robust Reward Model. To teach the model how to have natural conversations, the team meticulously curated the SFT dataset using five key strategies:
+
+- ChatML Format: They adopted the ChatML format, using special tokens (like <|im_start|>system, <|im_start|>user, and <|im_start|>assistant) to clearly distinguish between system instructions, user inputs, and assistant outputs.
+
+- Conversational Style: They prioritized flowing, multi-turn conversational data over simple Q&A formats to teach the model real human-machine interaction.
+
+- Task Diversity: The data spans a wide variety of natural language generation tasks to maximize the model's overall utility.
+
+- Removing Formatted Data: They specifically excluded heavily formatted template data from the prompts. Rigid formatting can restrict the model's ability to generalize to broader, unexpected scenarios.
+
+- Safety First: Data involving violence, bias, and pornography was heavily annotated and filtered to prioritize safety.
+
+The actual fine-tuning process was tightly controlled to prevent overfitting and ensure the model only learned what it was supposed to. The objective remained "Next Token Prediction." Crucially, they applied a loss mask to the system and user inputs. This means the loss function ignored the prompts and only calculated loss on the actual responses generated by the Qwen assistant. The AdamW optimizer uses $\beta_1 = 0.9$, $\beta_2 = 0.95$, and $\epsilon = 1\text{e-}8$. Sequence length was capped at 2048, with a batch size of 128. To prevent overfitting, the SFT used a weight decay of 0.1, a dropout rate of 0.1, and a gradient clipping limit of 1.0. The model trained for 4000 steps. For the first 1430 steps, the learning rate gradually increased to a peak of $2\text{e-}6$, and then remained constant.
+
+To prepare for the RLHF phase, Qwen-1 trained a highly accurate Reward Model in two distinct steps: Preference Model Pretraining (PMP) followed by Fine-Tuning. They used a massive dataset consisting of pairs of samples. Each sample contained a single query paired with two different responses and the corresponding human preference. The Reward Model was built using a Qwen model of the same size, with a pooling layer added to the end. The final reward value was extracted by passing the special end-of-sentence token through this pooling layer.
+
+To perfect the Reward Model, the reward model training focused heavily on the quality and diversity of the prompts and responses. They created a massive taxonomy with approximately 6600 detailed tags to ensure the prompts covered a vast and complex array of topics, and used a balanced algorithm to select prompts that accounted for both diversity and complexity. To generate the responses for grading, they used Qwen models of different sizes and sampling strategies. This generated highly diverse responses, which lowered the difficulty for human annotators and ultimately improved the Reward Model's performance. This fine-tuning ran for 1 epoch with a constant learning rate of $3\text{e-}6$, a batch size of 64, and a max length of 2048.
+#### 2.4.4.2 Qwen1.5
+Launched in February 2024, the Qwen1.5 series introduced both Base and Chat models across 7 different parameter scales: 0.5B, 1.8B, 4B, 7B, 14B, 32B, and 72B. Additionally, it introduced the very first Mixture of Experts (MoE) model in the Qwen family: Qwen1.5-MoE-A2.7B. To maximize inference efficiency, the release heavily supported various quantization schemes, including Int4, Int8, AWQ, and GGUF.
+
+The alignment process for the Qwen1.5 series effectively utilized Direct Preference Optimization (DPO) and Proximal Policy Optimization (PPO). This focus resulted in Chat models that are much better aligned with human preferences and possess significantly enhanced multilingual processing capabilities. Furthermore, all model sizes in this release support a massive context length of 32768 tokens.
+
+The Qwen1.5-MoE-A2.7B model implements a highly optimized Mixture of Experts (MoE) architecture that deviates from standard MoE setups (like Mixtral's 8-expert, top-2 routing). Despite having only 2.7 billion activated parameters, its performance rivals state-of-the-art 7-billion parameter models such as Mistral 7B and standard Qwen1.5-7B. This architectural efficiency reduces training costs by 75% and increases inference speed by 1.74 times. To achieve this, Qwen redesigned the MoE structure using three key strategies. First, instead of simply duplicating standard Feed-Forward Networks (FFNs) to act as experts, Qwen utilized Finegrained Experts. This technique splits a single FFN into multiple smaller, independent segments. This generates far more experts without ballooning the total parameter count. In total, Qwen1.5-MoE utilizes 64 of these fine-grained experts to achieve optimal effectiveness and efficiency. Second, because training an MoE model entirely from scratch is highly inefficient and risks suboptimal performance, the team did not start from zero. They took an existing dense model, Qwen-1.8B, and structurally transformed it into Qwen1.5-MoE-A2.7B. During this process, they discovered that introducing randomness during the initialization phase can significantly accelerate convergence speed and yields better overall training performance. Third, Qwen adopted a hybrid routing system that separates experts into "Shared" and "Routed" categories. Out of the 64 total experts, 4 are configured as Shared Experts, which are always activated for every token. 60 are configured as Routing Experts, of which only 4 are dynamically activated per token.
+
+#### 2.4.4.3 Qwen2
+
+Qwen2 builds upon the Transformer architecture of its predecessor with several targeted upgrades to improve throughput, memory usage, and multilingual capacity. While Qwen1.5 only used GQA for its largest models (32B and 110B), Qwen2 implements GQA across all model sizes, completely replacing standard Multi-Head Attention (MHA). This optimizes KV Cache usage, significantly increasing inference throughput and lowering VRAM consumption. Because embedding parameters consume a disproportionately large amount of space in small models, Qwen2 uses a tie embedding strategy (sharing weights between the input and output layers) for its smaller iterations to maximize the ratio of functional, non-embedding parameters. The tokenizer retains the highly efficient BPE tokenizer from Qwen1.5, which boasts excellent compression ratios and natively supports around 30 languages. The shared vocabulary consists of exactly 151,643 regular tokens alongside 3 control tokens: <|endoftext|>, <|im_start|>, and <|im_end|>. Qwen 2 continues to use SwiGLU for activations, RoPE for positional encoding, QKV bias to enhance the attention mechanism's extrapolation ability, and RMSNorm coupled with Pre-Norm for training stability.
+
+Qwen2 was trained natively on 32K token contexts but maintains strong perplexity (PPL) performance even at 128K tokens. To achieve this massive context window safely, it introduces specific attention mechanisms:
+
+- DCA (Dual Chunk Attention): This mechanism dynamically splits extremely long sequences into manageable "length chunks" so the model can process them without exceeding hardware limits.
+
+- YARN: This technique readjusts attention weights to better handle sequences of varying lengths. By applying YARN, both the Qwen2-7B-Instruct and Qwen2-72B-Instruct models officially support up to a 128K token context window.
+
+The Qwen2 MoE architecture is highly reminiscent of the Qwen1.5-MoE-A2.7B but refines the implementation of its experts. The standard FFN is replaced by $n$ individual FFNs (experts). A gating network $G$ assigns probabilities to route tokens to specific experts $E_i$:
+
+$$p = \text{softmax}(G(x))$$
+
+$$y = \sum_{i \in \text{top}_k(p)} E_i(x)$$
+
+The MoE system relies on three defining characteristics:
+
+- Fine-Grained Experts: Instead of directly copying a massive dense FFN to act as a single expert, Qwen2 splits them into fine-grained experts. It creates smaller-scale experts but activates more of them per token. Even with the exact same total parameter count, this finer granularity provides a much richer, more diverse combination of expert activations, boosting adaptability.
+
+- Expert Routing: It integrates both Shared Experts and Specific Routing Experts. Shared experts act as generalists and are applied across all tasks, while routing experts are specialists selectively activated for specific scenarios, creating a highly efficient computational balance.
+
+- Expert Initialization: To prevent inefficiencies when initializing the MoE from a dense model, Qwen2 uses a specialized replication and shuffling technique. Given a target expert intermediate dimension $h_E$, expert count $n$, and the original dense FFN dimension $h_{FFN}$, the original FFN is duplicated $\lceil n \times h_E / h_{FFN} \rceil$ times. To prevent the experts from just being identical clones, the parameters are shuffled along the intermediate dimension. Finally, 50% of the parameters for each fine-grained expert are randomly re-initialized. This introduction of pure randomness significantly enhances the model's exploratory capabilities during the MoE training phase.
+
+Qwen2 developed a massive, high-quality multilingual dataset that significantly improved upon the data used for Qwen and Qwen1.5 in scale, quality, and diversity. They improved their filtering algorithms using both additional heuristics and model-based methods (e.g., using Qwen itself to filter out low-quality data). They also used models to synthesize high-quality pre-training data. They collected a much larger volume of high-quality code, math, and multilingual data. The new dataset supports approximately 30 languages, including English, Chinese, French, German, etc. To mimic how humans learn, they ran experiments on small models to optimize the mixture of data from different sources and domains.
+
+Through these enhancements, the pre-training data was expanded from Qwen1.5's 3 trillion tokens to 7 trillion tokens. Qwen2 team experimented with relaxing the quality threshold to create a 12 trillion token dataset, but training on this did not show better results than the 7 trillion token dataset. All Qwen2 Dense models (except one) were trained on the >7 trillion token dataset. The exception is Qwen2-0.5B, which was actually trained on the 12 trillion token dataset. Based on an "upgrade and reuse" principle, the MoE models received an additional 4.5 trillion tokens of pre-training. High-quality multi-task instruction data was seamlessly integrated directly into the pre-training process to enhance the model's in-context learning and instruction-following abilities.
+
+To give Qwen2 exceptional long-text capabilities, they made critical adjustments during the final stages of pre-training. In the final phase, they increased the training context length from 4,096 tokens to 32,768 tokens. This was supplemented by introducing a large amount of high-quality long-text data into the training mix. To optimize performance for these long-context scenarios, Qwen2 adjusted the RoPE base frequency from 10,000 to 1,000,000. 
+
+Qwen2’s post-training process completely moves away from relying heavily on massive human supervision. Instead, it focuses on scalable alignment with minimal human annotation, utilizing a mix of automated synthesis and targeted human feedback. The post-training pipeline relies on two main datasets: an Instruction-Answer dataset $D = \{(x_i, y_i)\}$ used for Supervised Fine-Tuning (SFT), and a Preference dataset $P = \{(x_i, y_i^+, y_i^-)\}$ (where $y_i^+$ is better than $y_i^-$) used for RLHF.
+
+To build high-quality SFT and RLHF datasets with minimal manual labor, Qwen2 used a two-pronged approach.
+
+1. Collaborative Data Annotation. It used the InsTag tool to automatically extract underlying intents from massive instruction datasets, and then filtered these instructions based on tag diversity, semantic richness, complexity, and intent completeness to get a highly representative set. It used self-evolution strategies to prompt Qwen to add strict constraints and new requirements to existing instructions, deliberately increasing their complexity. For the selected prompts, different Qwen models (using various generation strategies) generated multiple responses. Human annotators then ranked these responses based on preference to create both the demonstration data ($D$) and preference data ($P$).
+
+2. Automated Data Synthesis. For math problems with absolute answers, the LLM generated multiple reasoning paths. Correct, logical paths were kept as SFT demonstration data, while the contrast between correct and incorrect paths formed the RLHF preference data. For coding tasks, the LLM generated code solutions and test cases. These were actively compiled and executed to verify correctness. This compiler feedback was used to create preference data. They even used LLMs as Python validation functions to check if responses met specific length or formatting constraints. For Literature/Writing, because specialized human writers are expensive, Qwen2 scraped high-quality public domain literature. They used large models to reverse-engineer "instructions" of varying detail for these texts, using the original masterpieces as the perfect "answer." For role-playing, they extracted character wikis and prompted models to generate strictly in-character dialogues.
+
+With the data prepared, Qwen2 underwent a highly structured SFT phase. A massive dataset of over 500,000 broad instruction examples covering coding, math, role-play, multilingual capabilities, and safety. The model was trained for 2 rounds (epochs) using a massive sequence length of 32,768. The learning rate gradually decayed from 7e-6 to 7e-7. They applied a weight decay of 0.1 and capped gradient clipping at a maximum of 1.0.
+
+The final RLHF phase was divided into two sequential stages. In the offline training stage, the model used the pre-compiled preference dataset $P$ and applied DPO (Direct Preference Optimization) to maximize the mathematical difference between the good responses ($y_i^+$) and the bad responses ($y_i^-$). In the online stage, the model utilized a Reward Model to get real-time feedback. The current policy model would generate multiple responses, and the Reward Model would instantly select the absolute best and worst ones to form dynamic, real-time DPO preference pairs for continuous iteration. Finally, to prevent the model from losing its general capabilities while aligning to these specific preferences (often called the "alignment tax"), Qwen2 utilized a specialized Online Merging Optimizer.
+
+The Qwen2 series includes five distinct sizes for both its pre-trained and instruction-tuned models. Different sizes cater to different hardware limits. The smaller models are designed for resource-constrained environments like mobile devices, whereas the large models are reserved for handling highly complex tasks.
+#### 2.4.4.4 Qwen2.5
+Qwen2.5 serves as a foundational architecture that played a crucial role in training several domain-specific models, including Qwen2.5-Math, Qwen2.5-Coder, QwQ, and the multimodal model Qwen2.5-VL. Compared to the previous Qwen2 generation, Qwen2.5 introduces three new parameter sizes: 3B, 14B, and 32B. Additionally, variants like Qwen2.5-Turbo and Qwen2.5-Plus were introduced to offer a highly optimized balance between accuracy, latency, and cost. 
+
+The Dense models retain the standard Transformer Decoder architecture and continue to utilize the highly effective components from previous generations, including GQA (Grouped Query Attention) for highly efficient KV cache usage, SwiGLU activation functions, RoPE for positional encoding, QKV bias integrated into the attention mechanism, and RMSNorm for layer normalization.
+
+Building upon the base Dense architecture, Qwen2.5 scales up by replacing standard FFN layers with MoE layers. Similar to Qwen1.5-MoE, it implements fine-grained expert division utilizing the DeepSeekMoE framework. It handles the routing of shared experts using DeepSpeed-MoE. This combination provides a substantial performance boost on downstream tasks.
+
+The model continues to use the BBPE tokenizer with a vocabulary size of 151,643. The most significant change here is that the number of control tokens jumped from just 3 in previous versions to 22. This includes the addition of 2 brand new tokens specifically designed for tool-calling operations.
+
+The pre-training data was significantly upgraded from the previous generation to reach a massive 18T (18 Trillion) tokens. This was achieved through a combination of complex filtering and scoring mechanisms alongside advanced data mixing strategies. The team used Qwen2-Instruct as a filter to comprehensively evaluate and score data across multiple dimensions. Because Qwen2 was trained on a larger multilingual corpus, it proved to be a vastly superior filter compared to older models, efficiently retaining high-quality data and discarding low-quality cross-lingual data. They then explicitly integrated the specialized training data from Qwen2.5-Math and Qwen2.5-Coder, and employed Qwen2-72B-Instruct and Qwen2-Math-72B-Instruct to generate high-quality synthetic data. This data was then strictly filtered using proprietary general RM (Reward Models) and the specialized Qwen2-Math-RM-72B. Qwen2-Instruct was used to categorize and balance data domains. Analysis revealed that domains like e-commerce, social media, and entertainment were overrepresented (often containing repetitive, template-based, or machine-generated junk). Meanwhile, high-quality domains like tech and academic research were underrepresented. They fixed this by down-sampling the low-quality domains and up-sampling the high-quality ones to create an optimal data mix.
+
+Instead of guessing hyperparameters, the team relied heavily on empirical scaling law research to effectively train models of various sizes. They analyzed how the optimal learning rate $\mu_{\text{opt}}$ and optimal batch size $B_{\text{opt}}$ change dynamically in response to two variables: the model scale $N$ and the pre-training data scale $D$. To find these formulas, they conducted massive systemic experiments ranging from 44M to 14B parameters for Dense models, and 44M to 1B for MoE (Mixture of Experts) models. These test models were trained on datasets ranging from 0.8B to 600B tokens. Using these optimal hyperparameter predictions, they successfully modeled the final loss as a mathematical function of model architecture and training data scale. Crucially, they used these scaling laws to predict and compare the performance between MoE models and Dense models. This guided the hyperparameter configuration for the MoE models, allowing them to adjust the ratio of activated parameters vs. total parameters to achieve performance parity with specific Dense variants.
+
+To dramatically enhance the model's ability to handle long documents, Qwen2.5 implemented specialized training phases. Most models initially trained on a standard 4,096 context length. In the final pre-training stage, this was expanded to a 32,768 context length. Concurrently, they used ABF technology to boost the base frequency of the RoPE (Rotary Positional Encoding) from 10,000 to 1,000,000. To push boundaries even further, Qwen2.5-Turbo underwent a unique 4-stage progressive context expansion strategy: starting at 32,768, then jumping to 65,536, 131,072, and finally 262,144 tokens (with RoPE base frequency kept at 1,000,000). At each stage, the training data mixture was carefully controlled so that 40% of the sequences met the maximum length of that stage, while 60% were shorter sequences. During inference, the models employ YARN and DCA mechanisms to further enhance long-sequence handling. Through these innovations, Qwen achieved a 4x increase in context capacity at inference time: standard models can effectively process 131,072 tokens, while the Qwen2.5-Turbo model can handle an astonishing 1M tokens.
+
+Qwen2.5 significantly expanded its post-training pipeline, utilizing millions of high-quality samples and a sophisticated two-stage Reinforcement Learning approach. The SFT phase utilized over 1 million high-quality samples. The training was conducted with a context length of 32,768, running for 2 epochs. To prevent overfitting, the learning rate decayed from 7e-6 to 7e-7, with a weight decay of 0.1 and a gradient clip of 1.0.
+
+The SFT data sequence reached up to 8,192 tokens for standard models. It used back-translation on pre-training data to synthesize long-text queries, strictly filtering out low-quality matches. It integrated Qwen2.5-Math Chain-of-Thought (CoT) data using rejection sampling with reward modeling to generate highly accurate, step-by-step reasoning paths. It also integrated Qwen2.5-Coder data covering 40+ languages using multi-language sandboxes for static code checking and execution feedback (unit tests) to ensure correctness. The SFT data implemented strict code-based verification. LLMs generated instructions and corresponding verification code/unit tests to cross-validate responses. It also added 70,000 new queries handling tables, JSON/HTML, and fact-checking, forcing the model to generate reasoning chains to extract information from complex formats. The logic reasoning covered deductive, inductive, analogical, causal, and statistical reasoning, systematically filtering out flawed reasoning paths. For translation tasks, it translated high-resource language instructions into low-resource languages, strictly evaluating semantic alignment between the two to maintain structure and style. The SFT data had hundreds of generic system prompts, proving that training with diverse system prompts makes the model highly robust and reduces variance. In reply filtering, it employed critic models and multi-agent cooperative scoring. Only responses deemed completely flawless across all scoring systems were kept.
+
+Instead of relying solely on standard Reward Models (RMs), Qwen2.5 first used Offline RL to handle objective domains (like Math, Code, Logic) where RM evaluation is notoriously difficult. They reused the execution feedback and answer-matching pipeline from the SFT stage to evaluate a new set of queries. Responses that passed the quality check became positive examples, and those that failed became negative examples. This generated 150,000 highly reliable pairs. The model was trained using an Online Merging Optimizer for 1 epoch at a learning rate of 7e-7. For the final alignment phase, Qwen2.5 used Online RL powered by the GRPO algorithm, relying on a meticulously trained Reward Model (RM) to provide nuanced feedback. The RM was trained to evaluate 6 strict criteria: Truthfulness, Helpfulness, Conciseness, Relevance, Harmlessness, and Debiasing. To train the RM, they sampled responses from various Qwen models across different training stages (SFT, DPO, RL) using different temperatures. They also merged the DPO training data directly into the RM dataset. During RL, the model generated 8 different responses for every prompt. The training order was highly strategic: prompts where the RM detected a large variance in scores among the 8 responses were prioritized and trained first.
+
+To extend Qwen2.5-Turbo's context length to 1M tokens while maintaining human alignment, the team used a specialized post-training branch.
+
+- Two-Stage SFT: Stage 1 used short instructions (max 32,768 tokens). Stage 2 mixed those short instructions with ultra-long instructions (up to 262,144 tokens).
+
+- Short-Only RL: Surprisingly, the RL phase for the Turbo model only used short instructions. The researchers did this because RL training on long contexts is prohibitively expensive, and there is a lack of Reward Models capable of accurately evaluating massive long-context tasks. Experiments showed that performing RL exclusively on short instructions still significantly enhanced the model's human-preference alignment on long-context tasks.
+#### 2.4.4.5 Qwen3
+The Qwen3 architecture introduces targeted refinements aimed at improving training stability and scaling efficiency across its Dense and Mixture of Experts (MoE) model lineups.
+
+The Qwen3 Dense series consists of 6 models ranging from 0.6B to 32B parameters. It retains foundational elements from Qwen2.5, including GQA (Grouped Query Attention), SwiGLU (a bias-free MLP structure), RoPE (Rotary Positional Embedding), and RMSNorm (Root Mean Square Normalization). Qwen3 entirely removes the biases from the attention linear projection layers. Unlike Qwen2 (which used bias=True for Q, K, and V projections), Qwen3 sets q_proj, k_proj, v_proj, and o_proj to use no bias by default to enhance training stability. In the attention module, Qwen3 introduces a dedicated Qwen3RMSNorm layer specifically for the Query and Key vectors. During the forward pass, after the linear transformation, the Query and Key vectors are individually normalized before the RoPE (rotary positional embedding) is applied.
+
+The Qwen3 MoE lineup features two massive models built on the same foundational attention improvements as the Dense models (including QK-Norm and bias removal). The flagship model is Qwen3-235B-A22B (235 billion total parameters, 22 billion activated), accompanied by the smaller Qwen3-30B-A3B. Both support a 128K context length. The MoE FFN module utilizes a Top-K gating strategy (nn.Linear with bias=False). It splits the network into 128 fine-grained experts, activating exactly 8 per token. Notably, Qwen3 explicitly removes the "Shared Expert" mechanism utilized in Qwen2.5-MoE, relying purely on the dynamic routing of the specialized expert network. MoE layers are not applied to every single transformer block. A stepping logic dictates whether a layer uses a standard Qwen3MoeMLP block or a sparse Qwen3MoeSparseMoeBlock based on the layer index and the configured interval step. To better handle varying sequence lengths during inference, the RoPE implementation introduces a dynamic frequency update mechanism. It dynamically expands or resets frequency bounds based on whether the current sequence length exceeds the cached maximum or falls below the original threshold. Qwen2-MoE lacked this dynamic adjustment logic.
+
+To promote expert specialization and prevent routing collapse (where the gate only sends tokens to a few dominant experts), Qwen3-MoE introduces a global batch load-balancing auxiliary loss, added to the main loss during the forward pass. Following a design similar to the Switch Transformer, the auxiliary loss for $N$ experts over a batch $B$ with $T$ tokens is defined as:
+
+$$\text{loss} = \alpha \cdot N \cdot \sum_{i=1}^N f_i \cdot P_i$$
+
+Where $f_i$ is the actual fraction of tokens assigned to expert $i$:
+
+$$f_i = \frac{1}{T} \sum_{x \in B} \mathbf{1}\{\text{argmax } p(x) = i\}$$
+
+And $P_i$ is the proportion of the routing probability mathematically allocated to expert $i$:
+
+$$P_i = \frac{1}{T} \sum_{x \in B} p_i(x)$$
+
+The loss is multiplied by the number of experts ($N$) to maintain scale consistency. Because a perfectly uniform routing distribution minimizes this loss, calculating $\sum(f_i \cdot P_i)$ uniformly would yield $\sum(\frac{1}{N} \cdot \frac{1}{N}) = \frac{1}{N}$. Multiplying by $N$ normalizes the target minimum back to $1$.
+
+The Qwen3 series used BBPE tokenizer.
+
+Qwen3 doubled the training data of its predecessor, training on a colossal 36T tokens covering 119 languages and dialects (a massive jump from Qwen2.5's 29 languages). To achieve this, the team implemented several advanced data augmentation and processing techniques:
+
+- PDF Text Extraction: They used the multimodal Qwen2.5-VL model to recognize text from PDF documents and optimize its quality, successfully harvesting over 1 trillion high-quality tokens from this single pipeline.
+
+- Specialized Synthetic Data: They used domain-expert models (Qwen2.5-Math and Qwen2.5-Coder) to collaboratively synthesize structural data, such as textbooks, Q&A pairs, and code snippets, generating T-level tokens of synthetic data.
+
+- Multilingual Optimization System: Breaking away from traditional domain-level balancing, they introduced 3 trillion tokens of multi-dimensional annotations (tagging for educational value, domain, and safety). This allowed for highly granular, instance-level data mixing optimization.
+
+- Processing Tech: The data pipeline utilized a novel two-step document processing flow (OCR recognition + quality enhancement) alongside fine-grained data combination strategies validated through ablation studies.
+
+Instead of a single continuous run, all Qwen3 models underwent a strict three-stage pre-training process, guided by scaling laws to predict the optimal learning rate and batch size for each phase:
+
+1. General Stage (S1). The model is trained on >30T tokens using a standard 4,096 sequence length. This phase establishes the foundation, completing the model's basic language comprehension and general world knowledge across all 119 languages.
+
+2. Reasoning Stage (S2). The model is trained on roughly 5T high-quality tokens using a 4,096 sequence length, accompanied by an accelerated learning rate decay strategy. To hyper-charge logical capabilities, this stage massively increased the proportion of knowledge-intensive tokens, specifically focusing on STEM, coding, reasoning tasks, and synthetic data.
+
+3. Long Context Stage (S3). The model is trained on <1T tokens (tens of billions) with the sequence length expanded to 32,768. The training corpus was strictly curated based on length: 75% of the text was between 16,384 to 32,768 tokens, while the remaining 25% was between 4,096 to 16,384 tokens. This stage used ABF technology to push the RoPE base frequency from 10,000 up to 1,000,000. It integrated YARN and Dual Chunk Attention (DCA) during training. These additions natively support a 4x sequence length extrapolation during inference.
+
+The combination of better data and refined architecture led to massive parameter efficiency gains across the Qwen3 lineup. The smaller Qwen3 Dense models consistently match the performance of the larger, previous-generation Qwen2.5 models (e.g., Qwen3 1.7B/4B/8B/14B/32B-Base match the capabilities of Qwen2.5 3B/7B/14B/32B/72B-Base), excelling particularly in STEM, coding, and reasoning. The Qwen3 MoE architecture only requires 1/5 of the activated parameters to match the performance of a dense model trained on the same data. Furthermore, it achieves parity with Qwen2.5 Dense models while using only 1/10 of the activated parameters, drastically lowering training and inference costs. The heavy-weight Qwen3-235B-A22B MoE model outperforms prominent open-source competitors like DeepSeekV3 and Llama-4-Maverick across most tasks, despite having significantly fewer total and activated parameters.
+
+Qwen3’s post-training strategy marks a significant evolution, split into two distinct pipelines depending on the model's size. The core philosophy revolves around two primary objectives:
+
+- Thinking Control: Providing users with a dual-mode system ("think" vs. "no think") that allows flexible control over whether the model reasons deeply or responds instantly.
+
+- Strong-to-Weak Distillation: Using the massive "Frontier" models to teach the smaller "Lightweight" models, saving roughly 90% of GPU compute time (requiring only 1/10 of the resources of the full 4-stage training) while drastically boosting performance (like Pass@1 and Pass@64 scores).
+
+The flagship models (Qwen3-235B-A22B and Qwen3-32B) undergo a rigorous 4-stage training process:
+
+1. Long-CoT Cold Start. This stage builds the foundational reasoning patterns using a highly curated, minimal dataset covering Math, Code, Logic, and STEM. Query filtering uses Qwen2.5-72B-Instruct to evaluate and remove queries that are too easy, unsolvable, or don't require Chain-of-Thought (CoT). It also ensures domain balance. Response filtering uses QwQ-32B to generate N candidate responses. Human annotators intervene if the model fails continuously. The system applies strict Pass@N filtering (requiring at least 1 correct answer) to remove six types of low-quality responses (e.g., wrong answers, repetitions, guesses). This stage used a small amount of data prevents over-optimizing too early, leaving room for the subsequent RL stages.
+
+2. Reasoning RL. This phase uses Reinforcement Learning to aggressively enhance reasoning depth using exactly 3,995 carefully selected query-verifier pairs. Queries must be independent (not from Stage 1), learnable, highly challenging, and cover broad sub-domains. This phase using GRPO alone boosted the Qwen3-235B-A22B model's score on the AIME'24 benchmark from 70.1 to 85.1 in just 170 steps.
+
+3. Thinking Mode Fusion. This stage integrates the "Non-Thinking" capabilities into the highly trained reasoning model to lower deployment costs and allow for user control. It blends "Thinking" data (generated via rejection sampling from Stage 2) with "Non-Thinking" data (coding, math, creative writing, roleplay). The template design introduces dynamic switching using /think and /no_think tags. When enable_thinking is set to False, the model appends empty thinking blocks to bypass the reasoning phase. If the model reaches a user-defined token limit while thinking, it is trained to gracefully truncate using this exact manual stop token: "Considering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>.\n\n".
+<p align="center">
+<img width="512" height="200" alt="80563a3a-6e4c-437b-af76-b71f046dbf48" src="https://github.com/user-attachments/assets/7d107cb4-9aeb-419b-b712-69f657aca100" />
+</p>
+4. General RL. The final stage polishes the model across 20+ general tasks, focusing on instruction following, format compliance, preference alignment, and Agent capabilities (with native MCP support). It employs a complex, triple-layered reward system. The Rule-based Rewards are strict evaluations for formatting and instructions to prevent reward hacking. Reference-based Rewards uses Qwen2.5-72B-Instruct to score responses against a provided reference answer. Reference-free Rewards uses a reward model trained on human preference data to score outputs dynamically when no "correct" answer exists.
+
+Lightweight Base Models leverages Strong-to-Weak Distillation instead of putting them (like Qwen3-0.6B to 14B, and the MoE 30B-A3B) through the expensive 4-stage RL pipeline. 
+
+1. Off-policy Distillation. The student model learns by imitating a mixed dataset of outputs generated by the teacher models (using both /think and /no_think modes). This establishes a baseline for reasoning and switching modes without active exploration.
+
+2. On-policy Distillation. The student model actively generates its own sequences based on prompts. Its output logits are then directly aligned with the Teacher models (Qwen3-32B or Qwen3-235B-A22B) by minimizing the KL divergence. This fine-grained control transfers complex reasoning logic far more effectively than standard fine-tuning.
+
+
+#### 2.4.4.6 Qwen3 Next
+The Qwen3-Next series introduces a radical architectural shift away from pure Transformer models, leaning heavily into hybrid attention and extreme sparsity. It features two primary 80-billion parameter models (with only 3 billion activated parameters per token) Qwen/Qwen3-Next-80B-A3B-Instruct and Qwen/Qwen3-Next-80B-A3B-Thinking.
+
+Qwen3-Next implements five major structural changes to achieve high efficiency and a massive 256K context window.
+
+- Hybrid Attention Mechanism (3:1 Ratio). The standard attention mechanism is completely replaced by a hybrid setup using a 3:1 blending strategy: 75% of the layers utilize Gated DeltaNet, while 25% retain Gated Attention. Inspired by MiniMax-01's Linear Attention, Gated Attention introduces a gating unit by splitting the standard query projection (q_proj) into two parts: a q projection and a gated projection. Gated DeltaNet completely swaps out the traditional $O(T^2)$ Softmax Attention for an $O(T \cdot d)$ recursive form. It uses gating and a learnable exponential decay to write historical information into a recurring state, which is then read by queries. For each value-head at time $t$, the core recursion is:
+
+$$s_t = \lambda_t \odot s_{t-1} + \beta_t \odot (\Phi(k_t) \otimes v_t)$$
+
+$$y_t = \Phi(q_t) \cdot s_t$$
+
+Where the forget factor $0 < \lambda_t < 1$ is defined by $\lambda_t = e^{g_t}$ with $g_t \le 0$; the input gate is $\beta_t \in (0,1)$; and $\Phi(\cdot)$ acts as the feature mapping/normalization for $q$ and $k$. To further boost length extrapolation, Rotary Positional Encoding (RoPE) is only applied to the first 25% of the position dimensions of the attention heads.
+
+- High-Sparsity Mixture-of-Experts (MoE). Qwen3-Next takes MoE granularity to the extreme. Compared to Qwen3's setup (128 total experts, 8 active, 0 shared), Qwen3-Next utilizes 512 total experts, activates 10 routing experts per token, and utilizes 1 shared expert. This drastically lowers the FLOPs per token while maintaining a massive model capacity.
+
+- Zero-Centered LayerNorm. To enhance training stability, it introduces Zero-Centered RMSNorm. In the code, the weight parameters are initialized to zero (self.weight = nn.Parameter(torch.zeros(dim))). This ensures that at initialization, the layer acts purely as an identity mapping (scale=1), preventing the instability that normally occurs when standard RMSNorm doesn't subtract the mean.
+
+- Multi-Token Prediction (MTP). During a single forward pass, the model simultaneously predicts the next $k$ tokens rather than just the immediate next token. This boosts training performance and accelerates inference (though it is noted this feature is currently unsupported in standard Hugging Face Transformers).
+
+<p align="center">
+<img width="669" height="710" alt="1597852f-98fa-42fe-99f2-9650b4ce3264" src="https://github.com/user-attachments/assets/73c6701f-7bee-4569-b1da-7f3dd12f192d" />
+
+</p>
+
+Instead of using the full 36T token corpus of Qwen3, Qwen3-Next was trained on a uniformly sampled subset containing only 15T tokens in the pre-training stage. The model utilized GSPO for its Reinforcement Learning phase (though the exact data sources for this phase remain undisclosed).
+
+Despite the extreme sparsity (activating only ~3B out of 80B parameters), Qwen3-Next demonstrates exceptional efficiency.
+
+#### 2.4.4.7 GTE-Qwen3
+
+GTE-Qwen series successfully transforms a generative language model into a powerful embedding representation model. The GTE-Qwen series is created by fine-tuning the Qwen LLM Base models using the same training data and strategies from the original pre-training phase. The series primarily consists of two versions: gte-Qwen1.5 and gte-Qwen2. 
+
+To successfully shift the model from an NLG (Natural Language Generation) task to an NLU (Natural Language Understanding) task for embeddings, Qwen implements three core mechanisms:
+
+1. Bidirectional Attention Integration. Instead of the standard causal (unidirectional) masking used in generative models, GTE-Qwen modifies the architecture to use bidirectional attention. By using a standard padding mask during inference, the model can look both forward and backward, significantly enriching its contextual understanding of the text.
+
+2. Instruction Tuning. The model undergoes an additional phase of Instruction tuning. The specific goal of this step is to unlock the deep capabilities the model acquired during pre-training and adapt them specifically for embedding and representation tasks.
+
+3. Improved Contrastive Learning (GTE Framework). GTE-Qwen relies on a dual-tower contrastive learning architecture but significantly improves upon the traditional InfoNCE loss function. For a batch of positive text pairs $B = \{(q_1, d_1), (q_2, d_2), \cdots, (q_n, d_n)\}$, it uses the following improved contrastive loss ($L_{icl}$):
+
+$$L_{icl} = - \frac{1}{n} \sum_{i=1}^n \log \frac{e^{s(q_i, d_i)/\tau}}{Z}$$
+
+Where the denominator $Z$ is calculated as:
+
+$$Z = \sum_j e^{s(q_i, d_j)/\tau} + \sum_{j \neq i} e^{s(q_i, q_j)/\tau} + \sum_j e^{s(q_j, d_i)/\tau} + \sum_{j \neq i} e^{s(d_i, d_j)/\tau}$$
+
+- Temperature ($\tau$): Fixed strictly at 0.01.
+- The Logic: The first two terms in the denominator handle the forward query contrast (comparing the query to documents and to other queries). The last two terms handle the reverse contrast (comparing the document back to queries and to other documents).
+
+The model uses a specific selection logic to represent the entire sequence based on padding. It first checks if the sequence uses left padding. If it uses left padding, it selects the last token on the right (the real token). Otherwise, it selects the token at the sequence_len - 1 position. The final embedding representation is always the embedding of the last token of the real sequence.
+
+#### 2.4.4.8 Qwen3 Embedding & Reranker
+The Embedding model is designed to generate highly accurate semantic vector representations of text, utilizing an upgraded contrastive learning framework. It uses a dual-tower design where queries and documents are processed separately. It accepts a single segment of text (e.g., {Instruction} + {Query} or {Doc}) as input. To represent the entire semantic meaning of this text, it extracts the hidden state vector corresponding to the final [EOS] (End of Sequence) token at the very last layer.
+
+Building on the GTE-Qwen framework, Qwen3 Embedding improves upon the traditional InfoNCE loss. For a batch of positive text pairs $B = \{(q_1, d_1), (q_2, d_2), \cdots, (q_n, d_n)\}$, it uses the following loss function:
+
+$$L_{icl} = - \frac{1}{n} \sum_{i=1}^n \log \frac{e^{s(q_i, d_i)/\tau}}{Z}$$
+
+Where the denominator $Z$ is expanded to account for both forward and reverse comparisons:
+
+$$Z = \sum_j e^{s(q_i, d_j)/\tau} + \sum_{j \neq i} e^{s(q_i, q_j)/\tau} + \sum_j e^{s(q_j, d_i)/\tau} + \sum_{j \neq i} e^{s(d_i, d_j)/\tau}$$
+
+The temperature parameter $\tau$ is strictly fixed at 0.01.
+<p align="center">
+<img width="300" height="167" alt="d81cc617-646d-4296-b266-c33f3c713db5" src="https://github.com/user-attachments/assets/6a792139-3568-446b-b988-2ab986fd98db" />
+</p>
+
+The embedding model is trained via a 3-stage process.
+
+1. Contrastive learning training utilizing ultra-large-scale weakly supervised data.
+
+2. Supervised Fine-Tuning (SFT) based on high-quality labeled synthetic data.
+
+3. A Model Merging strategy that fuses multiple candidate checkpoints from Stage 2 to significantly boost overall performance.
+<p align="center">
+<img width="896" height="185" alt="50f81c8a-f1a4-4c61-914c-823d75e7800d" src="https://github.com/user-attachments/assets/9c387316-52a4-4479-93dc-fdda5ea48826" />
+</p>
+The Reranker model is used as a second-pass filter to highly accurately score the relevance between a query and a retrieved document. Unlike the embedding model, the reranker processes the texts together. It accepts text pairs simultaneously (e.g., {Instruction} {Query} {Doc} Assistant:) as a single input. Using an LM head, it directly calculates a relevance score (e.g., the probability of predicting "yes") through regression training. 
+
+<p align="center">
+<img width="305" height="163" alt="8c9aabd7-8472-4749-9dc9-152f66f71310" src="https://github.com/user-attachments/assets/6df3f1a9-bcbb-40d3-9d04-80383e471048" />
+</p>
+
+Unlike the embedding model's complex multi-stage pipeline, the Reranking model's training directly utilizes high-quality labeled data for supervised training.
+### 2.4.5 Gemini 
+
+By Gemini 2.x, Google has introduced a new generation of multimodal models that natively support text, images, audio, video, and codebases. They feature an ultra-long context window (>1M tokens) and native tool-calling capabilities to build complex Agent systems. The series is divided into four distinct models based on their positioning.
+
+- Gemini 2.5 Pro: The flagship model. It delivers SOTA (State-of-the-Art) reasoning and coding capabilities, supporting codebase-level understanding, interactive Web app development, and multimodal coding.
+- Gemini 2.5 Flash: A hybrid reasoning model featuring a controllable "Thinking Budget," designed to perfectly balance quality, cost, and latency.
+- Gemini 2.0 Flash: A non-thinking, high-cost-performance model built for daily, general-purpose tasks.
+- Gemini 2.0 Flash-Lite: The fastest and most cost-effective model, aimed at large-scale application deployments.
+
+The Gemini 2.5 models utilize a sparse Mixture-of-Experts (MoE) multimodal Transformer architecture. The 1M+ context window is capable of processing up to 1,000,000 tokens, which equates to an entire novel, a full codebase, or 3 hours of audio/video. The visual processing modules have been highly optimized, significantly boosting image and video understanding. For lightweight models like Flash, Google uses distillation training. To lower the storage cost of the teacher model's next-token prediction distribution, they employ a k-sparse distribution over the vocabulary. This balances high throughput with storage efficiency while maintaining output quality.
+
+The training data covers a massive scale of web documents, code, images, audio, and video. Compared to Gemini 1.5, the 2.5 series utilizes heavily improved data filtering and deduplication methods to boost data quality.
+
+Training these massive models required innovations at the hardware and algorithmic levels on Google's TPUv5p accelerator clusters. If hardware fails, the system automatically shrinks the TPU slice and continues training, cutting interruption time from over 10 minutes down to dozens of seconds. It maintains 97% throughput even after recovery. The system also rapidly detects intermittent Silent Data Corruption (SDC). Only 0.25% of training steps had to be replayed due to suspected SDC, effectively isolating hardware defects.
+
+Google significantly increased the compute allocated to RL to allow the model to deeply explore complex behaviors (like multi-step operations and tool usage). They innovated their reward mechanisms, utilizing both verifiable rewards and model-generated reward mechanisms to provide more precise feedback. These optimizations led to massive gains, with the LMArena ELO score increasing by over 120 points (Gemini 2.5 Pro reached 122 points, and 2.5 Flash reached 111 points).
+
+While early models (like Gemini 2.0) provided immediate, instant responses, Gemini 2.5 introduces a sophisticated "Thinking" phase powered by Reinforcement Learning. By allowing multiple forward reasoning passes before answering, accuracy is drastically improved. Empirical data shows a direct positive correlation between reasoning time and final performance. The model can autonomously decide how much time it needs to think based on the prompt's complexity. Users can manually set a "Thinking Budget", strictly controlling how many tokens the model is allowed to consume while "thinking" before it outputs the final answer, allowing
+
+The Gemini 2.5 series demonstrates absolute dominance, not just over its predecessor (Gemini 1.5), but against the SOTA models in the industry (including Claude 4, GPT-4o/4.1, and DeepSeek R1). Gemini 2.5 Flash is now so powerful that it easily beats the previous flagship Gemini 1.5 Pro across the board (e.g., scoring 72.0% on AIME compared to 1.5 Pro's 17.5%). Gemini 2.5 Pro beats Claude 4 Opus and DeepSeek R1 in math (AIME 2025) and SOTA coding benchmarks (SWE-bench, Aider). On the 1M token retrieval benchmark (LOFT), it scored 87.0%, and on MRCR-V2 (8-needle retrieval) it scored 58.0%, far exceeding Claude 4 and others. In ASR and AST public benchmarks, Gemini 2.5 Pro easily beats the GPT-4o series, scoring a WER of 6.66 on FLEURS and a BLEU of 38.48 on CoVoST2. 
