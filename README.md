@@ -109,7 +109,35 @@
  
 **2.4 Causal Decoder-Only**
 * **2.4.1 GPT**
+    * **2.4.1.1 GPT-1**
+    * **2.4.1.2 GPT-2**
+    * **2.4.1.3 GPT-3**
+    * **2.4.1.4 GPT-3.5**
+    * **2.4.1.5 GPT-4**
+    * **2.4.1.6 OpenAI o1**
+    * **2.4.1.7 GPT-OSS**
 * **2.4.2 LLaMA**
+    * **2.4.2.1 LLaMA-1**
+    * **2.4.2.2 LLaMA-2**
+    * **2.4.2.3 LLaMA-3**
+    * **2.4.2.4 Alpaca**
+    * **2.4.2.5 Code LLaMA**
 * **2.4.3 DeepSeek**
+    * **2.4.3.1 DeepSeek-V1**
+    * **2.4.3.2 DeepSeek-V2**
+    * **2.4.3.3 DeepSeek-V2.5**
+    * **2.4.3.4 DeepSeek-V3**
+    * **2.4.3.5 DeepSeek-V3.2-EXP**
+    * **2.4.3.6 DeepSeek-R1**
 * **2.4.4 Qwen**
+    * **2.4.4.1 Qwen1**
+    * **2.4.4.2 Qwen1.5**
+    * **2.4.4.3 Qwen2**
+    * **2.4.4.4 Qwen2.5**
+    * **2.4.4.5 Qwen3**
+    * **2.4.4.6 Qwen3 Next**
+    * **2.4.4.7 GTE-Qwen3**
+    * **2.4.4.8 Qwen3 Embedding & Reranker**
 * **2.4.5 Gemini**
+  
+### **3. Pretraining**
