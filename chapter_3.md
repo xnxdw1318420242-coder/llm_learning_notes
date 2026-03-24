@@ -159,6 +159,32 @@ Setting the correct ratio of different data sources is critical because it dicta
 3. Long-Context Ability. To expand the context window (modifying the RoPE positional encoding), the data sequence gradually introduces longer text. CodeLLaMA Context Expansion: 4K context window (using 2.5T tokens) $\rightarrow$ 16K context window (using 20B tokens).
 
 ## 3.2 Training Tasks 
+### 3.2.1 Goals
+Before diving into the math, it is essential to understand the different frameworks we use to train a Large Language Model. Modern training tasks are broadly categorized into three areas:
+
+1. Self-Supervised Learning. This is the foundational phase where the model learns directly from raw, unlabeled text. In the Masked Language Modeling (MLM) task, the system randomly masks (hides) certain words in a sentence, and the model must predict what was hidden. In the Autoregressive Language Modeling (ALM) task, the model predicts the sequence strictly from left to right, guessing the next word based on the previous words. In the Sequence-to-Sequence Modeling task, an encoder-decoder architecture that reads a full input sequence and generates a completely new output sequence. Highly suitable for generation tasks like translation.
+
+2. Contrastive Learning. This technique forces the model to understand the nuances of similarity and difference. SimCSE constructs "positive" sample pairs using dropout techniques. The training objective is to maximize the mathematical similarity between positive samples while pushing negative samples apart. ELECTRA uses a two-part generator-discriminator setup. The generator replaces masked words with plausible alternatives, and the discriminator must guess whether a specific word is original or replaced.
+
+3. Knowledge Enhancement. These techniques explicitly inject deeper semantic understanding and real-world facts into the model. ERNIE enhances semantic understanding by specifically introducing entity and phrase masking (rather than just random individual words). K-BERT directly embeds Knowledge Graphs into the model to massively boost its reasoning capabilities.
+
+For modern generative AI (like the GPT family), Autoregressive Language Modeling (ALM) is the dominant paradigm. The training objective is simple: based on the provided context (previous words), maximize the probability of correctly generating the next target token. Mathematically, the loss function is defined as:
+
+$$\mathcal{L}_{LM}(\theta) = \mathbb{E}_{x \in \mathcal{D}_{\text{pretrain}}} \left[ - \sum_{t=1}^{|x|} \log P_\theta(x_t \mid x_{<t}) \right]$$
+
+If we have a training sequence $w_1, w_2, \dots, w_n$, the probability of generating this exact sentence $P(w_1, w_2, \dots, w_n)$ can be decomposed using the standard conditional probability formula:
+
+$$P(w_1, w_2, \dots, w_n) = p(w_1)p(w_2 \mid w_1)p(w_3 \mid w_1, w_2) \dots p(w_n \mid w_1, w_2, \dots, w_{n-1})$$$$= \prod_{i=1}^n p(w_i \mid w_1, \dots, w_{i-1})$$
+
+This core conditional probability $p(w_i \mid w_1, \dots, w_{i-1})$ can be modeled using older N-gram models (like KenLM) or modern Transformer models (like GPT-4). 
+
+In LLM evaluations, people rarely cite raw cross-entropy; instead, they talk about Perplexity. Perplexity measures how "uncertain" or "blurry" a model is when generating a token. Higher perplexity = a worse, more confused model. Its mathematical definition is:
+
+$$\text{Perplexity}(LM) = \left( \prod_{i=1}^m \frac{1}{q(w_i \mid w_1, w_2, \dots, w_{i-1})} \right)^{\frac{1}{m}}$$
+
+Perplexity and Cross-Entropy are the exact same metric, just expressed differently.
+
+### 3.2.2 Long Context
 To achieve this long-context capability, the research is divided into two primary directions: Extending Positional Encoding and Adjusting the Context Window. 
 
 A model's ability to handle context is naturally limited by the length of the texts it saw during training. If it encounters text longer than that distribution, its performance degrades. The mainstream RoPE (Rotary Positional Embedding) method, without special modification, lacks good "extrapolation" capabilities. To fix this, researchers use techniques like position interpolation and position truncation to adjust the rotation angles of the sub-spaces so they don't exceed the original context window's limits. Some positional encodings naturally allow the model to build text beyond its original trained context window. Methods like T5 biases, ALiBi, and xPos exhibit varying degrees of this extrapolation ability. While extrapolation allows a model to fluently generate long text, its actual comprehension of that long text often falls short compared to short texts. To achieve true long-context comprehension, the model must undergo additional fine-tuning on longer texts.
@@ -171,4 +197,15 @@ Instead of just messing with the encoding, another highly effective strategy is 
 
 3. Token Selection. It aims to effectively approximate full attention by picking only the most important $k$ tokens. By token similarity, it splits tokens into "close" (inside the window) and "far" (outside the window). For the far tokens, it uses external storage to save their Key-Value pairs and uses a k-nearest neighbor search to fetch only the most relevant tokens needed for the current generation step. By chunk similarity, it divides the sequence into chunks of different lengths and extracts only the most relevant sub-chunks for attention calculation.
    
-## 3.3 Training Optimization
+## 3.3 Optimizer
+
+### 3.3.1 Naive SGD
+### 3.3.2 Momentum SGD
+### 3.3.3 NAG
+### 3.3.4 Pytorch SGD
+### 3.3.5 AdaGrad
+### 3.3.6 RMSProp
+### 3.3.7 Adam
+### 3.3.8 AdamW
+### 3.3.9 Muon
+### 3.3.10 AdaFactor
