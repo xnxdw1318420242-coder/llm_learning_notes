@@ -200,12 +200,102 @@ Instead of just messing with the encoding, another highly effective strategy is 
 ## 3.3 Optimizer
 
 ### 3.3.1 Naive SGD
+Stochastic Gradient Descent (SGD) is a core optimization algorithm used to train machine learning and deep learning models. Its primary job is to adjust the model's parameters (like weights and biases) to minimize the loss function—which is the measure of how far off the model's predictions are from the actual truth.
+
+Unlike standard Batch Gradient Descent, which calculates the error using the entire dataset before taking a single step, SGD updates the parameters using the gradient from just one randomly chosen data point (or a small "mini-batch") at a time.
+
+Because it only looks at a fraction of the data per step, SGD is incredibly fast and computationally efficient. This causes its path to the minimum to be "noisy" or erratic, but this exact noise actually helps the model bounce out of suboptimal local minima.
+
+The mathematical update rule for true SGD at a given time step $t$ is:
+
+$$\theta_{t+1} = \theta_t - \eta \cdot \nabla_\theta J(\theta_t; x^{(i)}, y^{(i)})$$
+
 ### 3.3.2 Momentum SGD
+
+Momentum SGD is an optimization technique designed to solve the "zig-zagging" or oscillation problem often found in standard Stochastic Gradient Descent. standard SGD can suffer from high variance updates. Because the gradient is calculated on small batches, it often fluctuates wildly, especially in narrow "valleys" where the surface is much steeper in one dimension than another. This leads to a zig-zag path that makes convergence painfully slow.
+
+The core idea of momentum is to let the optimizer have a "memory" of previous gradients. By accumulating a history of gradients, the components that fluctuate (like the vertical zig-zags) tend to cancel each other out over time, while the components that consistently point toward the minimum (the horizontal direction) reinforce each other.
+
+$$v_t = \mu v_{t-1} + g_t$$
+
+$$\theta_{t+1} = \theta_t - \gamma v_t$$
 ### 3.3.3 NAG
-### 3.3.4 Pytorch SGD
-### 3.3.5 AdaGrad
-### 3.3.6 RMSProp
-### 3.3.7 Adam
-### 3.3.8 AdamW
-### 3.3.9 Muon
-### 3.3.10 AdaFactor
+
+Nesterov’s Accelerated Gradient (NAG) is an advanced variation of Momentum SGD designed to improve stability and prevent the model from overshooting the optimal point. While standard Momentum helps speed up training, it has a significant drawback: Momentum accumulation. Because the optimizer builds up "velocity," it can keep moving too fast as it approaches the minimum, causing it to oscillate wildly around the optimum instead of settling into it. NAG solves this by introducing a "look-ahead" mechanism. Instead of calculating the gradient at the current position and then adding momentum, NAG calculates the gradient at the position where the model would be after the momentum step.
+
+The update rule for NAG is defined by the following two equations:
+
+$$v_t = \mu v_{t-1} + g(\theta_t - \mu v_{t-1})$$
+
+$$\theta_{t+1} = \theta_t - \gamma v_t$$
+
+$\theta_t - \mu v_{t-1}$ represents the "look-ahead" position. We essentially "jump" to where the momentum would take us.
+
+By using a more accurate gradient based on the "future" position, it reaches the optimum faster than standard Momentum. The "braking" effect prevents the optimizer from overshooting, making it much more reliable when it is close to the global minimum. It essentially gives the optimizer a sense of the terrain ahead, allowing it to "slow down" if the look-ahead gradient indicates a sharp turn or an uphill climb.
+
+### 3.3.4 AdaGrad
+
+AdaGrad (Adaptive Gradient) is an optimization algorithm that moves away from a single global learning rate. Instead, it dynamically adjusts the learning rate for every individual parameter based on its historical performance. Standard SGD uses a uniform learning rate for all parameters. However, AdaGrad is built on the philosophy that different parameters should use different learning rates. For parameters with large gradients (Those that oscillate or update frequently), AdaGrad aggressively decreases their learning rate to prevent overshooting. For parameters with small gradients (Those that update slowly), AdaGrad increases their relative learning rate to help them converge faster.
+
+The update rule for AdaGrad is defined by two main components. AdaGrad first tracks the accumulation of all historical squared gradients for each parameter:
+
+$$s_t = s_{t-1} + g_t^2$$
+
+The parameters are then updated using the accumulated history to scale the learning rate:
+
+$$\theta_{t+1} = \theta_t - \frac{\gamma}{\sqrt{s_t} + \epsilon} g_t$$
+
+The main advantage of this approach is that it allows the model to converge more quickly by automatically "braking" on high-frequency features and "accelerating" on rare or slow features.
+
+Learning Rate Schedulers like Cosine Annealing  and StepLR adjusts the global learning rate over time. AdaGrad takes this a step further by making those adjustments specific to each weight in the network.
+
+Cosine Annealing adjusts the learning rate according to the periodic characteristics of a cosine function. Instead of just going down, the learning rate decreases from a maximum value ($lr_{\text{max}}$) to a minimum value ($lr_{\text{min}}$) and then periodically increases back. This wave-like pattern repeats throughout training. By raising the learning rate occasionally, the model can "jump out" of suboptimal local minima. This allows the model to explore a broader parameter space more effectively.
+
+$$lr_t = lr_{\text{min}} + 0.5 \cdot (lr_{\text{max}} - lr_{\text{min}}) \cdot \left(1 + \cos\left(\frac{t}{T} \cdot \pi\right)\right)$$ 
+
+StepLR is a simpler, "staircase" approach where the learning rate stays constant for a set number of epochs and then drops abruptly. You define a step size and a decay factor (a number less than 1, like 0.1). Every time the model completes the defined number of epochs (the "step"), the current learning rate is multiplied by the decay factor. The method is very simple to implement and helps the model settle into a minimum as it gets closer to the end of training. However, as the change is very sudden, it can sometimes disrupt training stability compared to smoother schedulers.
+### 3.3.5 RMSProp
+
+RMSProp was proposed by Geoffrey Hinton as a way to "forget" very old gradients. Instead of a simple sum, it uses an Exponentially Weighted Moving Average (EWMA). In AdaGrad, the denominator $s_t$ grows indefinitely. In RMSProp, the denominator is a weighted average that favors recent gradients. This prevents the learning rate from becoming too small to move, allowing the model to continue learning indefinitely.
+
+Update the squared gradient average:
+
+$$s_t = \rho s_{t-1} + (1 - \rho) g_t^2$$
+
+Update the parameters:
+
+$$\theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{s_t + \epsilon}} g_t$$
+
+### 3.3.6 Adam
+
+Adam is currently the "gold standard" for most deep learning tasks, especially for training Large Language Models. It is essentially Momentum + RMSProp combined into one powerful algorithm. Adam tracks two different "moments":
+
+- First Moment ($m_t$): The mean of the gradients (this is the Momentum part).
+- Second Moment ($v_t$): The uncentered variance of the gradients (this is the RMSProp part).
+
+Estimate the moments:
+
+$$m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t$$
+
+$$v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2$$
+
+Bias Correction:
+
+$$\hat{m}_t = \frac{m_t}{1 - \beta_1^t} \quad , \quad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}$$
+
+Since $m_t$ and $v_t$ are initialized at zero, they are biased toward zero at the start of training. Adam fixes this with a correction step:
+
+Update Parameters:
+
+$$\theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{\hat{v}_t} + \epsilon} \hat{m}_t$$
+
+It is computationally efficient, requires little memory, and is well-suited for problems with very large data or parameters.
+### 3.3.7 AdamW
+
+AdamW (Adam with Weight Decay) is a modification of the standard Adam optimizer designed to improve model generalization. It is currently the industry standard for training state-of-the-art Large Language Models, including LLaMA 2. 
+
+While the original Adam algorithm is powerful, it often fails to generalize as well as SGD with Momentum. To fix this, researchers typically add $L_2$ regularization. However, in the standard Adam implementation, $L_2$ regularization does not function the same way it does in SGD because it becomes entangled with the moving averages (moments). The defining feature of AdamW is that it decouples (separates) the weight decay from the gradient update steps. In standard Adam with $L_2$, the regularization term is added directly to the gradient ($g_t$) before the first and second moments ($m_t, v_t$) are calculated. In AdamW, the weight decay is applied independently at the very end of the parameter update step. This ensures that the weight decay strictly shrinks the weights without being distorted by the adaptive learning rate's denominators.
+
+$$\theta_t \leftarrow \theta_{t-1} - \eta_t \left( \alpha \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda \theta_{t-1} \right)$$
+
+By decoupling the weight decay, AdamW recovers the original intent of $L_2$ regularization: pushing weights toward zero to prevent overfitting. This simple change is what allows models like LLaMA 2 to achieve much better stability and performance during massive pre-training runs.
