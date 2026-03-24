@@ -141,3 +141,27 @@
 * **2.4.5 Gemini**
   
 ### **3. Pretraining**
+**3.1 Data**
+* **3.1.1 Data Collection**
+* **3.1.3 Data Preprocessing**
+    * **3.1.3.1 Data Quality Filtering**
+    * **3.1.3.2 Sensitive Content Filtering**
+    * **3.1.3.3 Data Deduplication**
+    * **3.1.3.4 tokenization**
+* **3.1.2 Data Augmentation**
+* **3.1.3 Data Scheduling**
+
+**3.2 Training Tasks**
+* **3.2.1 Goals**
+* **3.2.2 Long Context**
+
+**3.3 Optimizer**
+* **3.3.1 Naive SGD**
+* **3.3.2 Momentum SGD**
+* **3.3.3 NAG**
+* **3.3.4 AdaGrad**
+* **3.3.5 RMSProp**
+* **3.3.6 Adam**
+* **3.3.7 AdamW**
+
+### **4. Post-Training**
