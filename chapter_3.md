@@ -305,7 +305,7 @@ Instead of just messing with the encoding, another highly effective strategy is 
 2. Λ-shaped Context Window. It selectively forces the model to only pay attention to two things: the tokens immediately neighboring the current Query, and the tokens at the very beginning of the sequence. Everything else in the middle is ignored. Because it completely drops the information of the ignored tokens, this method fails to fully utilize all the context information.
 
 3. Token Selection. It aims to effectively approximate full attention by picking only the most important $k$ tokens. By token similarity, it splits tokens into "close" (inside the window) and "far" (outside the window). For the far tokens, it uses external storage to save their Key-Value pairs and uses a k-nearest neighbor search to fetch only the most relevant tokens needed for the current generation step. By chunk similarity, it divides the sequence into chunks of different lengths and extracts only the most relevant sub-chunks for attention calculation.
-   
+
 ## 3.3 Optimizer
 
 ### 3.3.1 Naive SGD
