@@ -109,17 +109,46 @@ Filtering out toxic content and Personally Identifiable Information (PII) is man
 
 #### 3.1.3.3 Data Deduplication
 
-Anthropic discovered that training on duplicate data causes the model to output repetitive, localized loops. Furthermore, duplicates weaken a model's ability to utilize context, actively harming its generalization and in-context learning. It can also cause a phenomenon known as Double Descent, where the training loss drops, unexpectedly spikes, and then drops again, leading to severe training instability.
+Early research in Large Language Models (LLMs) believed that increasing model parameters was the most important factor for success. However, current science proves that data quality is the true bottleneck. By elevating data quality, smaller models can match or even beat massive, parameter-heavy models. Conversely, using low-quality or highly repetitive data causes training to fail. Crucially, if a model is trained on factually incorrect or outdated data, it will confidently generate false information—a phenomenon formally defined as Hallucination.
 
-The two primary categories for deduplication matching are Exact Matching and Approximate Matching. Exact Matching identifies text segments that are character-for-character identical. It typically utilizes suffix arrays to find and match the longest common substrings that meet a minimum length requirement. This is often applied at the sentence level to remove verbatim copies or highly repetitive boilerplate text. Approximate Matching is designed to find "near-duplicates"—documents that are slightly different (e.g., different ads, minor formatting changes) but contain the same core content. Comparing every document character-by-character would be computationally impossible at a "Trillion-token" scale, so it uses Locality-Sensitive Hashing (LSH).
+When assembling massive datasets for LLM training, duplicates are inevitable. Failing to remove them leads to several severe consequences:
 
-MinHash is the primary tool for approximate matching. It treats a document as a set of features (like n-grams). It applies multiple random hash functions to every element in that set. For each hash function, it selects the minimum hash value to represent the set. These minimum values form a "signature." By comparing these small signatures instead of the full text, the system can rapidly estimate the Jaccard similarity between two massive documents. This allows the pipeline to skip pairwise comparisons of every single element, making it highly efficient for processing ultra-large-scale datasets. SimHash transforms text features into a fixed-length bit string (a fingerprint). Similarity is measured using Hamming distance; the smaller the distance between two fingerprints, the higher the similarity between the texts.
+- Overfitting and Rote Memorization: If data contains massive amounts of repetitive content, the model will "rote memorize" these specific samples instead of learning how to genuinely understand and generalize language.
 
-TF-IDF is another "soft" dedup method that compares documents based on the frequency and rarity of words.
+- Behavioral Degradation: Anthropic discovered that training on duplicate data actively harms a model's ability to utilize context and causes it to output repetitive, localized loops.
 
-Real-world pipelines don't just pick one. They use a multi-stage, multi-granularity approach. In the dataset / document level, they use Approximate Matching (MinHashLSH) to remove documents with high similarity (e.g., similarity scores > 0.8). This is faster for broad filtering. In the sentence level, they use Exact Matching to perform a finer "clean-up," deleting specific identical strings that might still exist within otherwise unique documents.
+- Training Instability (Double Descent): Duplicates can cause a phenomenon known as Double Descent, where the training loss drops, unexpectedly spikes, and then drops again, leading to severe instability during the training process.
 
-Early research believed that increasing model parameters was the most important factor. However, current science proves that data quality is the true bottleneck. By elevating data quality, smaller models can match or beat massive models. Conversely, using low-quality data causes training to fail. Crucially, if a model is trained on factually incorrect or outdated data, it will confidently generate false information—a phenomenon formally defined in the text as Hallucination.
+- Privacy and Security Risks: Models that over-memorize repeated data are highly susceptible to leaking sensitive or private information that was accidentally included multiple times in the training corpus.
+
+- Resource Inefficiency: Processing redundant data wastes massive amounts of computational power and dramatically increases training time.
+
+- Evaluation Contamination: If duplicate data exists across both the training set and the testing set, the model effectively gets to "cheat" on its final exam. This contaminates the evaluation, making the test results wildly inaccurate.
+
+Because comparing every document character-by-character is computationally impossible at a "Trillion-token" scale, engineers use distinct categories of deduplication:
+
+- Exact Matching. This method identifies text segments that are character-for-character identical. It typically utilizes cryptographic hash values (like MD5) to instantly flag identical files, or suffix arrays to find and match the longest common substrings that meet a minimum length requirement. This method is often applied to remove verbatim copies or highly repetitive boilerplate text.
+
+- Approximate (Fuzzy) Matching. It is designed to find "near-duplicates"—documents that are slightly different (e.g., different ad placements, minor formatting changes) but contain the exact same core content. It heavily relies on Locality-Sensitive Hashing (LSH).
+  1. MinHash: The primary tool for approximate matching. It treats a document as a set of features (like n-grams) and applies multiple random hash functions to every element. For each hash, it selects the minimum value to create a small "signature." By comparing these signatures instead of the full text, the system can rapidly estimate the Jaccard similarity between two massive documents, skipping pairwise comparisons.
+  2. SimHash: Transforms text features into a fixed-length bit string (a fingerprint). Similarity is measured using Hamming distance; the smaller the distance between two fingerprints, the higher the similarity.
+  3. TF-IDF: Another "soft" method that compares documents based on the frequency and rarity of specific words.
+
+- Semantic Deduplication. This method moves beyond characters and words to understand actual meaning. It utilizes embedding models (like SentenceTransformer) to convert raw text into mathematical vectors. It then calculates the semantic similarity between these vectors. This method is applied identifying and removing documents that express the exact same concept or meaning, even if they use entirely different vocabulary to say it.
+  
+In practice, real-world data pipelines do not rely on just one method. They use a multi-stage, multi-granularity approach:
+
+1. Determine the Processing Unit: First, define the basic unit for deduplication based on the data type (e.g., line-level, paragraph-level, or document-level).
+
+2. Broad Filtering (Document Level): Use Approximate Matching (like MinHash LSH) across the entire dataset to quickly identify and remove documents with high similarity (e.g., similarity scores > 0.8).
+
+3. Internal vs. Cross-Unit Deduplication: * Internal: Check if there is repetitive, looping content within a single processing unit (like a single document) and delete/merge it.
+
+4. Cross-Unit: Compare different processing units against each other to find broader overlaps.
+
+5. Fine Clean-up (Sentence Level): Use Exact Matching to perform a granular clean-up, deleting specific identical strings or boilerplate that might still exist within otherwise unique documents.
+
+6. Train/Test Split Verification: Perform a final rigorous deduplication check specifically between the training set and the test set to guarantee zero contamination.
 
 #### 3.1.3.4 tokenization
 Tokenization for modern Large Language Models (LLMs) relies on Subword Tokenizers (such as BPE, WordPiece, or Unigram) and is executed through a highly structured four-step pipeline. Here is the step-by-step breakdown of how to do tokenization, including specific strategies used by top-tier models like Qwen, LLaMA, and DeepSeek.
@@ -299,3 +328,65 @@ While the original Adam algorithm is powerful, it often fails to generalize as w
 $$\theta_t \leftarrow \theta_{t-1} - \eta_t \left( \alpha \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda \theta_{t-1} \right)$$
 
 By decoupling the weight decay, AdamW recovers the original intent of $L_2$ regularization: pushing weights toward zero to prevent overfitting. This simple change is what allows models like LLaMA 2 to achieve much better stability and performance during massive pre-training runs.
+
+## 3.3 Incremental Pre-training
+Incremental Pre-training is the process of taking that already pre-trained base model and continuing to train (or fine-tune) it using newly acquired data. The goals is to allow the model to continuously learn new knowledge and adapt to new domains without losing the foundational knowledge it already has. Think of it as "updating on an existing foundation" rather than building a new house from scratch every time you want to add a room. It reuses the parameters and knowledge the base model already learned, constantly expands the model's knowledge base with new events or domain-specific info, and significantly reduces the computing power and time required compared to starting over.
+
+Training models isn't a one-and-done process. Incremental training solves several major real-world challenges:
+- Data and Knowledge are Constantly Evolving: The real world is dynamic. New vocabulary, jargon, and historical events emerge daily. Furthermore, specific industries (like healthcare, finance, or law) experience rapid regulatory and market changes. If a model only relies on its original training data, its knowledge becomes outdated.
+
+- Training from Scratch is Prohibitively Expensive: Training a Large Language Model (LLM) requires hundreds of GPUs, weeks or months of time, and massive energy consumption. Doing this every time new data arrives is financially and logistically impossible.
+
+- Preventing "Catastrophic Forgetting": If you only train a model on new data, it tends to overwrite and forget its old capabilities—a phenomenon known as catastrophic forgetting. Incremental training balances the retention of old knowledge with the absorption of the new, maintaining overall model stability.
+
+By utilizing incremental pre-training, developers and organizations gain several key advantages:
+
+- Maintained "Freshness": The model consistently understands recent concepts and news.
+
+- Rapid Domain Adaptation: When moving into a highly specialized niche, the model can quickly adapt to the specific vocabulary and rules of that domain, shortening development cycles.
+
+- Resource Savings: It saves massive amounts of compute power, time, and human effort.
+
+- Handling Continuous Data Streams: It is perfect for online or real-time systems (like chatbots or sentiment monitoring) that receive a continuous flow of incoming data.
+
+The lifecycle of an incrementally trained model usually follows this path:
+1. Initial Pre-training: Train a base model on a massive, general dataset.
+
+2. Data Acquisition: As time passes or business needs shift, collect new training corpora.
+
+3. Incremental Updating: Combine the base model with the new data. During this phase, specific techniques (like mixed sampling or regularization) are used to learn the new info while protecting the old parameters.
+
+4. Validation & Evaluation: Test the newly updated model on both general tasks (to ensure it didn't forget the basics) and new tasks (to ensure it actually learned the new material).
+
+During incremental pre-training, it is normal for the "Loss" (error rate) to go up. A short-term increase in Loss is completely normal and expected. The new data might look significantly different from the original data (e.g., a completely different industry's jargon). The model needs time to adapt its parameters to this "unfamiliar" input. The model experiences tension. It is trying to retain its original representations while simultaneously altering them to fit the new data. If it fails to perfectly balance this immediately, its performance on older data might temporarily dip. Factors like learning rates or the way old and new data are mixed in training batches can cause short-term instability. A healthy incremental training run will show Loss spiking initially as it encounters unfamiliar data, and then slowly, steadily converging (dropping) as it masters the new information. You must monitor two specific metrics:
+
+1. New Data Validation Loss: Proves the model is actually learning the new concepts.
+
+2. Old Data/Core Task Loss: Proves the model is successfully avoiding catastrophic forgetting.
+
+If the Loss spikes significantly, continuously, and refuses to come back down, you should investigate:
+
+- Data Quality: Are the new data labels correct? Is the distribution shift simply too extreme?
+- Hyperparameters: Is your learning rate too high? Is your mix of old/new data imbalanced?
+- Architecture: Do you need more advanced techniques to force the model to remember?
+
+To ensure the model successfully absorbs new data without forgetting the old, engineers use several common techniques during the incremental update step:
+
+- Mixed Sampling (Replay/Memory-based): Keep a small stash of the original training data and mix it in with the new data. This forces the model to constantly "review" the old material.
+
+- Regularization Methods (e.g., EWC - Elastic Weight Consolidation): Identify which mathematical weights/parameters were most crucial for the original tasks. Apply strict mathematical penalties to prevent the system from changing those specific weights too drastically.
+
+- Knowledge Distillation: Use the original, untouched base model as a "Teacher" to guide the updated "Student" model, ensuring the student's outputs don't deviate wildly from what the teacher would have said on old tasks.
+
+- Modular Training: Architect the model so that certain structural modules handle the old knowledge, while different modules are optimized for the new knowledge, preventing them from clashing.
+
+Incremental pre-training is a necessary "break-in" process. As long as the model eventually adapts to the new distribution and shows stable performance on both new and historical tasks, temporary fluctuations in the error rate are simply the cost of learning.
+
+The Learning Rate determines the "step size" a model takes when updating its parameters along the gradient direction during training. If the LR is too low, the model learns too slowly or struggles to grasp new knowledge. If it's too high, it "over-steps," causing the loss function to oscillate wildly or even diverge entirely. It directly dictates the stability of the training process, impacting both how well and how fast the model converges.
+
+Incremental Pre-training involves taking a model that has already learned a vast amount of general knowledge and training it further on new data or domains. Because the base model has already reached a high-quality, stable parameter space, adjusting the LR requires a delicate balance. If the learning rate is too high, the model overfits the new data, drastically altering existing weights, and causes Catastrophic Forgetting (destroying the old knowledge). If it is too low, the model fails to effectively absorb the new data. Generally, you should set the starting LR for incremental pre-training to about 10% of the maximum LR used during the initial pre-training phase. You are "fine-tuning" an already capable model, not building from scratch. Smaller steps prevent massive disruptions to established parameters. If the new data is massive and fundamentally different from the old data, you can slightly increase the LR. However, start small, observe the loss curve, and raise it gradually. Be conservative and use a smaller LR. With limited data, a large step size will cause the model to overfit the small dataset and forget everything else. When increasing the batch size by a factor of $k$, the LR should also be scaled up, but rarely at a 1:1 linear ratio. If the batch size increases by 4x, the LR should roughly increase by 2x (effectively following a square-root scaling rule). This maintains consistent update efficiency while preventing instability. If the training or validation loss spikes and refuses to drop, or if performance on the old dataset plummets, reduce the LR immediately. To further prevent catastrophic forgetting, mix in a certain percentage of the old training data, or use regularization techniques like Knowledge Distillation or EWC.
+
+Warmup is a scheduling technique where training begins with an intentionally tiny Learning Rate, which is then slowly and steadily increased until it hits your target (maximum) LR. After hitting the peak, the LR typically decays normally. This is because, at the very start of training, gradients can be chaotic. Jumping straight into a high LR can cause massive loss fluctuations or "gradient explosions." Starting small allows the model to find a stable optimization direction first, ensuring smoother and more optimal learning once the LR peaks.
+
+Warmup Ratio is the percentage of total training steps (or epochs) dedicated entirely to the Warmup phase. It should be set based on training length. For 1 Epoch (Typical Pre-training), set it around 0.01 (1%). For 3 Epochs (Typical Supervised Fine-Tuning - SFT), set it around 0.03 (3%). The overall final impact of warmup is smaller, but a ratio between 0.01 and 0.06 is still recommended for a safe "take-off." If you plan to use a exceptionally high peak LR, you need a larger warmup_ratio (e.g., 0.05 to 0.1) to create a longer buffer and prevent initial model collapse. If your peak LR is naturally tiny, your warmup ratio can be much smaller (e.g., 0.005). Extremely large batch sizes cause immense gradient accumulation early on. To have it, increase the warmup_ratio to force a slower, gentler LR ascent in the beginning.
+
