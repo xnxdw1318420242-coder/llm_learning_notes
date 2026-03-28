@@ -164,4 +164,17 @@
 * **3.3.6 Adam**
 * **3.3.7 AdamW**
 
+**3.4 Incremental Pretraining**
+
 ### **4. Post-Training**
+
+**4.1 SFT (Supervised Fine-Tuning)**
+* **4.1.1 Instruction Tuning**
+    * **4.1.1.1 Packing**
+    * **4.1.1.2 Diversity**
+    * **4.1.1.3 Sandbox Verification**
+* **4.1.2 Training Strategy**
+* **4.1.3 Multi-Turn Dialogue**
+* **4.1.4 PEFT**
+  
+**4.2 Reinforcement Learning in LLM**
