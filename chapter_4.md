@@ -41,7 +41,7 @@ Here is a thorough breakdown of these two stages:
 
 - SFT is the second phase, occurring after the base model is already established. It transforms a "knowledgeable" model into a "helpful assistant." It is training on a small-scale labeled dataset to adapt the model to specific application needs and instruction following, using Supervised Learning with explicit target answers provided by humans or high-quality teacher models. The data type is specific prompt-response pairs. Unlike pre-training, the data length is natural—the sequence is only as long as the prompt and the answer actually are. While SFT adapts the model, it is crucial to control knowledge injection. New knowledge should only represent 10% to 20% of the mix; forcing too much can cause the model to forget its foundational pre-trained reasoning.
 
-## 4.1.1 Instruction Tuning
+### 4.1.1 Instruction Tuning
 Essentially, this is the process that turns a "raw" pre-trained model into a helpful, conversational assistant by teaching it to obey human commands. Instruction Tuning is a supervised fine-tuning process that uses specialized Instruction Datasets. These datasets contain explicit commands (e.g., "Translate the following text into French" or "Summarize this article") along with the correct answers. Its goal is to move the model beyond simple text completion and teach it the specific pipeline of Reading the Instruction $\rightarrow$ Processing the Input $\rightarrow$ Generating a Compliant Output. The model becomes highly sensitive and "obedient" to human prompts, making it capable of handling diverse tasks and complex dialogue scenarios.
 
 To train the model precisely, researchers represent each data entry as a triplet $(i^k, x^k, y^k)$:
@@ -105,7 +105,81 @@ Here are some overall practical tips for SFT data preparation.
 
 5. Respect the "Alignment Tax". Every model has its own "understanding boundaries." If you force a model to answer questions that are far beyond its current capabilities, it won't just fail—it will actually start performing worse on tasks it already knew how to do. If you push the model past its limit, you break its existing abilities rather than teaching it new ones.
 
-## 4.1.2 Training Strategy
+#### 4.1.1.1 Packing
+When training Large Language Models (LLMs), specifically during Supervised Fine-Tuning (SFT), data samples vary wildly in length—some are only a few dozen tokens, while others are thousands. SFT Packing is an optimization technique designed to handle this variance efficiently. In traditional training, a model uses a fixed sequence length. If a training sample is shorter than that length, the remaining space is filled with padding tokens. Padding tokens do not contribute to learning, yet the model still spends "compute" processing them. In datasets with many short samples (like Q&A pairs or instruction data), a massive amount of GPU power is wasted on processing useless padding. Instead of padding each sample individually, SFT Packing "stitches" multiple training samples together into a single, continuous sequence (a "fake long sentence") to fill the block size. This minimizes invalid padding and maximizes training efficiency.
+
+Because padding tokens are largely removed, the model processes more "real" data per second. This is particularly effective for short-sample datasets like summaries or chat logs. If a batch originally only fit 1–2 long sentences, Packing might allow it to fit over a dozen short ones. This leads to higher GPU utilization and faster gradient updates. Since this is a data-level operation, it does not require changing the model's architecture. It is fully compatible with various positional encodings like RoPE or Absolute PE.
+
+Early training frameworks (like the initial versions of DeepSpeed-Chat) often split multi-turn dialogues into separate samples. With Non-packing, a 3-turn dialogue $[q1, a1], [q2, a2], [q3, a3]$ would be treated as three independent samples. This causes the total data volume to swell (tripling in some cases) and results in very low efficiency. With Packing, these turns can be glued together, allowing the model to understand the entire conversational logic in one go without wasting tokens.
+
+There are three main versions of how Packing is implemented in frameworks like LLaMA Factory:
+
+1. Direct Concatenation (The Basic Version). This throws all tokens into a pool and cut them strictly by the block_size. Samples are often cut off mid-sentence at the start or end of a block, leading to ruptured semantics and lost context.
+
+2. Knapsack Packing. Samples are sorted by length and then grouped (like the "knapsack problem" in algorithms) to fit as perfectly as possible into the block_size. Any remaining small gaps are padded. While the blocks are mostly full, reducing token waste, because all samples in a block use a standard attention mask (all 1s), different samples "see" each other. A model might accidentally learn that an unrelated prompt in the same block is the context for its current answer.
+
+3. 4D Attention Mask (The Advanced Version). Samples are packed, but each is assigned a unique ID (0, 1, 2...). A Block Diagonal Mask (or 4D Mask) is generated. Even though they are physically in the same sequence, the mask ensures tokens only "attend" to other tokens within their own sample. This creates total isolation, solving the cross-contamination problem entirely.
+
+Packing is not always a "free" upgrade. There are two major risks to consider:
+
+- Gradient "Dilution" of Short Queries. Without Packing, if a batch contains only one short text, the model’s entire gradient for that update comes from that one piece of data, leading to intense optimization. With Packing, that same short text is bundled with 7–8 others. Its gradient contribution is now only a small fraction of the total batch. Short but difficult queries (like rhetorical questions or ambiguous instructions) may not be learned effectively because the "signal strength" is diluted by the surrounding data.
+
+- Interference in Multi-turn Dialogues. If you don't use the isolation techniques like 4D Attention Mask, the model may get confused. The model might struggle to distinguish where one conversation ends and another begins. Even using <eos> or <pad> as separators isn't always enough because, without Block Attention, the mathematical attention mechanism still links them. In the worst case, the model treats "someone else's history" as the context for the current dialogue, resulting in "hallucinated" context and wasted compute.
+
+SFT Packing is a powerful tool, but it requires the right infrastructure. Use Packing only if your framework supports Block Attention or 4D Attention Masks (currently supported by LLaMA Factory, DeepSpeed, and transformers v4+). This ensures you get the massive speed benefits of Packing without the "semantic pollution" caused by cross-contamination.
+nsures the center of the class is actually a high-quality response
+
+#### 4.1.1.2 Diversity
+
+In the development of Large Language Models (LLMs)—specifically during the Supervised Fine-Tuning (SFT) stage—the philosophy has shifted from "the more data, the better" to "Quality and Diversity over Quantity." By the time a model reaches SFT, it is already "smart" from its massive pre-training phase. The goal of SFT isn't to teach the model new facts, but to teach it how to provide a high-quality response. Training on messy, repetitive, or low-quality data actually degrades the model's performance.
+
+If your data is all the same, the model’s capabilities will be one-dimensional. Data diversity is the foundation of a model’s "cognitive breadth." To achieve true diversity, researchers focus on three distinct "pillars":
+
+1. Task Type (What the model does). You must tell the model what "job" it is currently performing. Use established lists (like OpenAI's task list) including translation, summarization, roleplay, and code review. Include traditional NLP tasks like Named Entity Recognition (NER), Reading Comprehension (MRC), and Intent Recognition to give the model a solid baseline. Include tasks like legal/financial analysis or specific cultural tasks (e.g., writing traditional riddles). Don't distribute data evenly. Use a weighted structure: more data for complex tasks (like multi-step logical reasoning) and less for simple ones.
+
+2. Data Form (How the information is written). This prevents the model from "pattern matching" based on specific keywords. Instead of saying "Please translate A to B," use scenario-based prompts: "I am an English teacher, help me translate this for my students." Progressively increase the complexity of instructions (e.g., the WizardLM approach) to help the model learn in "stages." Vary the length of prompts and ensure key information isn't always at the beginning. This forces the model's Attention mechanism to scan the entire input. Mix short and long answers. Occasionally demand "1000+ word detailed explanations" to prevent the model from becoming "lazy" and only giving short replies. In multi-turn dialogues, include samples where the topic shifts suddenly. This teaches the model to distinguish between current context and past history.
+
+3. Semantic Diversity (The distribution in embedding space). Even if you have 100,000 instructions, they are useless if they all mean the same thing. Convert text into vectors (embeddings) to see how they "clump" in mathematical space. Ensure the data covers "Core" mainstream expressions as well as "Rare" or "Edge-case" styles.
+
+There are several strategies to find a small, representative "handful" of data from a massive pile.
+
+- K-Means Clustering. Convert text to vectors, cluster them, and pick the sample closest to each center. This is very straightforward. However, when we only picks "representatives," not necessarily "good" samples, a bad sample can be a cluster center.
+
+- Diversity + Quality Weighting. Combine clustering with a "Quality Score" (derived from GPT-4 ratings or logic/grammar checks). This ensures the center of the class is actually a high-quality response, but requires much more complex to run.
+
+- K-Nearest Neighbors (KNN) Weighting. Look at how "similar" a sample is to its neighbors. The less similar it is, the more "rare" and "precious" it is. This method looks for "individual personality" in the data rather than just the most common denominator.
+
+Diversity is equally vital in the pre-training phase. Recent research (specifically the D4 Paper) highlights:
+- Synonyms are Knowledge: Do not delete data just because it means the same thing. Similar sentences expressed in different ways (e.g., high-EQ vs. low-EQ phrasing) are valuable "knowledge expressions" the model needs to learn.
+
+- Document-Level Key: Diversity across websites, languages, and styles is more important than just sentence-level variety.
+
+- Density Balance: Balance "fragmented" web data with "dense" academic or technical texts.
+
+#### 4.1.1.3 Sandbox Verification
+
+In the high-stakes world of Large Language Model (LLM) training, "blindly" feeding the model massive amounts of data is a recipe for wasted budget and mediocre results. Sandbox Verification is a systematic pre-rehearsal system designed to evaluate and screen data quality before the expensive, full-scale training begins. The ultimate goal of a Sandbox is to ensure the model "eats" only the data that is most useful, cost-effective, and performance-enhancing.
+
+Before committing to full-scale training, the Sandbox system seeks to answer three critical questions:
+1. Utility: Which specific datasets actually help the model's performance?
+2. Compatibility: Do different data combinations work well together, or do they "clash" and overlap?
+3. Scalability (ROI): If we invest more money to expand our data, which specific categories provide the best return on investment?
+
+The Sandbox process follows a logical progression from individual unit analysis to complex combinations, and finally to high-cost scaling.
+1. Single-OP Processing (Unit Analysis). In this stage, the raw dataset $D$ is dismantled into different Operation Pools (OP) based on dimensions like source, task type, and style. Each pool is further divided into three tiers based on quality or importance (e.g., 0–33%, 33–67%, and 67–100%). This allows researchers to simulate the "cost-performance" ratio of the data. Then instead of a giant model, we train $3N + 1$ lightweight models (where $N$ is the number of pools) to test each pool’s impact. Data is ranked by its actual contribution to model metrics. You might find that the top 33% of one pool is better than random data, while the bottom 33% of another is essentially "junk" that adds no value.
+
+2. Multi-OP Processing (Combination Analysis). Once we know which individual pools perform well, we need to see if they play nice together. The goal is to find a set of pools ($OP^*$) that are mutually non-overlapping and mutually reinforcing. This step involves three types of analysis:
+   - Correlation Analysis: Checking if different pools have high semantic overlap. If two pools are too similar, we don't need both.
+   - Diversity Analysis: Ensuring the data is "diverse" as well as "accurate." High diversity across different domains and styles leads to better model generalization.
+   - Duplication Analysis: Identifying redundant content within the combination to prevent wasting training costs on repetition.
+  
+3. Higher-Cost Data Scaling. Steps 1 and 2 are performed within a "cost-controlled" environment using small models and limited training. Once $OP^*$ is identified, we move to the final stage with high confidence. Use the validated high-quality combinations to expand into a massive, high-quality dataset. This refined data is finally used for high-cost tasks like full-scale Supervised Fine-Tuning (SFT), Direct Preference Optimization (DPO), and Reinforcement Learning.
+
+The true value of the Sandbox is financial and technical transparency. It identifies "marginal" data that takes up space without adding intelligence. By the time you reach the expensive scaling phase, you aren't guessing. You know exactly which data combinations are worth the "big money." Models trained on Sandbox-verified data are more stable and perform better on target tasks.
+
+Sandbox Verification turns model training from a "blind gamble" into a calculated engineering process where every dollar spent on compute is backed by data-driven evidence.
+
+### 4.1.2 Training Strategy
 Utilizing a model from Hugging Face involves coordinating four distinct categories of files that work together to turn your raw text into an intelligent response.
 
 1. The Preprocessing Phase (The Tokenizer). A model cannot read English; it only reads numbers (tokens). The Tokenizer related files act as the translator. tokenizer.json & tokenizer_config.json contain the complete instructions for the conversion process. They define the "rules of engagement," including special symbols like [CLS] or [SEP]. The vocab.json file maps specific words or sub-words to unique integer IDs. The merges.txt file is specifically used for BPE (Byte Pair Encoding) to decide how smaller character pieces should be merged into recognizable tokens. You load these files first to transform your input string into a tensor of IDs that the model can actually process.
@@ -176,8 +250,21 @@ While Supervised Fine-Tuning (SFT) is a fundamental requirement for building mod
 Because of the unidirectional nature of autoregressive LLMs (often called Causal Masking), the model can only see what comes before a token, never what comes after. Imagine a sentence that starts with a false statement but ends with a refutation (e.g., "Pluto is a planet, a statement that is now scientifically outdated."). While training on that sentence, the model sees "Pluto is a..." and learns that "planet" is a high-probability next word. It cannot "look ahead" to the end of the sentence to see that the statement is being refuted. This makes SFT notoriously bad at handling irony, sarcasm, or complex logical "reversals" where the meaning of the beginning of the sentence changes based on the end.
 
 SFT is a microscopic process. It focuses on the next token, not the whole message. It lacks the structural understanding to evaluate whether a paragraph makes sense as a whole. This is where Reinforcement Learning from Human Feedback (RLHF) steps in. RLHF can use Process Reward Models (PRM) to score an entire sequence at once. In RLHF, a human (or reward model) can say, "This whole sentence is wrong," and that signal travels backward to correct the logic. SFT simply cannot do this because it has no concept of a "whole-sentence score."
-## 4.1.3 Incremental Pre-training
+### 4.1.3 Multi-Turn Dialogue
 
-## 4.1.4 PEFT
+When training Large Language Models (LLMs) on multi-turn dialogues—typically during the Supervised Fine-Tuning (SFT) phase—a key technical decision is whether to calculate the training loss for every response in the conversation or only for the final one. The choice depends on your specific training goals and how you want the model to prioritize information.
 
+If the goal is context understanding, Loss is calculated for every response (Assistant turn) within the dialogue history. This helps the model better internalize conversational flow and maintain consistency over long interactions. If the goal is final answer quality,  loss is calculated exclusively for the very last response in the conversation. This prioritizes the model's ability to provide a high-quality "end result," which can be more computationally efficient for specific tasks.
+
+In practice, we control which tokens contribute to the model's weight updates using a Loss Mask. This tells the training script to effectively "ignore" certain parts of the input sequence. When using PyTorch’s CrossEntropyLoss (the standard loss function for LLMs), there is a specific parameter called ignore_index. By convention, this is set to -100. Any label in your training data assigned the value of -100 will be skipped by the loss function. It will not affect the gradients or influence the model's learning for those specific positions.
+### 4.1.4 PEFT
+#### 4.1.4.1 BitFit
+#### 4.1.4.2 Prefix Tuning
+#### 4.1.4.3 Prompt Tuning
+#### 4.1.4.4 P-Tuning V1 & V2
+#### 4.1.4.5 Adapter Tuning
+#### 4.1.4.6 LoRA 
+#### 4.1.4.7 QLoRA
+#### 4.1.4.8 xLoRA
+#### 4.1.4.9 AdaLoRA
 ## 4.2 Reinforcement Learning in LLM 
