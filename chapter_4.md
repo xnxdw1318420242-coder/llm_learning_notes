@@ -258,6 +258,15 @@ If the goal is context understanding, Loss is calculated for every response (Ass
 
 In practice, we control which tokens contribute to the model's weight updates using a Loss Mask. This tells the training script to effectively "ignore" certain parts of the input sequence. When using PyTorch’s CrossEntropyLoss (the standard loss function for LLMs), there is a specific parameter called ignore_index. By convention, this is set to -100. Any label in your training data assigned the value of -100 will be skipped by the loss function. It will not affect the gradients or influence the model's learning for those specific positions.
 ### 4.1.4 PEFT
+As Large Language Models (LLMs) continue to scale from millions to billions of parameters, the traditional way we "train" or adapt them has hit a major wall. Based on the provided images, here is a structured breakdown of why Parameter-Efficient Fine-Tuning (PEFT) has become essential. 
+
+In the early days of AI, models were small enough (millions of parameters) that Full Fine-Tuning—updating every single weight in the model—was easy and accessible. However, modern models (like the GPT series or Llama) are so massive that full fine-tuning presents two massive hurdles:
+- Extreme Computational Cost: Full fine-tuning requires massive amounts of VRAM (Video RAM) and processing power. Most developers and researchers only have access to "consumer-grade" hardware (like a single high-end gaming GPU), which simply cannot handle the memory load of a full billion-parameter model update.
+- Sluggish Training Speed: Because the system has to calculate and update billions of gradients, the training process is incredibly slow.
+
+If you use Full Fine-Tuning to adapt a model for five different tasks (e.g., translation, coding, sentiment analysis, etc.), you end up with five different versions of the entire model. PEFT solves this by only updating a tiny fraction of the parameters, meaning you only need to store the small "delta" (the changes), which are often just a few megabytes.
+
+PEFT was developed to bridge the gap between high-performance adaptation and low-resource requirements. You don't need to touch all the parameters. By only tuning a small subset or adding auxiliary layers, you drastically reduce the VRAM and storage footprint. State-of-the-art (SOTA) PEFT techniques, like LoRA, have proven that you can achieve performance levels nearly identical to Full Fine-Tuning while only training a fraction of the parameters. PEFT allows massive models to be fine-tuned on consumer-grade hardware, "democratizing" AI development so it isn't restricted to giant tech companies with supercomputers.
 #### 4.1.4.1 BitFit
 #### 4.1.4.2 Prefix Tuning
 #### 4.1.4.3 Prompt Tuning
