@@ -99,6 +99,41 @@ Heuristic-Based Filtering is highly efficient, capable of processing 10M to 100M
 
 Model-Based Filtering (Classifiers) are used for fine-grained filtering, though they are computationally heavier. FastText is highly efficient for lightweight models, but precision is limited by the model's capacity. BERT can be fine-tuned for specific pre-training data but has limited generalization capabilities. GPT-4 (Closed-source APIs) is highly capable but comes with high costs and a lack of flexibility for custom tasks.
 
+Here, we introduce two extra methods for data filtering.
+
+IFD is a metric designed to let the model itself determine how "valuable" a piece of training data is. It measures the value of an instruction by comparing how the model performs on a specific answer with and without the instruction present. To calculate an IFD score, the system looks at two primary indicators:
+- Conditioned Answer Score (CAS): This measures how well the model generates an answer when the instruction is given. It evaluates the consistency between the input prompt and the output.
+- Direct Answer Score: This measures the model's ability to generate that same answer without the instruction. It represents the intrinsic complexity or "inherent difficulty" of the answer itself.
+The IFD Score Formula:
+$$r_{\theta}(Q, A) = \frac{\text{Conditioned Answer Score}}{\text{Direct Answer Score}}$$
+
+- High IFD Score: This indicates that adding the instruction significantly clarifies the task or adds value that wasn't there before. This data is considered high-value "Cherry" data because it helps the model learn to follow instructions.
+- Low IFD Score: This indicates the data is either too simple (the model already knew the answer without the prompt) or the instruction and answer are unrelated. This data is usually filtered out.
+
+The 3-Step IFD Workflow:
+1. Learning from Brief Experience: A base model is given a "short-term" training on a small, highly diverse set of samples (selected via K-Means clustering) to give it basic instruction-following capabilities.
+2. Evaluating Based on Experience: This "pre-experienced" model calculates the CAS and Direct Answer scores for the entire dataset to determine the IFD for every sample.
+3. Retraining from Self-Guided Experience: Only the high-value "Cherry" data is used to fine-tune the final model, ensuring every training step is used to "patch the model's weaknesses."
+
+<p align="center">
+<img width="519" height="385" alt="86272d6e-e32e-4cf6-8632-644295b09a05" src="https://github.com/user-attachments/assets/c537a75f-f0a3-4e2d-a781-47bc37cbbf4e" />
+
+</p>
+MoDS is a more holistic selection framework. It evaluates data across three specific dimensions: Quality, Diversity, and Necessity to select the most valuable subset for training. 
+
+The 3-Step MoDS Workflow:
+1. Quality Evaluation. The system uses a Reward Model (often based on the DeBERTa architecture) to score every (Instruction, Input, Output) triple in the raw dataset. A threshold is set, and any data that doesn't meet the quality standard is discarded immediately.
+
+2. Diversity Selection. High-quality data is useless if it is all the same. MoDS uses the K-Center-Greedy algorithm to identify a representative set of instructions that covers a wide range of tasks and semantics. This creates the Seed Instruction Dataset.
+
+3. Necessity Selection (Finding the Model's "Gaps"). This step identifies what the model specifically needs to learn. The model is fine-tuned using the Seed Dataset from Step 2 to create an initial baseline. This initial model is then asked to predict outcomes for the rest of the high-quality data. Any samples where the model performs poorly are identified as the model's "shortcomings" or "weaknesses." These difficult samples are used to create an Augmented Instruction Dataset.
+
+By combining the Seed Dataset (for breadth) and the Augmented Dataset (for specific improvement), MoDS results in a final model with superior performance across a wide range of tasks.
+
+<p align="center">
+<img width="468" height="355" alt="e34358b6-b3af-45d8-83a4-d851cc756f7e" src="https://github.com/user-attachments/assets/daba9a43-23d2-4ff2-bc04-44c24cd5b711" />
+</p>
+
 #### 3.1.3.2 Sensitive Content Filtering
 
 Filtering out toxic content and Personally Identifiable Information (PII) is mandatory to prevent models from generating abusive outputs or leaking private user data. 
