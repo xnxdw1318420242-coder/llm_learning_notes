@@ -268,12 +268,83 @@ If you use Full Fine-Tuning to adapt a model for five different tasks (e.g., tra
 
 PEFT was developed to bridge the gap between high-performance adaptation and low-resource requirements. You don't need to touch all the parameters. By only tuning a small subset or adding auxiliary layers, you drastically reduce the VRAM and storage footprint. State-of-the-art (SOTA) PEFT techniques, like LoRA, have proven that you can achieve performance levels nearly identical to Full Fine-Tuning while only training a fraction of the parameters. PEFT allows massive models to be fine-tuned on consumer-grade hardware, "democratizing" AI development so it isn't restricted to giant tech companies with supercomputers.
 #### 4.1.4.1 BitFit
-#### 4.1.4.2 Prefix Tuning
-#### 4.1.4.3 Prompt Tuning
-#### 4.1.4.4 P-Tuning V1 & V2
-#### 4.1.4.5 Adapter Tuning
-#### 4.1.4.6 LoRA 
-#### 4.1.4.7 QLoRA
-#### 4.1.4.8 xLoRA
-#### 4.1.4.9 AdaLoRA
+
+BitFit (Binary Task Fine-tuning) is an exceptionally sparse and efficient strategy within the Parameter-Efficient Fine-Tuning (PEFT) family. While most methods focus on adding new layers (Adapters) or modifying weight matrices (LoRA), BitFit takes a minimalist approach by only modifying the bias terms of a pre-trained model.
+
+Standard Full Fine-Tuning is powerful but comes with significant baggage. Updating every parameter in a multi-billion parameter model creates a massive, unique file for every single task you want to solve. This makes deployment and maintenance nearly impossible as the number of tasks grows.
+
+BitFit was designed to meet four "ideal" conditions for fine-tuning:
+
+- Performance: Matching the accuracy of full fine-tuning.
+
+- Efficiency: Modifying only a tiny fraction of the parameters.
+
+- Deployment: Enabling data to arrive in "streams" for efficient hardware use.
+
+- Consistency: Keeping the modified parameter types consistent across different downstream tasks.
+
+In a Transformer model, most parameters are stored in the weight matrices ($W$) of the Attention and MLP layers. BitFit freezes all of these weights and only updates the bias terms ($b$). Specifically, it targets the biases in:
+
+- Attention Modules: Calculations for Query ($Q$), Key ($K$), and Value ($V$), as well as the biases used when merging multiple attention heads.
+
+- MLP Layers: The feed-forward networks between attention blocks.
+
+- Layer Normalization: The biases used to scale and shift activations.
+
+In models like BERT-Base or BERT-Large, the bias parameters account for only $0.08\%$ to $0.09\%$ of the total parameter count. Despite this tiny footprint, the research shows impressive results. It significantly outperforms "Frozen" methods (where no parameters are tuned) and stays within reach of Full Fine-Tuning. Research indicates that not all biases are created equal. The most critical changes happen in the Query biases and the Intermediate Feed-Forward (FFN) layers (where the dimension expands from $N$ to $4N$). If you freeze either of these specific bias groups, the model's performance drops sharply.
+
+Example code:
+```python
+import torch
+from transformers import AutoModelForSequenceClassification
+
+def apply_bitfit(model):
+    """
+    Freezes all parameters in the model except for the bias terms.
+    """
+    trainable_params = 0
+    all_params = 0
+
+    for name, param in model.named_parameters():
+        all_params += param.numel()
+        
+        # BitFit Logic: Only unfreeze parameters with 'bias' in their name
+        # We also typically keep the classification head (classifier) trainable
+        if "bias" in name or "classifier" in name:
+            param.requires_grad = True
+            trainable_params += param.numel()
+        else:
+            param.requires_grad = False
+
+    print(f"Total Parameters: {all_params:,}")
+    print(f"Trainable (BitFit) Parameters: {trainable_params:,}")
+    print(f"Percentage Trainable: {(100 * trainable_params / all_params):.4f}%")
+    
+    return model
+
+# 1. Load a standard pre-trained model
+model_name = "bert-base-uncased"
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+
+# 2. Apply the BitFit strategy
+model = apply_bitfit(model)
+
+# 3. Setup the optimizer 
+# Only pass the parameters that actually require gradients
+optimizer = torch.optim.AdamW(
+    [p for p in model.parameters() if p.requires_grad], 
+    lr=1e-4
+)
+```
+
+#### 4.1.4.2 Prompt Tuning
+
+#### 4.1.4.3 Prefix Tuning
+#### 4.1.4.4 Soft Prompt Tuning
+#### 4.1.4.5 P-Tuning V1 & V2
+#### 4.1.4.6 Adapter Tuning
+#### 4.1.4.7 LoRA 
+#### 4.1.4.8 QLoRA
+#### 4.1.4.9 xLoRA
+#### 4.1.4.10 AdaLoRA
 ## 4.2 Reinforcement Learning in LLM 
