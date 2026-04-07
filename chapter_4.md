@@ -337,12 +337,389 @@ optimizer = torch.optim.AdamW(
 )
 ```
 
-#### 4.1.4.2 Prompt Tuning
+#### 4.1.4.2 Hard Prompt Tuning
+The fundamental idea of Prompt-Tuning is to convert a downstream task (like sentiment analysis) back into a pre-training task (like fill-in-the-blank). In the past, to make a model like BERT identify emotions, we had to attach a brand-new "classifier head" (an MLP layer) on top of it. This required a significant amount of labeled data to train that new layer from scratch. Prompt-Tuning avoids this by "tricking" the model into using its original skills to solve the new problem. 
+
+Using the BERT sentiment analysis example, the process follows three distinct steps:
+
+- Template Construction. We take the original input and wrap it in a "Template" that includes a [MASK] token, like "[CLS] I like the Disney films very much. [SEP] It was [MASK]."
+
+- Reusing the MLM Classifier. Instead of using a new classification layer, we use the model’s original Masked Language Model (MLM) head. The model looks at the mask and predicts the probability distribution of every word in its vocabulary that could fill that hole.
+
+- Label Word Verbalizer (Mapping). Since we only care about specific categories (Positive vs. Negative), we create a "Verbalizer" to map words to labels. For example, if the model predicts "great" or "amazing" $\rightarrow$ Label as Positive.
+
+GPT-3 took this concept a step further with In-Context Learning (ICL) and Demonstration Learning. This is the "Zero-shot" or "Few-shot" approach. You don't update any model parameters at all. You simply provide the task description in the prompt. You give the model examples (demonstrations) within the prompt to show it how to behave.
+
+There are two types of Prompt Tuning. Hard Prompting (Discrete) is what is shown in the examples above—manually or automatically searching for the best text-based templates that humans can read. Soft Prompting (Continuous) is a more advanced PEFT (Parameter-Efficient Fine-Tuning) method. Instead of using real words, we "tune" specific mathematical vectors (Prompt Embeddings) that are prepended to the input. While humans can't read these "virtual tokens," they are often much more effective at guiding the model.
 
 #### 4.1.4.3 Prefix Tuning
+
+Instead of retraining an entire massive model, Prefix-Tuning focuses on adding a small, learnable "hint" that guides the model to perform specific tasks. Before Prefix-Tuning, researchers relied on Prompt Tuning, which involved designing text-based templates (called "Hard Prompts"). For example, to summarize a text, you might manually add the words "In summary:" at the end. However, this had several major flaws:
+
+- High Sensitivity: Small changes in the manual template could cause huge drops in model performance.
+
+- Suboptimal Results: Human-designed words (discrete tokens) are often not the "perfect" mathematical instructions for a model.
+
+- Manual Labor: It is incredibly difficult and time-consuming for humans to design the "optimal" prompt for every different task.
+
+Prefix-Tuning replaces human words with Virtual Tokens (also known as Soft Prompts or Continuous Prompts). Implicit vs. Explicit: While a "Hard Prompt" is an explicit hint humans can read, a "Prefix" is an implicit, learnable hint consisting of continuous vectors. Instead of picking from a fixed dictionary of words, Prefix-Tuning searches for the best "instruction" in a much larger, continuous mathematical vector space. These virtual tokens don't correspond to any real word in a natural language; they are purely optimized for the model's performance.
+
+<p align="center">
+<img width="397" height="307" alt="3f87fc48-e431-4229-979f-33135428f68f" src="https://github.com/user-attachments/assets/aeb05816-77aa-46d9-b33d-e0fe7110ab13" />
+</p>
+
+Prefix-Tuning changes its structure depending on the type of model being used:
+
+- Decoder-Only Models (e.g., GPT-2): The prefix is added only at the very beginning of the sequence. Formula: $z = [PREFIX; x; y]$ (where $x$ is the input and $y$ is the output).
+
+- Encoder-Decoder Models (e.g., BART): Different prefixes are added to the start of both the encoder and the decoder. The encoder prefix guides the encoding of the input, while the decoder prefix guides the generation of the output. Formula: $z = [PREFIX; x; PREFIX'; y]$.
+
+Research shows that putting the "hint" at the very beginning (Prefix) is slightly better than putting it in the middle (Infix: $[x; INFIX; y]$).
+
+<p align="center">
+<img width="498" height="193" alt="b72ff315-5d8c-4aeb-97d6-92393fdc24a8" src="https://github.com/user-attachments/assets/2305fc8e-cd4a-4467-98d5-0b23d949fc30" />
+
+</p>
+
+To make Prefix-Tuning stable and powerful, the authors introduced three critical "Key Points":
+
+- Layer-wise Prefix-Tuning. Researchers found that just adding a prefix to the initial input (the embedding layer) wasn't expressive enough. To truly "steer" the model, Prefix-Tuning adds a Prefix Vector to every single Transformer block in the model. This ensures that the task-specific guidance influences every stage of the model's "thinking" process, not just the beginning. For every index $i$ in the sequence, the model checks if it falls within the "Prefix" range. If it is a prefix index ($i \in P_{idx}$), the activation $h_i$ is copied directly from a specialized parameterized matrix ($P_\theta$). if it is not, $h_i$ is computed using the standard Language Model (LM) layers. Because every subsequent calculation depends on the prefixes to its left, these "deep prompts" influence the hidden states at every level of the model's architecture.
+
+<p align="center">
+<img width="310" height="182" alt="ffc13c36-e237-4b79-a404-a76e2f157d55" src="https://github.com/user-attachments/assets/61fc7e7e-74fa-40c0-85bc-ae9a5861ccaf" />
+</p>
+
+- MLP Projection (Reparameterization). Directly updating the prefix vectors during training can lead to instability and performance loss. To fix this, the authors use a Multi-Layer Perceptron (MLP) to "reproject" the parameters. They decompose the large matrix into a smaller matrix ($|P_{idx}| \times k$) followed by a larger MLP ($k \times dim(h_i)$). During training, the gradients update the MLP. Once training is finished, the MLP is discarded. Only the resulting Prefix parameters are kept for the actual model run, meaning there is no extra "weight" added to the model during use.
+
+<p align="center">
+<img width="400" height="162" alt="4f11aebb-8999-4d95-8b2b-eb386e1f3efe" src="https://github.com/user-attachments/assets/2940688e-3471-48b7-87d9-6f2a69b8558d" />
+</p>
+
+- The "Length" of the prefix (how many virtual tokens you use) is a critical balance between performance and the model's "context window."  The authors found that a default prefix length of 10 virtual tokens is often the "sweet spot." Because the prefix is so short, the total number of new parameters is incredibly small—roughly 0.1% of the original model's parameters. The length of the prefix directly impacts the model's ability to handle long documents; if the prefix is too long, it leaves less room for the actual input text.
+
+Example code:
+```python
+import torch
+import torch.nn as nn
+from transformers import AutoModel
+
+class PrefixEncoder(nn.Module):
+    def __init__(self, config, num_prefix_tokens=10, intermediate_dim=512):
+        super().__init__()
+        self.num_layers = config.num_hidden_layers
+        self.num_prefix_tokens = num_prefix_tokens
+        self.hidden_size = config.hidden_size
+
+        # KEY POINT 2: Reparameterization (Small Matrix + MLP)
+        # This is the 'raw' virtual token matrix (|P_idx| x k)
+        self.embedding = nn.Embedding(num_prefix_tokens, intermediate_dim)
+        
+        # The MLP that projects 'k' to the full hidden states
+        # We project to (num_layers * 2 * hidden_size) to provide Key and Value for every layer
+        self.mlp = nn.Sequential(
+            nn.Linear(intermediate_dim, intermediate_dim),
+            nn.Tanh(),
+            nn.Linear(intermediate_dim, self.num_layers * 2 * self.hidden_size)
+        )
+
+    def forward(self):
+        # Generate the prefix vectors
+        tokens = torch.arange(self.num_prefix_tokens).to(self.embedding.weight.device)
+        past_key_values = self.embedding(tokens) # [num_tokens, intermediate_dim]
+        past_key_values = self.mlp(past_key_values) # [num_tokens, num_layers * 2 * hidden_size]
+        
+        # KEY POINT 1: Layer-wise distribution
+        # Reshape so we have a distinct 'Prefix' for every single layer
+        return past_key_values.view(self.num_layers, 2, self.num_prefix_tokens, -1)
+
+# Usage Logic
+model = AutoModel.from_pretrained("gpt2")
+
+# FREEZE BASE MODEL:
+for param in model.parameters():
+    param.requires_grad = False
+
+# Add our Prefix Tuning logic
+prefix_config = model.config
+prefix_tuning_layer = PrefixEncoder(prefix_config)
+```
+
+Prefix-Tuning is a powerful "Plug-and-Play" method that excels in efficiency and multi-task management. It has extreme parameter efficiency, high training efficiency (Because the number of trainable parameters is a tiny fraction of the whole model, the backpropagation and gradient update process is significantly faster, saving both time and computational energy), superior for multi-task scenarios (You only need to store and swap out a tiny task-specific "Prefix Vector" for each new objective, making it ideal for systems that require frequent task switching), and strong portability and transferability (The prefixes can be viewed as modular knowledge that can potentially be transferred or adapted across various related tasks).
+
+Despite its efficiency, Prefix-Tuning has specific "bottlenecks" that engineers must carefully manage. The length of the virtual tokens is a "Goldilocks" problem. If it is too short, the prefix may not provide enough "guidance" or representational power for the model to complete complex tasks effectively. If it is too long, increasing the length consumes more of the model’s limited context window and increases training costs. Unlike Full Fine-Tuning, Prefix-Tuning only modifies the input features (activations) at each layer. It cannot alter the model's internal "logic" or pre-trained knowledge stored in the hidden parameters. On certain specialized tasks, its performance may still lag behind full parameter fine-tuning because the model's "core" cannot be reshaped. On specific, highly complex tasks, the "Soft Prompt" approach might not be as robust as methods that allow for internal weight adjustments (like LoRA or Full FT).
+
+Prefix-Tuning is not a "one-size-fits-all" solution, but it has a clear home in specific domains:
+
+- Primary Use Case: Text Generation Tasks. It is exceptionally well-suited for Machine Translation, Text Summarization, and Dialogue Generation.
+- Secondary Use Case: Some classification tasks.
+- High-Value Scenarios: It performs best in multi-task and cross-domain applications, where the ability to quickly transfer pre-trained capabilities to a new task with minimal storage overhead is a massive competitive advantage.
+  
 #### 4.1.4.4 Soft Prompt Tuning
+In Soft Prompt Tuning, instead of using real words, we use continuous embedding vectors (Virtual Tokens). These "Soft Prompts" are learned through backpropagation. Humans can't read them, but the model understands them perfectly as optimized instructions. The core technical workflow involves "tricking" the model into using its original skills for a new purpose.
+
+Given an input sequence $X$, we prepend a series of $m$ trainable prompt tokens $P$: $[P; X]$ or $[p_1, p_2, \dots, p_m, x_1, x_2, \dots, x_n]$. The dimension of the prompt vectors $d$ is set to match the model's embedding layer dimension. These virtual tokens aren't just random noise. They can be initialized in two ways:
+- Random Initialization: Starting from scratch.
+- Manual Initialization: Initializing the vectors from existing word embeddings (like "summarize" or "translate") to give the model a "head start."
+
+The most critical part of Prompt-Tuning training process is what stays still and what move. The entire pre-trained model ($\theta$) is frozen. Not a single original weight is changed. Only the parameters of the prompt vectors ($\theta_P$) are updated using a task-related Loss function ($\mathcal{L}$). The mathematical goal is:
+
+$$\min_{P} \mathcal{L}(f(X_{ext}; \theta), y)$$
+
+While Prompt-Tuning and Prefix-Tuning sound similar, there is key distinction. Prefix-Tuning injects virtual tokens into every layer of the Transformer and often uses an MLP for adjustment. Prompt-Tuning is a simplified version of Prefix-Tuning. It only prepends tokens to the input embedding layer (the very first block). Because it doesn't touch the internal layers, it uses significantly fewer parameters than Prefix-Tuning.
+
+Prompt-Tuning becomes more effective as the model gets bigger. For a massive model like T5-XXL (11 Billion parameters), a full fine-tuning would require 11B updates. Prompt-Tuning achieves nearly the same performance by tuning only 20,480 parameters. Experiments prove that automatically generated soft prompts perform nearly as well as full model tuning and exceed the performance of human-designed hard prompts. The task switching is also rapid. Since you only need to save the tiny prompt file (the "delta") for each task, you can switch the model from "Translator" to "Summarizer" instantly just by swapping the input prefix.
+
+Prompt-Tuning allows for a unique optimization called Prompt Ensembling. In a single Batch, you can train/query the same task using different prompts (asking the same question in different ways). This is mathematically similar to training different models but at a much lower cost than traditional model ensembling.
+
+There are constraints and limitations for this method:
+- Dependency on Prompt Length: The length $m$ of the prompt is a key hyperparameter that needs tuning. Different tasks have different needs.
+- Limited on Small Models: On smaller pre-trained models, Prompt-Tuning may not perform as well as full parameter fine-tuning. It truly shines once you cross the 10 Billion parameter threshold.
+- Adaptation for Complex Tasks: Some extremely complex tasks may still require more internal model modification (like LoRA) to achieve peak accuracy.
+
 #### 4.1.4.5 P-Tuning V1 & V2
+
+P-Tuning is famous for the research paper title "GPT Understands, Too," because it successfully boosted the performance of GPT-style models in Natural Language Understanding (NLU) tasks, where they previously lagged behind BERT. 
+
+Traditional prompting relies on Hard Prompts (human-designed text templates). P-Tuning shifts the focus from "searching for words" to "optimizing embeddings." Instead of using real natural language tokens (like "The capital of..."), P-Tuning inserts continuous, differentiable "virtual tokens" into the input. These are not words humans can read; they are purely mathematical vectors optimized by the model. Unlike Prefix-Tuning (which only adds tokens at the beginning), the position of virtual tokens in P-Tuning is optional—they can be inserted as a prefix, a suffix, or even in the middle of the input. The goal is to replace real tokens in human-designed templates with differentiable virtual tokens to better "awaken" the model's potential.
+
+A unique feature of P-Tuning (specifically v1) is the use of a Prompt Encoder to handle the virtual tokens before they enter the LLM. Pre-trained word embeddings in LLMs are highly discrete. If you initialize virtual tokens randomly, the model might easily get stuck in a "local optimum" (a sub-optimal solution). Virtual tokens should be related to each other. By passing them through a Bi-directional LSTM followed by an MLP (Multi-Layer Perceptron), the system creates a "chain of logic" between the tokens, allowing for faster convergence and better results. This setup is a form of parameter reparameterization—training the LSTM/MLP to output the "perfect" embeddings for the task.
+
+The method evolved to handle more complex tasks and different model scales:
+
+- P-Tuning v1. Virtual tokens are added only to the input embedding layer. It is less effective on smaller models (under 10B parameters) and struggles with complex sequence-labeling tasks.
+
+- P-Tuning v2. Virtual tokens are added to every single Transformer layer (Layer 1, Layer 2, ..., Layer N). It is universal across different model scales and tasks. It achieves performance comparable to full fine-tuning while keeping the base model frozen.
+
+To construct a P-Tuning workflow, first define a prompt $P$ of length $m$. These tokens have a dimension $d$ equal to the model's embedding dimension. Then, concatenate the prompt $P$ with the original input $X$:
+
+$$X_{ext} = [P; X] \in \mathbb{R}^{(m+n) \times d}$$
+
+In the training process, the entire pre-trained model parameters ($\theta$) are frozen. Only the parameters of the virtual tokens ($P$) or the Prompt Encoder are updated by minimizing the loss function:
+
+$$\min_{P} \mathcal{L}(f(X_{ext}; \theta), y)$$
+
+<p align="center">
+<img width="904" height="204" alt="0bea350a-8c57-4109-9a1e-e018f4d41210" src="https://github.com/user-attachments/assets/7f47d103-aafd-4ef7-9b83-eb3b6db60a7d" />
+</p>
+
+P-Tuning v2 is a universal and scalable Parameter-Efficient Fine-Tuning (PEFT) method designed to overcome the critical limitations of its predecessors, Prompt-Tuning and P-Tuning v1. While earlier methods proved that "GPT understands, too," they struggled with smaller model scales and complex NLU (Natural Language Understanding) tasks.
+
+The original P-Tuning and Prompt-Tuning methods faced three primary "bottlenecks" that hindered their widespread adoption:
+- Lack of Scalability for Small Models: When model parameters were between 100M and 1B, there was a massive performance gap between prompt-based tuning and full fine-tuning. These methods only reached parity when models exceeded 10B parameters.
+  
+- Lack of Task Universality: While effective for simple classification, they struggled with "hard" NLU tasks like Sequence Labeling (e.g., Named Entity Recognition) and complex reasoning.
+
+- Limited Parameter Impact: Because prompts were only inserted at the input embedding layer, their influence on the model’s deeper layers was indirect and the number of trainable parameters was extremely small (around 0.01%).
+
+The fundamental change in P-Tuning v2 is the transition from "Input-layer prompting" to "Deep Prompt Tuning." Instead of just prepending virtual tokens to the input, P-Tuning v2 injects Prompt tokens into every single layer (Layer 1 to Layer N) of the Transformer architecture. Unlike Prefix-Tuning (where prompts are often linked via an MLP), the prompts at each layer in P-Tuning v2 are independent and not calculated from the previous layer. By adding prompts to deeper structural levels, the "task-specific hint" has a much more direct and powerful influence on the model's final predictions.
+
+P-Tuning v2 introduces several strategic shifts to make the model more robust and universal:
+- Increased Trainable Parameters. By utilizing prompts across all layers, the ratio of trainable parameters increases from the tiny 0.01% of v1 to a more substantial 0.1% to 3%. This provides enough "tuning space" to handle complex tasks while remaining highly efficient
+- Removal of Reparameterization (The Encoder). In v1 and Prefix-Tuning, complex encoders (like LSTM or MLP) were used to stabilize training. In v2, the authors found that these encoders actually provided very little improvement and could even hurt performance on smaller models. Thus, v2 removes the heavy reparameterization.
+- Task-Specific Prompt Length. Research showed that prompt length is a crucial hyperparameter that depends on task complexity. For simple Tasks (e.g., Sentiment Analysis), a short prompt of ~20 tokens is sufficient. Complex Tasks (e.g., Reading Comprehension) requires a much longer prompt of ~100 tokens to achieve optimal performance.
+- Return to Traditional Classification Heads. Instead of using a Verbalizer (mapping words to labels), P-Tuning v2 returns to the traditional approach of using a randomly initialized Classification Head (Linear Head) applied over the tokens. This makes the method universal across all NLU tasks, including sequence labeling.
+- Multi-Task Learning Strategy. To overcome the optimization difficulty of randomly initialized prompts, v2 suggests pre-training on multi-task prompts before adapting to specific downstream tasks. This "shared knowledge" serves as a better starting point for the model.
+
+P-Tuning v2 allows models under 10B parameters to finally achieve performance comparable to full fine-tuning. In tasks like RTE (Recognizing Textual Entailment), P-Tuning v2 (especially when applied to BERT) significantly outperforms standard full fine-tuning. It is the first prompt-based method to effectively tackle sequence labeling and complex NLU benchmarks where previous versions failed.
+
+<p align="center">
+<img width="901" height="199" alt="42c8c3fc-83e2-4dca-9486-542c9ad04a97" src="https://github.com/user-attachments/assets/1acd5581-caad-4cf0-8f7b-4ad84c94cbfd" />
+</p>
+
+P-Tuning v1 example code:
+```python
+import torch
+import torch.nn as nn
+
+class PTuningV1Encoder(nn.Module):
+    def __init__(self, num_virtual_tokens, embedding_dim, hidden_dim=128):
+        super().__init__()
+        # 1. Raw Virtual Token IDs
+        self.embedding = nn.Embedding(num_virtual_tokens, embedding_dim)
+        
+        # 2. KEY POINT: LSTM Reparameterization (Bi-directional)
+        self.lstm = nn.LSTM(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True
+        )
+        
+        # 3. MLP Projection Head
+        self.mlp_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, embedding_dim)
+        )
+
+    def forward(self):
+        # Generate the continuous embeddings for the prompt
+        indices = torch.arange(self.embedding.num_embeddings).unsqueeze(0).to(self.embedding.weight.device)
+        input_embeds = self.embedding(indices) # [1, tokens, dim]
+        
+        # Pass through LSTM to establish token relationships
+        output, _ = self.lstm(input_embeds)
+        
+        # Project back to model dimension
+        prompt_embeddings = self.mlp_head(output)
+        return prompt_embeddings
+
+# --- Usage Logic ---
+# To train:
+# 1. Get original embeddings of X: inputs_embeds = model.embeddings(input_ids)
+# 2. Get prompt embeddings: prompt_embeds = encoder()
+# 3. Concatenate: full_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
+# 4. Pass full_embeds to the frozen model.
+```
+
+P-Tuning v2 example code:
+```python
+class PTuningV2Prompt(nn.Module):
+    def __init__(self, num_layers, num_virtual_tokens, hidden_size):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_virtual_tokens = num_virtual_tokens
+        self.hidden_size = hidden_size
+        
+        # KEY POINT: Independent parameters for EVERY layer
+        # Each layer needs a set of Key and Value vectors
+        # Shape: [num_layers, 2 (K and V), num_tokens, hidden_size]
+        self.prompt_parameters = nn.Parameter(
+            torch.randn(num_layers, 2, num_virtual_tokens, hidden_size)
+        )
+
+    def forward(self, batch_size):
+        # Expand for the current batch size
+        # Result shape: [num_layers, batch_size, 2, num_heads, tokens, head_dim]
+        # (Note: Requires reshaping based on the specific model's head count)
+        prompts = self.prompt_parameters.unsqueeze(1).expand(-1, batch_size, -1, -1, -1)
+        
+        # Construct the 'past_key_values' structure for HuggingFace models
+        past_key_values = []
+        for i in range(self.num_layers):
+            # Extract Key and Value for this specific layer
+            layer_k_v = (prompts[i, :, 0], prompts[i, :, 1])
+            past_key_values.append(layer_k_v)
+            
+        return tuple(past_key_values)
+
+# --- Usage Logic ---
+# model = AutoModel.from_pretrained(name)
+# freeze_model(model) # Set requires_grad=False
+# p_v2 = PTuningV2Prompt(config.num_layers, 100, config.hidden_size)
+#
+# outputs = model(input_ids=input_ids, past_key_values=p_v2(batch_size))
+```
+**Advantages**
+- High Parameter Efficiency: Unlike traditional methods that require updating the entire model, P-tuning only requires training a small number of prompt vector parameters. This significantly reduces the computational overhead and resources needed for fine-tuning.
+
+- Better Task Adaptability: Because P-tuning uses continuous prompt vectors, its representational power is much stronger than manually designed "hard" (discrete) prompts. This allows the model to adapt to different tasks with much higher flexibility.
+  
+- Broad Versatility: It is not limited to a single type of task. It can be applied effectively across a wide range of Natural Language Processing (NLP) scenarios, including classification, sequence labeling, and content generation.
+
+**Disadvantages**
+- Critical Prompt Length Selection: The performance of P-tuning is highly sensitive to the length of the prompt vector. Finding the "optimal length" requires significant manual tuning, and what works for one task may not work for another.
+  
+- Dependency on Task Data: The effectiveness of P-tuning is heavily tied to the specific data of the task. In certain highly specialized or complex scenarios, P-tuning may still underperform compared to Full Parameter Fine-Tuning, as it cannot modify the model's internal weights.
+
 #### 4.1.4.6 Adapter Tuning
+
+Adapter Tuning is a highly effective method within the Parameter-Efficient Fine-Tuning (PEFT) family. Its primary goal is to adapt massive pre-trained models to specific downstream tasks without the massive computational and storage costs associated with "Full Fine-Tuning." Instead of modifying the model's original "knowledge" (its weights), Adapter Tuning inserts small, trainable modules into the existing architecture.
+
+The logic of Adapter Tuning is straightforward:
+1. Freeze the Base Model: Every original weight in the Transformer layers is locked.
+2. Insert Adapters: Small, task-specific "Adapter" modules are inserted into every layer of the model.
+3. Train Only the Adapters: During fine-tuning, the gradients only update the Adapter parameters, the LayerNorm layers, and the final classification Head.
+
+The Adapter module itself is designed to be extremely "lean" using a bottleneck structure. It consists of four main parts:
+1. Down-Projection ($W_{down}$): It takes the high-dimensional input (dimension $d$) and projects it down to a much lower dimension ($m$). Usually, $m \ll d$. This is the key to reducing the parameter count.
+2. Non-linearity: A non-linear activation function (like ReLU or GeLU) is applied to help the model learn complex patterns.
+3. Up-Projection ($W_{up}$): The low-dimensional features are projected back up to the original dimension ($d$).
+4. Skip Connection (Residual): The original input $h$ is added back to the output of the up-projection.
+
+The Mathematical Formula:
+
+$$h \leftarrow h + f(hW_{down})W_{up}$$
+
+Skip Connection ensures that even if the Adapter's weights are initialized near zero, the model still functions as an "identity mapping" (the original information passes through unchanged). This provides immense training stability.
+
+Based on the research, each Transformer layer typically receives two Adapter modules:
+
+- Location 1: Inserted immediately after the Multi-Head Attention projection.
+- Location 2: Inserted immediately after the second Feed-Forward (FFN) layer.
+
+By placing them here, the Adapters can "intercept" and refine the most critical information-processing steps of the Transformer.
+
+Adapter Tuning adds only 0.5% to 5% of the original model's parameter count. Despite the tiny footprint, it achieves performance within 1% of a full fine-tuning model. Since you only save the Adapters, task-specific files are tiny, making it easy to store dozens of "specialized" models for one base model. It allows for rapid transfer of capabilities to new downstream tasks and cross-domain applications.
+
+<p align="center">
+<img width="272" height="202" alt="80c535dd-6b84-42f1-8aa2-67278d8e49ec" src="https://github.com/user-attachments/assets/f674d7f1-ac1c-4d34-95f3-8c6ef6973795" />
+</p>
+
+The Houlsby Adapter is the "classic" design. It treats the adapter as a series of checkpoints that the data must pass through inside each Transformer layer. It inserts two adapter modules into every single Transformer block. In standard setups, this adds about 3.6% to the model's total parameters per task. By placing adapters in these "serial" locations, the model forces the information to be refined and transformed at the most critical points of the layer’s logic.
+
+Unlike the Houlsby version, the Parallel Adapter doesn't wait in line. It works side-by-side with the main model layers. The adapter is treated as a parallel sub-network that runs at the same time as the Transformer layer. Instead of the layer feeding into the adapter, both paths produce outputs independently. These outputs are then merged using weighted averages or summation. This often leads to smoother training and can be more efficient for certain hardware parallelizations, as the adapter doesn't "block" the main computation path.
+
+If the 3.6% parameter increase of a Houlsby adapter is still too much, the Compacter is the solution. It is a hyper-optimized variant designed to reduce the adapter's own storage footprint. The Compacter borrows a trick from LoRA. It breaks down the internal weight matrices ($W_{up}$ and $W_{down}$) into the product of even smaller, low-rank matrices. By using this decomposition, the Compacter can achieve the same performance as a standard adapter while training a significantly smaller fraction of parameters (often under 0.1%).
+
+AdapterFusion is an advanced architectural framework designed to integrate knowledge from multiple tasks into a single model without the negative side effects of traditional training methods. It builds upon standard Adapter Tuning to provide a "non-destructive" way to combine expertise across different domains. Traditional methods for integrating knowledge from multiple tasks (Multi-task Learning) face several critical bottlenecks:
+- Sequential Fine-tuning: Training a model on Task A then Task B. This often requires knowing the "perfect" order of tasks beforehand and carries a high risk of Catastrophic Forgetting (losing knowledge of Task A while learning Task B).
+- Multi-task Learning (MTL): Training on all tasks simultaneously. This is difficult to balance because different tasks can interfere with each other, especially if datasets vary greatly in size.
+- The Adapter Solution: Standard Adapter Tuning solves the forgetting problem by using task-specific modules, but it doesn't have a built-in way to let Task B "borrow" useful information from the Adapter already trained for Task A.
+
+AdapterFusion was created to bridge this gap, allowing a model to dynamically identify and combine the most relevant knowledge from various task adapters. AdapterFusion splits the learning process into two distinct phases to ensure stability and efficiency.
+
+1. Stage 1: Knowledge Extraction. In this stage, the model focuses on learning individual tasks in isolation. There are two training options. For Single-Task Adapters (ST-A), task-specific Adapter modules are inserted into the pre-trained model for each of the $N$ tasks. For Multi-Task Adapters (MT-A), multiple tasks are optimized jointly via multi-task learning.
+
+2. Stage 2: Knowledge Composition (The Fusion Phase). Once the task-specific adapters are trained, they are "fused" together to solve a target task $m$. The parameters of the pre-trained model and the parameters of the $N$ adapters from Stage 1 are completely frozen. A new set of parameters, called AdapterFusion, is introduced to learn how to combine the $N$ adapters. The goal is to learn a parameterized "mixer" that determines which adapters are most useful for the current input context.
+
+The core of AdapterFusion is an Attention mechanism that acts as a dynamic selector. It is placed above the adapters within each Transformer layer. AdapterFusion uses the relationship between the model's current state and the adapter outputs to decide weighting:
+- Query ($Q$): This is the output of the pre-trained Transformer’s internal sub-modules (like the Feed-Forward or Attention layer). It represents the "current context."
+- Key ($K$) and Value ($V$): These are derived from the outputs of the $N$ task-specific adapters.
+The model calculates a dot product between the Query and all the Keys. This is passed through a SoftMax function to generate weights. The model assigns high weights to the adapters that are most relevant to the current input, aggregating the info into a single optimized representation.
+
+<p align="center">
+<img width="217" height="293" alt="649266c7-eff6-4998-bd7a-8c03478d0fc0" src="https://github.com/user-attachments/assets/4e79f894-5ee7-4fe1-846a-b5558ea1f47a" />
+<img width="250" height="270" alt="d799cfef-2e10-4c15-a71c-a50731fa8c8f" src="https://github.com/user-attachments/assets/d558c8c4-e3e3-48dd-8653-15aaf06b4cef" />
+</p>
+
+Comparative experiments show that AdapterFusion outperforms both Full Fine-tuning and standard Adapter Tuning in most scenarios. By splitting training into Knowledge Extraction and Knowledge Composition, it effectively solves the issues of catastrophic forgetting, inter-task interference, and training instability. It allows for a shared multi-task structure where adapters can be reused and combined as needed for new tasks.
+
+While powerful, AdapterFusion also has disadvantages. Adding multiple adapters and the fusion layer increases the total parameter count of the model. Because the model must process multiple adapters and a fusion attention layer for every token, it decreases model inference performance (speed/efficiency) compared to a single-task model.
+
+While standard Adapters are revolutionary for training, they come with a hidden cost:
+
+- The Training Win: Adapters are 60% faster during training than full fine-tuning because they update so few parameters.
+
+- The Inference Loss: Because you are adding extra layers to the model, adapters actually make the model 4% to 6% slower during inference (forward pass).
+
+To dynamically and efficiently remove adapters to reduce the parameter count and increase efficiency in both the backward pass (training) and the forward pass (inference), all without affecting task performance.
+
+AdapterDrop uses two distinct methods to "slim down" the model depending on the architecture. 
+
+1. Layer-wise Dropping (Removing Layers). This strategy focuses on the vertical depth of the Transformer. Research shows that not every layer needs an adapter to maintain high performance. By dropping adapters from the first five Transformer layers while performing inference on 8 tasks, researchers saw a 39% increase in speed. Even with multiple layers dropped, the model maintains good performance/results, proving that deep layers often carry the heavy lifting for task-specific logic.
+
+2. AdapterFusion Pruning (Removing Breadth). When using AdapterFusion (which combines multiple task-specific adapters), the model can become very heavy because it’s looking at many adapters at once. Consider pruning most of the adapters within the Fusion layer. Experiments showed that using only two remaining adapters achieved results comparable to a full AdapterFusion model using eight adapters. This specific pruning method increased inference speed by 68%.
+
+The technical materials emphasize a clear takeaway for AI engineers: Perform AdapterFusion pruning before actually deploying these models. It is a simple but highly effective technique that allows you to realize massive efficiency gains and hardware savings while fully maintaining the performance of the original, more complex model. AdapterDrop turns adapters from a "training-only" benefit into a lean, mean inference machine, making them viable for high-traffic, real-world applications where every millisecond of latency counts.
+
+The MAM Adapter (short for Mix-And-Match Adapter) represents a sophisticated "unified" approach to Parameter-Efficient Fine-Tuning (PEFT). Instead of viewing methods like LoRA, Prefix Tuning, and Adapters as competing tools, the MAM architecture treats them as building blocks that can be decomposed and recombined into a single, high-performance framework. Engineers often wonder why different methods like Adapter, Prefix Tuning, and LoRA—which look structurally and mathematically different—often yield very similar results. The authors of the MAM Adapter research analyzed these methods and decomposed them into four design dimensions:
+- Functional Form: The specific math used (e.g., bottleneck layers).
+- Insertion Form: Whether the module is Sequential (one after another) or Parallel (working side-by-side).
+- Modified Representation: Which specific part of the model is being changed.
+- Composition Function: How the new weights are merged back into the original model's output.
+
+Before building the MAM Adapter, researchers performed "Ablation Studies" to see which specific placements worked best. They discovered two critical rules:
+- Parallel > Sequential: Adding an adapter in parallel (working simultaneously with the main layer) is more effective than the standard Houlsby-style sequential approach.
+- Feed-Forward Networks (FFN) are the best place for Parallel Adapters.
+- Attention Mechanisms (MHA) are most effectively modified by Soft Prompts (Prefix Tuning).
+
+The final MAM Adapter is not just one module, but a dual-layered upgrade to the Transformer block. It "mixes and matches" the two most efficient sub-methods found during the study:
+- Prefix Tuning (Soft Prompts): These are used to modify the Attention (MHA) layers. This is extremely parameter-efficient, requiring only about 0.1% of additional parameters to steer the model's focus.
+- Parallel Adapters: These are attached specifically to the Feed-Forward Network (FFN). Research proved that modifying the FFN via a parallel bottleneck is the most powerful way to "update" the model's internal knowledge during fine-tuning.
+
+The MAM Adapter is designed to maximize the "Accuracy-to-Parameter" ratio. In tasks like XSum (text summarization) and MT (machine translation), MAM achieves results that are nearly identical to Full Fine-Tuning (achieving a ROUGE-2 score of 21.90 vs. Full FT's 21.94). It achieves this high-tier performance using only 6.7% of the parameters required by full fine-tuning. 
 #### 4.1.4.7 LoRA 
 #### 4.1.4.8 QLoRA
 #### 4.1.4.9 xLoRA
