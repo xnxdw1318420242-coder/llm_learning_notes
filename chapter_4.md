@@ -862,6 +862,7 @@ QLoRA is strictly designed for model deployment and training in limited hardware
 <p align="center">
 <img width="517" height="212" alt="98670416-9984-46ff-8814-8935d1243f41" src="https://github.com/user-attachments/assets/c616667d-2c94-4053-83ff-9172f48cbe59" />
 </p>
+
 #### 4.1.4.9 AdaLoRA
 
 AdaLoRA (Adaptive Low-Rank Adaptation) is a highly optimized, "smart" evolution of the standard LoRA method. While traditional LoRA is efficient, it applies a "one-size-fits-all" approach to a model's architecture. AdaLoRA fixes this by dynamically distributing your computational budget to the parts of the model that need it most. 
