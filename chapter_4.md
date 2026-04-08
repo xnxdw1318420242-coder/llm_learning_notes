@@ -721,7 +721,170 @@ The final MAM Adapter is not just one module, but a dual-layered upgrade to the 
 
 The MAM Adapter is designed to maximize the "Accuracy-to-Parameter" ratio. In tasks like XSum (text summarization) and MT (machine translation), MAM achieves results that are nearly identical to Full Fine-Tuning (achieving a ROUGE-2 score of 21.90 vs. Full FT's 21.94). It achieves this high-tier performance using only 6.7% of the parameters required by full fine-tuning. 
 #### 4.1.4.7 LoRA 
+
+In the era of Large Language Models (like GPT-3 or Llama), models possess billions of parameters. When we want to teach these models a specific new task, the traditional approach is Full Fine-Tuning—updating every single weight in the model. This requires an enormous amount of computational power, GPU memory, and storage (because you have to save a massive new model file for every single task). Researchers discovered that heavily over-parameterized models actually reside in a low "intrinsic dimension" (intrinsic rank). This means that when a model learns a new task, the actual, meaningful changes to the weights are highly redundant and don't require updating the full matrix. You can achieve the same learning in a much smaller mathematical subspace.
+
+LoRA's central idea is to simulate the massive weight changes of fine-tuning using Low-Rank Matrix Decomposition.Instead of directly modifying the original pre-trained weight matrix ($W$), LoRA does the following:
+1. Freezes the Base Model: The original pre-trained weights ($W \in \mathbb{R}^{d \times k}$) are completely locked and do not change.
+
+2. Adds a "Bypass" (Delta Matrix): LoRA introduces a weight update matrix ($\Delta W$) that runs parallel to the original weights.
+
+3. Decomposes the Update: To save parameters, $\Delta W$ is decomposed into the product of two much smaller matrices: $A$ and $B$. $B \in \mathbb{R}^{d \times r}$ (A down-projection matrix). $A \in \mathbb{R}^{r \times k}$ (An up-projection matrix). $r$ is the Rank, and it is significantly smaller than the original dimensions ($r \ll d, k$).
+
+During training, the forward pass becomes:
+
+$$h = Wx + \Delta Wx = Wx + BAx$$
+
+Instead of updating $d \times k$ parameters, you only update $(d \times r) + (r \times k)$ parameters. This drastically reduces the parameter count, saving massive amounts of memory and time.
+
+How matrices $A$ and $B$ are initialized before training begins is one of the most critical parts of LoRA's success. Matrix B is initialized to all Zeros. Matrix A is initialized with a Random Gaussian Distribution ($N(0, \sigma^2)$). If $B = 0$, then $B \times A = 0$. This means at step zero of training, $\Delta W = 0$, and the model outputs exactly what the original pre-trained model ($W$) would output. This provides immense stability:
+- Protects Pre-trained Knowledge: It ensures the model's foundational capabilities aren't instantly destroyed.
+- Gradual Adjustment: It allows the new weights to ease into the model rather than causing massive, disruptive fluctuations early on.
+- Gradient Safety: It minimizes the risk of exploding or vanishing gradients at the start of training.
+
+If both were zero, the gradients for both would be zero, and the model wouldn't learn anything (the "symmetry problem"). Initializing $A$ randomly:
+- Breaks Symmetry: It gives the model multiple distinct mathematical "directions" to explore during optimization.
+- Provides Effective Gradients: Since the gradient of $B$ depends on $A$ (and vice versa), having $A$ be non-zero ensures $B$ receives a gradient immediately to kickstart the learning process.
+- Increases Representation Power: It helps the low-rank matrix capture more complex feature combinations.
+
+In practice, the $\Delta W$ update is multiplied by a scaling factor: $\frac{\alpha}{r}$. So the final formula is: $h = Wx + \frac{\alpha}{r}(BAx)$
+- $\alpha$ (Alpha) is a hyperparameter you set to control how much influence the new LoRA weights have on the final output.
+- If $\frac{\alpha}{r}$ is too large, the LoRA weights overpower the base model, leading to overfitting.
+- If $\frac{\alpha}{r}$ is too small, the LoRA weights barely do anything, and the fine-tuning effect is unnoticeable.
+
+When setting up a training run, a common and safe practice is to set $\alpha$ to be exactly twice the value of $r$ (e.g., if $r=8$, $\alpha=16$).
+
+Choosing the right $r$ is crucial, but more isn't always better. $r = 4$, $8$, or $16$ is usually more than enough. The research shows that simply increasing $r$ does not necessarily capture a more meaningful subspace; a low-rank matrix is sufficient. However, applying the technique to various weight matrices might yield better results. Experiments definitively prove that applying LoRA to the $W_q$ (Query) and $W_v$ (Value) matrices inside the Transformer's Attention layers produces the absolute best results. Simple tasks need a smaller $r$; highly complex tasks need a larger $r$. A stronger, smarter base model requires a smaller $r$ (and less training data) to learn a new task. If you are training on a massive dataset, you generally need a larger $r$ to absorb all that new information.
+
+<p align="center">
+<img width="337" height="308" alt="86ba839d-31bc-4071-aaec-71bd00c54ae6" src="https://github.com/user-attachments/assets/2ab1a4d1-b239-4e5a-9790-56026ec48e6d" />
+
+</p>
+
+Below is a summary of the advantages for LoRA.
+
+- Zero Inference Latency: After training is complete, you can mathematically add $BA$ directly into the original $W$ matrix ($W_{new} = W + BA$). During deployment (inference), the architecture is identical to the original model, meaning it doesn't run a single millisecond slower.
+
+- High Parameter Efficiency: You achieve performance matching Full Fine-Tuning while only updating a tiny fraction of the parameters.
+
+- Frozen Base Model: Because $W$ is never altered, you can train multiple different LoRA modules (one for coding, one for translation, one for math) and seamlessly swap them in and out on top of the same frozen base model.
+
+- Strong Universality: It isn't restricted to a specific architecture; it can be applied to almost any dense layer in various Transformer models.
+
+Example code:
+```python
+import torch
+import torch.nn as nn
+import math
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=8, lora_alpha=16):
+        super().__init__()
+        
+        # 1. The Original Pre-trained Layer (W)
+        self.base_layer = nn.Linear(in_features, out_features)
+        
+        # FREEZE the base model weights
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+
+        # 2. LoRA Hyperparameters
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = self.lora_alpha / self.r # The scaling coefficient
+
+        # 3. The LoRA Low-Rank Matrices (A and B)
+        # Matrix A: Projects down from input dimension to rank 'r'
+        self.lora_A = nn.Linear(in_features, r, bias=False)
+        # Matrix B: Projects up from rank 'r' to output dimension
+        self.lora_B = nn.Linear(r, out_features, bias=False)
+
+        # 4. Apply Initialization Rules
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """
+        The critical initialization step to ensure stability at step 0.
+        """
+        # Initialize A with a random Gaussian/Uniform distribution
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        
+        # Initialize B with absolute ZEROS
+        # This guarantees that lora_B(lora_A(x)) == 0 when training starts
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        # Calculate the frozen base output: Wx
+        base_output = self.base_layer(x)
+        
+        # Calculate the LoRA delta update: BAx * (alpha/r)
+        lora_output = self.lora_B(self.lora_A(x)) * self.scaling
+        
+        # Final output is the sum of both paths
+        return base_output + lora_output
+
+# --- Testing the Layer ---
+# Create a simulated attention layer with input dim 1024, output dim 1024
+layer = LoRALinear(in_features=1024, out_features=1024, r=8, lora_alpha=16)
+
+# Notice how the number of trainable parameters is tiny!
+# W matrix: 1024 * 1024 = 1,048,576 parameters (FROZEN)
+# A matrix: 1024 * 8 = 8,192 parameters (TRAINABLE)
+# B matrix: 8 * 1024 = 8,192 parameters (TRAINABLE)
+```
+
 #### 4.1.4.8 QLoRA
-#### 4.1.4.9 xLoRA
-#### 4.1.4.10 AdaLoRA
+
+QLoRA (Quantized Low-Rank Adaptation) is the ultimate memory-saving evolution of the LoRA technique. While standard LoRA is incredibly efficient, QLoRA takes it a step further by drastically compressing the frozen base model, allowing you to train massive models on consumer-grade hardware. The primary goal of quantization is to compress high-precision weights into a lower precision (like 4-bit) to save space. Standard 4-bit quantization scales weights using this formula:
+
+$$W_q = \text{round}\left(\frac{W - W_{min}}{W_{max} - W_{min}} \cdot (2^4 - 1)\right)$$
+
+This maps all weights into 16 discrete integer bins (from 0 to 15). However, this standard method is not ideal for neural networks.
+
+Neural network weights typically follow a zero-centered normal distribution with a standard deviation of $\sigma$. NormalFloat (NF) is an information-theoretically optimal data type that ensures every quantization bin contains an equal number of values, preventing data loss.
+
+1. Normalization: The theoretical normal distribution $N(0,1)$ is scaled to fit precisely within a $[-1, 1]$ range.
+2. Asymmetric Splitting: To handle the zero-center perfectly, NF4 splits the distribution asymmetrically using $2^{k-1}$ quantiles for each half. It divides the negative range $[-1, 0]$ into 8 parts and the positive range $[0, 1]$ into 9 parts.
+3. Merging: This creates 17 boundaries, but since zero appears in both sets, they are merged (removing the duplicate zero) to leave exactly 16 unique quantiles.
+4. Mathematical Calculation: The exact boundaries ($q_i$) are calculated using the quantile function $Q_X(\cdot)$ of the standard normal distribution:
+
+$$q_i = \frac{1}{2}\left(Q_X\left(\frac{i}{2^k+1}\right) + Q_X\left(\frac{i+1}{2^k+1}\right)\right)$$
+
+By matching the distribution of the model's weights to this mathematically optimal NF4 range, QLoRA preserves the model's accuracy far better than standard linear quantization.
+
+Even when model weights are reduced to 4-bit, the system still needs to save quantization constants (scaling factors) for every block of weights so it knows how to de-quantize them later. In QLoRA, weights are processed in blocks of 64. If each block requires a 32-bit float (float32) constant, the memory overhead adds up quickly, costing an average of 0.5 bits per parameter just for the constants. QLoRA applies a second round of quantization. It groups every 256 quantization constants together and quantizes them from 32-bit floats down to 8-bit. By quantizing the constants themselves, the extra memory overhead is slashed down to a mere 3.17%, squeezing out even more VRAM savings. (Note: Because it is doubly quantized, the model must undergo a two-step de-quantization process during the forward pass to restore the values).
+
+When fine-tuning large models, sudden spikes in memory (especially during the optimizer's gradient update step) can cause devastating Out-Of-Memory (OOM) errors that crash your training. QLoRA utilizes NVIDIA's unified memory feature to create a safety net. Similar to how a computer uses a hard drive for "pagefiles" when its standard RAM is full, QLoRA automatically transfers optimizer data from the GPU RAM to the CPU RAM when the GPU is running out of space. When the GPU needs that data back for the next update step, it is seamlessly paged back into the GPU memory. This ensures the training process is crash-proof, even in tightly constrained hardware environments. 
+
+QLoRA is strictly designed for model deployment and training in limited hardware environments. If you only have consumer-grade GPUs or even CPU environments, QLoRA makes it possible to run and adapt massive foundation models at 4-bit precision. It drastically lowers memory consumption through its advanced quantization (NF4 + Double Quantization) while maintaining high task performance by leveraging the adaptability of LoRA. It effectively democratizes large language models, breaking down the hardware barriers that previously restricted their use to massive data centers.
+
+<p align="center">
+<img width="517" height="212" alt="98670416-9984-46ff-8814-8935d1243f41" src="https://github.com/user-attachments/assets/c616667d-2c94-4053-83ff-9172f48cbe59" />
+</p>
+#### 4.1.4.9 AdaLoRA
+
+AdaLoRA (Adaptive Low-Rank Adaptation) is a highly optimized, "smart" evolution of the standard LoRA method. While traditional LoRA is efficient, it applies a "one-size-fits-all" approach to a model's architecture. AdaLoRA fixes this by dynamically distributing your computational budget to the parts of the model that need it most. 
+
+Standard LoRA requires you to pre-define a fixed rank ($r$) that is applied uniformly across every targeted weight matrix in the model. This ignores the reality that different modules and layers have vastly different levels of importance during fine-tuning. For example, standard LoRA typically only trains the Attention modules and ignores the Feed-Forward Networks (FFN). However, research shows that the FFN is actually often more important for storing and adapting task-specific knowledge. Instead of a rigid assignment, AdaLoRA acts like a smart financial manager. It calculates an "importance score" for each weight matrix and adaptively allocates the parameter budget across them.
+
+AdaLoRA achieves this dynamic allocation through two major technical shifts. One is adjusting the incremental matrix allocation. Crucial matrices receive a high rank to capture fine-grained, highly specific task information. Less important matrices have their rank reduced (pruned). This not only saves computational budget but also actively prevents the model from overfitting on unimportant features. The other shift is parameterization via SVD (Singular Value Decomposition). Instead of just using two generic matrices ($A$ and $B$), AdaLoRA parameterizes the weight updates using the form of SVD:
+
+$$W = W^{(0)} + \Delta = W^{(0)} + P \Lambda Q$$
+
+Calculating exact SVD for massive matrices at every training step is computationally disastrous. AdaLoRA avoids this by adding an extra penalty term to the training loss. This penalty enforces the orthogonality of matrices $P$ and $Q$ automatically, stabilizing the training without the heavy math. It actively prunes (cuts out) the unimportant singular values inside $\Lambda$ based on their importance metrics, while keeping the singular vectors intact so the model can still recover and learn stably.
+
+To figure out which layers deserve a higher rank, AdaLoRA uses the gradient information (how much the model wants to change a layer) to adjust the rank dynamically. It uses the Frobenius norm of the gradients to calculate this:
+
+$$\Delta r = \alpha \frac{||\nabla W||_F}{\sum_{i=1}^L ||\nabla W_i||_F}$$
+
+- $\Delta r$: The exact amount the rank $r$ should be adjusted for a specific layer.
+- $\alpha$: An adjustment coefficient (a hyperparameter) that controls the scale/ratio of the change.
+- $||\nabla W||_F$: The Frobenius norm of the weight's gradient at that specific layer. It measures the absolute "degree of update" happening in that layer during the current training step.
+- $\sum_{i=1}^L ||\nabla W_i||_F$: The sum of the gradient Frobenius norms across all layers. This normalizes the score so that layers are judged relative to one another.
+
+Layers with highly complex updates get larger ranks, while quieter, less complex layers are restricted to smaller ranks.
+
+AdaLoRA provides highly efficient, fine-grained adaptation for specific downstream tasks on massive pre-trained foundations. By dynamically adjusting the rank, it entirely eliminates "resource waste." It guarantees that every single trainable parameter is doing heavy lifting, preserving the model's powerful performance while shrinking the footprint. 
+
 ## 4.2 Reinforcement Learning in LLM 
