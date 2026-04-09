@@ -176,5 +176,14 @@
 * **4.1.2 Training Strategy**
 * **4.1.3 Multi-Turn Dialogue**
 * **4.1.4 PEFT**
-  
+    * **4.1.4.1 BitFit**
+    * **4.1.4.2 Hard Prompt Tuning**
+    * **4.1.4.3 Prefix Tuning**
+    * **4.1.4.4 Soft Prompt Tuning**
+    * **4.1.4.5 P-Tuning V1 & V2**
+    * **4.1.4.6 Adapter Tuning**
+    * **4.1.4.7 LoRA**
+    * **4.1.4.8 QLoRA**
+    * **4.1.4.9 AdaLoRA**
+
 **4.2 Reinforcement Learning in LLM**
