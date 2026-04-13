@@ -889,3 +889,29 @@ Layers with highly complex updates get larger ranks, while quieter, less complex
 AdaLoRA provides highly efficient, fine-grained adaptation for specific downstream tasks on massive pre-trained foundations. By dynamically adjusting the rank, it entirely eliminates "resource waste." It guarantees that every single trainable parameter is doing heavy lifting, preserving the model's powerful performance while shrinking the footprint. 
 
 ## 4.2 Reinforcement Learning in LLM 
+
+Reinforcement Learning (RL) is essentially the "trial-and-error" branch of AI. It’s about teaching an agent how to behave in an environment to maximize rewards. Think of it as training a digital athlete: it doesn't just learn from a static textbook; it learns by actually playing the game.
+
+RL isn't just for simple tasks; it is specifically designed for multi-step sequential decision-making problems. These are situations where an action taken now might not show its true value until many steps later. Key real-world applications include:
+- Games: Competitive strategy games like AlphaGo.
+
+- Physical Systems: Autonomous driving and robot operation control.
+
+- Digital Strategies: Online interaction strategies for recommendation systems.
+
+RL excels in these areas because it can self-adapt through trial-and-error interaction, even when the environment’s probability transition model is unknown or when the dimensions of possible "states" and "actions" are massive. Algorithms in Reinforcement Learning are broadly divided into two categories based on how they view the "world" around them: Model-Free Learning and Model-Based Learning. Model-Free Learning is the most common and "simple" approach. The agent doesn't try to understand the hidden laws of physics or the "why" behind the environment. Instead, it just reacts to what it sees. It doesn't build a mental map (model) of the environment. It focuses on direct optimization of policies or value functions through repeated sampling from the real world. It is simple to implement and highly applicable to complex real-world scenarios where the environment is too messy to model. Model-Based Learning is more "cerebral." The agent tries to build a internal simulation of the world. It first learns or assumes a transition distribution $P(s' | s, a)$—meaning it tries to predict what the next state ($s'$) will be given its current state ($s$) and action ($a$). It then uses this "virtual environment" to plan or simulate future moves. It is excellent for planning future decisions before actually taking them. Its performance is strictly capped by the quality of its model. If the "virtual environment" doesn't match the real environment, the agent's performance will be poor.
+
+In large-scale real environments where every action has a huge impact on the future, choosing between these two methods involves a trade-off between the simplicity of Model-Free sampling and the strategic planning of Model-Based simulation.
+
+<p align="center">
+<img width="813" height="404" alt="0d9035e1-6c90-487b-a0ad-81784f7eaef1" src="https://github.com/user-attachments/assets/a7c64a17-7acc-43f7-ac67-99361b1848c9" />
+</p>
+
+Or, RL algorithms can also be broadly classified based on how the agent learns to make decisions. We can break down the field into three primary methodologies: Value-Based, Policy-Based, and the hybrid Actor-Critic.
+
+- Value-Based Methods: "Calculating the Worth". The core philosophy here is to assign a specific "Value" to every possible action in a given state. For every State, the agent calculates a "Value" for every feasible Action. It then follows a simple rule: choose the action with the highest Value. These values are updated and iterated using the Bellman Equation. This equation is critical because it balances immediate rewards with long-term future gains. Representative algorithms include Q-Learning and SARSA (State-Action-Reward-State-Action). Best use cases include situations where you have a set list of moves (e.g., Pacman moving Up, Down, Left, or Right), or when the final goal is to always perform the same "best" action in a specific state.
+
+- Policy-Based Methods: "Learning the Strategy". Instead of calculating values for actions, these methods model the Policy ($\pi$) directly. The agent learns a probability distribution of actions. For a given state, it doesn't say "Action A is worth 10 points"; it says "There is a 70% chance Action A is the best move." The agent interacts with the environment and uses Gradient updates to optimize the strategy, aiming to maximize the expected total return. Representative algorithms include Policy Gradient (PG) series. Best use cases include scenarios where actions aren't simple buttons, but fluid movements (e.g., the precise rotation angle of a robot's joint), and situations where you need to be random to be optimal (e.g., in Rock-Paper-Scissors, the best strategy is a random 1/3 split for each move).
+
+- Actor-Critic: The Best of Both Worlds. This is the most modern and popular approach in Deep Reinforcement Learning because it combines the strengths of the previous two methods. The Actor is responsible for learning the policy (deciding which actions to take).
+## 4.2.1 Markov Decision Process
