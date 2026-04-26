@@ -1026,5 +1026,238 @@ While Dynamic Programming is mathematically elegant, it has strict limitations t
 - Real-World Rarity: The biggest limitation of DP is that perfect "white-box" environments almost never exist in complex real-world scenarios. You rarely know all the exact probabilities of how the world will react to an action.
 - Size Limits: Furthermore, Policy Iteration and Value Iteration are generally only applicable to finite Markov Decision Processes. This means the total number of possible states and actions must be discrete and strictly limited.
 
-### 4.2.3.1 Policy Iteration
-### 4.2.3.2 Value Iteration
+#### 4.2.3.1 Policy Iteration
+Policy Iteration is a core Dynamic Programming algorithm used to find the absolute best strategy in a Reinforcement Learning environment. 
+
+1. Phase 1: Policy Evaluation
+
+Before you can improve a policy ($\pi$), you need to know exactly how good it is. Policy Evaluation calculates the precise State-Value Function ($V^\pi(s)$) for every state under the current policy. It uses the Bellman Expectation Equation. Because we are using dynamic programming, we break the problem down. We calculate the value of a state in the current round ($k+1$) by looking at the values of all possible next states from the previous round ($k$).
+
+$$V^{k+1}(s) = \sum_{a \in A} \pi(a|s) \left( r(s,a) + \gamma \sum_{s' \in S} P(s'|s,a)V^k(s') \right)$$
+
+You can start with any arbitrary values for $V^0$ (usually all zeros). As $k \to \infty$, the sequence of values will eventually stabilize and converge perfectly to $V^\pi$. Mathematically, $V^\pi$ is a fixed point of this update equation. 
+
+Calculating to absolute infinity is too computationally expensive. In practice, we set a tiny threshold ($\theta$). If the maximum change in value between rounds ($\max |V^{k+1}(s) - V^k(s)|$) is smaller than $\theta$, we stop early. This saves massive compute time while providing a value that is practically identical to the true value.
+
+2. Phase 2: Policy Improvement
+
+Now that you know exactly what your current policy is worth ($V^\pi(s)$), it is time to make a better policy ($\pi'$). To do this, we calculate the Action-Value ($Q^\pi(s,a)$)—which answers: "What if I break my current rule just for this one step, take action $a$, and then go back to following my old policy?" If taking action $a$ yields a higher expected return than simply following the old policy (i.e., $Q^\pi(s,a) > V^\pi(s)$), then action $a$ is objectively a better choice. The Policy Improvement Theorem proves that if we greedily pick the action that maximizes the $Q$ value for every single state, the new policy $\pi'$ is guaranteed to be better than or equal to the old policy $\pi$.
+
+We update the policy by always picking the single best action mathematically available:
+
+$$\pi'(s) = \arg\max_{a} \left( r(s,a) + \gamma \sum_{s' \in S} P(s'|s,a)V^\pi(s') \right)$$
+
+3. The Full Algorithm Workflow
+
+Policy Iteration is simply gluing these two phases together into a continuous while loop until perfection is reached.
+
+- Initialize: Start with a completely random policy ($\pi^0$) and arbitrary state values.
+- Evaluate: Run Policy Evaluation to calculate $V^{\pi^0}$.
+- Improve: Use $V^{\pi^0}$ to greedily create a new, better policy $\pi^1$.
+- Repeat: Evaluate $\pi^1$, create $\pi^2$, and so on.
+  
+$$\pi^0 \to V^{\pi^0} \to \pi^1 \to V^{\pi^1} \to \pi^2 \to \dots \to \pi^*$$
+
+- Termination: During the Improvement phase, we check if the new greedy policy ($\pi_{old}$) is identical to the one we just evaluated ($\pi$). If the policy doesn't change, the algorithm has converged, and we have definitively found the optimal policy.
+
+Example code:
+```python
+import numpy as np
+
+def policy_evaluation(policy, env, discount_factor=0.99, theta=1e-9):
+    """
+    Phase 1: Evaluate a policy to find its State-Value Function V(s).
+    """
+    # Initialize state values to zero
+    V = np.zeros(env.nS)
+    
+    while True:
+        delta = 0
+        # Iterate over every state
+        for s in range(env.nS):
+            v_new = 0
+            # Look at the probability of taking each action under the current policy
+            for a, action_prob in enumerate(policy[s]):
+                # Look at all possible next states from taking action 'a' in state 's'
+                # env.P[s][a] returns a list of tuples: (transition_probability, next_state, reward, is_done)
+                for trans_prob, next_state, reward, done in env.P[s][a]:
+                    # The Bellman Expectation Equation
+                    v_new += action_prob * trans_prob * (reward + discount_factor * V[next_state])
+            
+            # Track the maximum change in value for the convergence check
+            delta = max(delta, np.abs(v_new - V[s]))
+            V[s] = v_new
+            
+        # Stop evaluating if the changes are microscopic (smaller than theta)
+        if delta < theta:
+            break
+            
+    return V
+
+def get_action_values(state, V, env, discount_factor):
+    """
+    Helper function: Calculates the Action-Value Q(s, a) for all actions in a given state.
+    """
+    A = np.zeros(env.nA)
+    for a in range(env.nA):
+        for trans_prob, next_state, reward, done in env.P[state][a]:
+            A[a] += trans_prob * (reward + discount_factor * V[next_state])
+    return A
+
+def policy_iteration(env, discount_factor=0.99):
+    """
+    Phase 2 & The Main Loop: Alternates between evaluation and improvement.
+    """
+    # 1. Start with a random (uniform) policy
+    # Shape is [Number of States, Number of Actions]
+    policy = np.ones([env.nS, env.nA]) / env.nA
+    
+    while True:
+        # Step A: Evaluate the current policy
+        V = policy_evaluation(policy, env, discount_factor)
+        
+        # Step B: Improve the policy
+        policy_is_stable = True
+        
+        for s in range(env.nS):
+            # What is the best action we would take under the *old* policy?
+            old_best_action = np.argmax(policy[s])
+            
+            # Calculate Q-values for all actions to find the *actual* best action
+            action_values = get_action_values(s, V, env, discount_factor)
+            new_best_action = np.argmax(action_values)
+            
+            # If our old policy didn't pick the optimal action, our policy is not stable yet
+            if old_best_action != new_best_action:
+                policy_is_stable = False
+                
+            # Greedily update the policy: 100% probability to the best action, 0% to the rest
+            policy[s] = np.eye(env.nA)[new_best_action]
+            
+        # If no actions changed for any state, we have found the optimal policy!
+        if policy_is_stable:
+            return policy, V
+
+# --- Example of How to Use It ---
+# import gym
+# env = gym.make('FrozenLake-v1')
+# optimal_policy, optimal_values = policy_iteration(env.unwrapped, discount_factor=0.99)
+```
+
+#### 4.2.3.2 Value Iteration
+Value Iteration is a highly efficient Dynamic Programming algorithm used to find the optimal strategy in Reinforcement Learning. It was designed as a direct "shortcut" to overcome the heavy computational costs associated with traditional Policy Iteration. In standard Policy Iteration, the "Policy Evaluation" step requires calculating the state-value function until it completely converges. In environments with massive state and action spaces, running this evaluation loop over and over again is incredibly computationally expensive. However, the most defining characteristic of Value Iteration is that it does not maintain an explicit policy during the learning loop. Instead of bouncing between evaluating a policy and improving a policy, we only maintain and update one state-value function. It treats the entire process as one continuous dynamic programming update using the Bellman Optimality Equation.
+
+Value Iteration forces the model to look at all possible actions from a state and instantly assume the agent will take the absolute best one (the max operator). The iterative update formula is written as:
+
+$$V^{k+1}(s) = \max_{a \in \mathcal{A}} \left( r(s,a) + \gamma \sum_{s' \in \mathcal{S}} P(s'|s,a)V^k(s') \right)$$
+
+- $V^{k+1}(s)$: The newly updated value for state $s$.
+- $\max_{a}$: Instead of using a policy's probability, it directly grabs the maximum possible expected return from all available actions.
+- Convergence: We keep running this update for every state. When $V^{k+1}$ and $V^k$ become identical, the algorithm has reached the fixed point of the Bellman Optimality Equation. At this exact moment, our values are the absolute Optimal State-Value Function ($V^*$).
+
+Here is the step-by-step logical flow of the algorithm:
+- Random Initialization: Start by assigning random values to $V(s)$ for all states (often zeros).
+- The Loop (while $\Delta > \theta$): Set a tiny threshold ($\theta$). As long as the maximum change in value ($\Delta$) is larger than this threshold, keep looping.
+- State Sweep: For every single state $s$ in the state space $\mathcal{S}$, store the old value $v \leftarrow V(s)$. Calculate the new value by taking the maximum possible reward from all actions, plus the discounted value of the next states before updating $\Delta$ to track the biggest change that occurred during this sweep: $\Delta \leftarrow \max(\Delta, |v - V(s)|)$.
+
+$$V(s) \leftarrow \max_a \left( r(s,a) + \gamma \sum_{s'} P(s'|s,a)V(s') \right)$$
+
+- End Loop: When the changes become microscopic (smaller than $\theta$), the loop stops. The values have converged to $V^*$.
+
+Because Value Iteration doesn't actually keep track of a policy during the loop, we have to extract it at the very end. Once we have the perfect map of state values ($V^*$), finding the optimal strategy is simple. We just look at the map and return a deterministic policy by greedily choosing the action that leads to the highest value:
+
+$$\pi(s) = \arg\max_a \left( r(s,a) + \gamma \sum_{s'} P(s'|s,a)V(s') \right)$$
+
+Value Iteration skips the tedious back-and-forth of evaluating specific policies. It aggressively updates state values using the max operator, merging evaluation and improvement into a single, highly efficient mathematical sweep.
+
+Example code:
+```python
+import numpy as np
+
+def get_action_values(state, V, env, discount_factor):
+    """
+    Helper function: Calculates the expected Action-Value Q(s, a) 
+    for all actions in a given state, using the current State-Values (V).
+    """
+    A = np.zeros(env.nA)
+    for a in range(env.nA):
+        # Look at all possible outcomes of taking action 'a' in state 's'
+        for trans_prob, next_state, reward, done in env.P[state][a]:
+            # The core Bellman Expectation calculation for a specific action
+            A[a] += trans_prob * (reward + discount_factor * V[next_state])
+    return A
+
+def value_iteration(env, discount_factor=0.99, theta=1e-9):
+    """
+    The Main Algorithm: Calculates the optimal State-Value Function V* and extracts the optimal policy.
+    """
+    # 1. Initialize state values to zero
+    V = np.zeros(env.nS)
+    
+    # 2. The Iterative Update Loop
+    while True:
+        delta = 0
+        # Perform a "sweep" over all states
+        for s in range(env.nS):
+            # Store the current value to check for convergence later
+            v_old = V[s]
+            
+            # Calculate the Q-values for all possible actions from this state
+            action_values = get_action_values(s, V, env, discount_factor)
+            
+            # THE CRITICAL DIFFERENCE: 
+            # We aggressively update V[s] using the maximum possible action value.
+            # This is the Bellman Optimality Equation in code.
+            V[s] = np.max(action_values)
+            
+            # Track the maximum change across all states
+            delta = max(delta, np.abs(v_old - V[s]))
+            
+        # 3. Convergence Check
+        # If the largest change in our sweep is microscopic, we have found V*
+        if delta < theta:
+            break
+            
+    # 4. Policy Extraction
+    # Now that we have the perfect state values (V*), we extract the optimal policy
+    optimal_policy = np.zeros([env.nS, env.nA])
+    for s in range(env.nS):
+        # Find the absolute best action from this state based on our perfect V*
+        action_values = get_action_values(s, V, env, discount_factor)
+        best_action = np.argmax(action_values)
+        
+        # Make the policy perfectly greedy
+        optimal_policy[s, best_action] = 1.0
+        
+    return optimal_policy, V
+
+# --- Example of How to Use It ---
+# import gym
+# env = gym.make('FrozenLake-v1')
+# optimal_policy, optimal_values = value_iteration(env.unwrapped, discount_factor=0.99)
+```
+
+### 4.2.4 Temperal Difference
+
+Temporal Difference (TD) Learning is arguably the most central and impactful concept in modern Reinforcement Learning. It acts as the bridge between the mathematical perfection of Dynamic Programming and the trial-and-error reality of the Monte Carlo method. Earlier, we looked at Dynamic Programming (DP). DP is incredibly powerful, but it comes with a fatal flaw: it requires you to know the exact rules of the environment—specifically, the state transition probabilities. In the real world (like playing a complex video game or controlling a robot), these probabilities are impossible to write out. Because you don't have the "cheat sheet" of the environment, you cannot use DP directly. Instead, the agent must learn purely by interacting with the environment and collecting data samples. This broad category of learning is called Model-Free Reinforcement Learning. Two of the most famous model-free algorithms—Sarsa and Q-learning—are both built entirely on the concept of Temporal Difference (TD).
+
+Temporal Difference learning is brilliant because it steals the best ideas from both Monte Carlo (MC) and Dynamic Programming (DP):
+- From Monte Carlo: It learns directly from raw experience (sampling data), meaning it doesn't need to know the environment's rules beforehand.
+- From Dynamic Programming: It uses the concept of the Bellman equation to update its current guess based on its next guess, a process known as "bootstrapping."
+
+To understand TD, we have to look at how it improves upon the Monte Carlo update rule.In Monte Carlo, you update the value of a state based on the difference between your old estimate and the actual total return ($G_t$).
+
+$$V(s_t) \leftarrow V(s_t) + \alpha [G_t - V(s_t)]$$
+
+TD replaces the strict averaging fraction $\frac{1}{N(s)}$ with a constant learning rate step size, $\alpha$
+
+ Monte Carlo forces you to wait until the entire episode is finished (the game is over) before you know the true $G_t$ and can update your values.  TD realizes that the expected total return is mathematically equal to the immediate reward plus the discounted value of the next state: $\mathbb{E}[G_t] = \mathbb{E}[R_t + \gamma V(S_{t+1})]$. Instead of waiting for the game to end, TD learning only waits one single step. It takes the immediate reward ($r_t$), looks at its own current estimate for the next state ($V(s_{t+1})$), and uses that combined information to update the current state right now. The Final TD Update Equation:
+
+$$V(s_t) \leftarrow V(s_t) + \alpha [r_t + \gamma V(s_{t+1}) - V(s_t)]$$
+
+In the equation above, the core driving force of the update is this specific chunk:
+
+$$r_t + \gamma V(s_{t+1}) - V(s_t)$$
+
+This is called the TD Error. It represents the difference between your current estimate ($V(s_t)$) and your new, slightly more accurate observation after taking one step ($r_t + \gamma V(s_{t+1})$). The TD algorithm multiplies this error by the step size ($\alpha$) to incrementally correct the state's value. Over time, taking these step-by-step corrections guarantees convergence to the true value function.
+
