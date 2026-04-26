@@ -914,4 +914,117 @@ Or, RL algorithms can also be broadly classified based on how the agent learns t
 - Policy-Based Methods: "Learning the Strategy". Instead of calculating values for actions, these methods model the Policy ($\pi$) directly. The agent learns a probability distribution of actions. For a given state, it doesn't say "Action A is worth 10 points"; it says "There is a 70% chance Action A is the best move." The agent interacts with the environment and uses Gradient updates to optimize the strategy, aiming to maximize the expected total return. Representative algorithms include Policy Gradient (PG) series. Best use cases include scenarios where actions aren't simple buttons, but fluid movements (e.g., the precise rotation angle of a robot's joint), and situations where you need to be random to be optimal (e.g., in Rock-Paper-Scissors, the best strategy is a random 1/3 split for each move).
 
 - Actor-Critic: The Best of Both Worlds. This is the most modern and popular approach in Deep Reinforcement Learning because it combines the strengths of the previous two methods. The Actor is responsible for learning the policy (deciding which actions to take).
-## 4.2.1 Markov Decision Process
+  
+### 4.2.1 Markov Decision Process
+Markov Decision Process (MDP) is the foundational mathematical framework for almost all Reinforcement Learning. An MDP expands upon the simpler Markov models by adding "Actions." It is formally defined by a 5-tuple $\langle S, A, P, R, \gamma \rangle$:
+1. $S$ (States): The set of all possible situations the agent can find itself in.
+2. $A$ (Actions): The set of all possible moves the agent can make.
+3. $\gamma$ (Discount Factor): A number (usually between 0 and 1) that determines how much the agent cares about immediate rewards versus distant future rewards.
+4. $R(s,a)$ (Reward Function): The immediate reward received after taking action $a$ in state $s$. (Unlike an MRP, the reward now depends on both the state and the action).
+5. $P(s'|s,a)$ (State Transition Function): The probability of landing in a new state ($s'$) after taking a specific action ($a$) in the current state ($s$).
+
+Because the transition to a new state now depends on both the current state and the action chosen, the state transition function $P$ becomes a three-dimensional array (tensor), rather than the simple 2D matrix used in an MRP.
+
+An MDP is a continuous, time-dependent loop of interaction.
+1. The Agent observes the current state $S_t$.
+2. The Agent chooses an action $A_t$ based on a rulebook.
+3. The Environment absorbs that action and spits back a Reward $R_t$ and the next state $S_{t+1}$.
+   
+The "rulebook" the agent uses to choose its actions is called the Policy ($\pi$). The policy is essentially a mathematical function: $\pi(a|s) = P(A_t = a | S_t = s)$.
+Policies come in two flavors:
+- Deterministic Policy: The agent is 100% certain of what to do. In state $s$, one action has a probability of 1, and all others have 0.
+- Stochastic Policy: The agent acts based on a probability distribution (e.g., 50% chance to go left, 50% chance to go right).
+
+To figure out if a policy is actually good, we need to measure the expected cumulative rewards. The MDP uses two distinct value functions for this:
+- State-Value Function ($V^\pi(s)$). This measures "How good is it to simply be in state $s$, assuming I follow policy $\pi$ from now on?"
+
+$$V^\pi(s) = \mathbb{E}_\pi[G_t | S_t = s]$$
+
+- Action-Value Function ($Q^\pi(s,a)$). This measures "How good is it to be in state $s$, intentionally take action $a$ right now, and then follow policy $\pi$ from then on?"
+
+$$Q^\pi(s,a) = \mathbb{E}_\pi[G_t | S_t = s, A_t = a]$$
+
+The value of a state is simply the sum of the values of all possible actions you could take from that state, weighted by the probability that your policy will actually choose them:
+
+$$V^\pi(s) = \sum_{a \in A} \pi(a|s)Q^\pi(s,a)$$
+
+By expanding the relationship between the State-Value and Action-Value functions, we get the Bellman Expectation Equations. These equations show how the value of the current state is recursively tied to the value of the next state.
+
+For State-Value:
+
+$$V^\pi(s) = \sum_{a \in A} \pi(a|s) \left( r(s,a) + \gamma \sum_{s' \in S} p(s'|s,a) V^\pi(s') \right)$$
+
+For Action-Value:
+
+$$Q^\pi(s,a) = r(s,a) + \gamma \sum_{s' \in S} p(s'|s,a) \sum_{a' \in A} \pi(a'|s') Q^\pi(s',a')$$
+
+If an MDP feels too complex because of the "Action" dimension, there is a mathematical trick to simplify it. If we are evaluating a specific, fixed policy $\pi$, we can "average out" the actions. This is called Marginalization. By multiplying the reward and transition functions by the policy's probabilities, we collapse the MDP back into a simpler MRP:
+- New Reward: $r'(s) = \sum_{a \in A} \pi(a|s)r(s,a)$
+- New Transition: $P'(s'|s) = \sum_{a \in A} \pi(a|s)P(s'|s,a)$
+
+This creates a new MRP: $\langle S, P', r', \gamma \rangle$. The state-value function of this simplified MRP is exactly identical to the state-value function of the original complex MDP.
+
+While we can use exact analytical math (like the marginalization trick) to solve small MDPs, for massive, real-world state spaces, these precise analytical solutions break down. In those cases, we must rely on iterative algorithms like Dynamic Programming or Monte Carlo estimation to find the values.
+
+- Dynamic Programming: Model-based.  It requires full knowledge of the environment's rules. Specifically, it directly uses the known state transition probabilities ($p(s'|s,a)$) to iteratively calculate and update the value function.
+- Monte Carlo: Model-free. It estimates values by sampling complete episodes (playing a game all the way to the end) and averaging the total returns collected. Because it relies on actual, completed outcomes, it has low bias. However, because entire episodes can vary wildly based on random actions, it suffers from high variance.
+- Temporal Difference: Model-free. Instead of waiting for an episode to finish, TD updates its value estimates step-by-step. It uses the actual partial reward from the current step plus its own estimate of the next state's value to make the update. Because it updates step-by-step rather than relying on wild, full-episode outcomes, it has lower variance compared to Monte Carlo. However, because it relies on its own estimates to update itself (a concept called bootstrapping), it introduces some bias.
+  
+### 4.2.2 Monte Carlo
+
+The Monte Carlo Method is a numerical calculation technique grounded in probability and statistics. Also known as a statistical simulation method, it uses repeated random sampling to estimate complex mathematical values. In a Markov Decision Process (MDP), the state-value function $V^\pi(s)$ represents the expected return. Instead of using complex analytical math (like solving the Bellman Expectation Equation directly), the Monte Carlo method estimates this value through sheer trial and error: the agent samples multiple sequences (trajectories) in the environment.
+
+- The Formula: The value of a state is approximated by averaging the actual returns ($G_t$) obtained after visiting that state across many sampled sequences:
+- Every-visit MC: Calculates the cumulative reward every single time the state appears in a sequence.
+- First-visit MC: Only calculates the cumulative reward following the first time the state appears in a sequence, ignoring subsequent visits in the same run.
+
+Instead of summing all returns and dividing at the very end, we can update the value incrementally step-by-step to save memory. By keeping a counter $N(s)$ and tracking the difference between the newly sampled return $G$ and our current estimate $V(s)$, we use the elegant update rule:
+
+$$V(s) \leftarrow V(s) + \frac{1}{N(s)}(G - V(s))$$
+
+According to the Law of Large Numbers, as $N(s) \to \infty$, the estimate $V(s)$ smoothly converges to the true $V^\pi(s)$.
+
+Different policies result in different value functions because they fundamentally change the probability distribution of the states the agent visits.
+
+- State Visitation Distribution: The probability distribution of states the agent will visit when interacting with the MDP under policy $\pi$.
+- Occupancy Measure: This extends the concept to state-action pairs. It represents the overall probability of a specific state-action pair $(s,a)$ being visited. $\rho^\pi(s,a) = v^\pi(s)\pi(a|s)$.
+- Two policies are completely identical if and only if their occupancy measures are identical ($\rho^{\pi_1} = \rho^{\pi_2} \iff \pi_1 = \pi_2$).
+- Given a valid occupancy measure $\rho$, it generates one unique policy: $\pi_\rho = \frac{\rho(s,a)}{\sum_{a'} \rho(s,a')}$.
+
+The ultimate goal of Reinforcement Learning is to find the policy that yields the maximum expected return.
+- Partial Ordering: A policy $\pi$ is considered better than or equal to $\pi'$ if $V^\pi(s) \ge V^{\pi'}(s)$ for all states.
+- Optimal Policy ($\pi^*$): A policy that is better than or equal to all other policies. There can be multiple optimal policies, but they all share the exact same optimal value functions.
+- Optimal State-Value Function ($V^*(s)$): $V^*(s) = \max_\pi V^\pi(s)$
+- Optimal Action-Value Function ($Q^*(s,a)$): $Q^*(s,a) = \max_\pi Q^\pi(s,a)$
+- The optimal value of a state is the value of the best possible action taken from that state: $V^*(s) = \max_{a \in A} Q^*(s,a)$.
+
+By substituting the relationship between $V^*$ and $Q^*$ into the standard equations, we get the definitive Bellman Optimality Equations. Solving a Reinforcement Learning problem practically means solving these equations to find the optimal strategy.
+
+$$V^*(s) = \max_{a \in A} \left\{ r(s,a) + \gamma \sum_{s' \in S} P(s'|s,a)V^*(s') \right\}$$
+
+$$Q^*(s,a) = r(s,a) + \gamma \sum_{s' \in S} P(s'|s,a) \max_{a' \in A} Q^*(s',a')$$
+
+### 4.2.3 Dynamic Programming
+Dynamic programming is a highly efficient algorithmic design strategy used to solve complex, classic problems (like the famous "knapsack problem" or finding the shortest path). Instead of tackling a massive problem all at once, DP uses a "divide and conquer with a memory" approach:
+- Decomposition: It breaks the target problem down into several smaller, manageable sub-problems.
+- Saving Answers: As it solves these sub-problems, it saves their answers.
+- Avoiding Redundancy: When calculating the final target problem, if it needs the answer to a sub-problem it has already solved, it simply looks up the saved answer instead of recalculating it from scratch. This completely avoids redundant calculations.
+  
+In Reinforcement Learning, we use the DP mindset to efficiently calculate the absolute best strategy (the optimal policy) for a Markov Decision Process (MDP).
+
+When applying DP to Reinforcement Learning, we rely on two primary methods:
+
+Policy Iteration finds the best strategy through a continuous two-step cycle.
+- Policy Evaluation: First, it evaluates how good the current policy is. It uses the Bellman Expectation Equation to calculate the state-value function for the current strategy. (This evaluation step itself is a dynamic programming process).
+- Policy Improvement: Once it knows the exact value of the current policy, it tweaks the policy to make it slightly better. It repeats this evaluation and improvement cycle until the policy can't get any better.
+
+Instead of bouncing back and forth between evaluating and improving a policy, Value Iteration takes a more direct mathematical shortcut. It directly applies the Bellman Optimality Equation using dynamic programming to iteratively update the values until it arrives at the final optimal state-value function.
+
+While Dynamic Programming is mathematically elegant, it has strict limitations that restrict its use in the real world.
+- The "White-Box" Requirement: DP algorithms require you to know the environment's rules perfectly beforehand. You must have exact knowledge of the entire MDP, specifically the state transition function and the reward function.
+- No Interaction Needed: Because it is a "white-box environment," the agent doesn't need to actually play the game or interact with the environment to learn. It can just sit back and calculate the perfect state-value function mathematically.
+- Real-World Rarity: The biggest limitation of DP is that perfect "white-box" environments almost never exist in complex real-world scenarios. You rarely know all the exact probabilities of how the world will react to an action.
+- Size Limits: Furthermore, Policy Iteration and Value Iteration are generally only applicable to finite Markov Decision Processes. This means the total number of possible states and actions must be discrete and strictly limited.
+
+### 4.2.3.1 Policy Iteration
+### 4.2.3.2 Value Iteration
