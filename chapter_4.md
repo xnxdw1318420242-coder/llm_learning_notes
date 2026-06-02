@@ -1375,3 +1375,231 @@ def sarsa(env, num_episodes, alpha=0.1, gamma=0.99, epsilon=0.1):
 # env = gym.make('CliffWalking-v0')
 # learned_Q_table = sarsa(env, num_episodes=500, alpha=0.1, gamma=0.99, epsilon=0.1)
 ```
+
+#### 4.2.4.2 Multi-step Sarsa
+
+Multi-step Sarsa elegantly solves a classic tug-of-war in Reinforcement Learning by finding the "sweet spot" between two extreme methods. 
+
+To understand why Multi-step Sarsa was created, we first have to look at the two opposite ends of the learning spectrum: Monte Carlo (MC) and 1-Step Temporal Difference (TD). The Monte Carlo Method waits until the very end of an episode to add up every single reward obtained along the way. It is completely unbiased because it relies entirely on true, factual results. However, it has a very large variance (方差). Every single step in an environment carries uncertainty. When you add up dozens or hundreds of uncertain steps, the final value can swing wildly from one game to the next, making learning unstable. 1-Step Temporal Difference only looks one step ahead. It takes the immediate reward and adds its own current estimate of what the next state is worth. It has a very small variance because it only exposes itself to the uncertainty of a single step. However, it is biased because the update relies heavily on its own existing (and potentially inaccurate) guess of the true value.
+
+If MC looks all the way to the end ($n = \infty$) and standard Sarsa looks exactly one step ahead ($n = 1$), the logical solution to combine their advantages is to look $n$ steps ahead. By using a multi-step approach, you use actual, real rewards for the first $n$ steps (reducing bias), and then use your value estimate for the state you land in at step $n$ (cutting off the chain to reduce variance).
+
+The algorithm requires a modification to the target return ($G_t$) that the agent is trying to update toward. We accumulate rewards over $n$ steps, applying the discount factor ($\gamma$) increasingly to each future step, until we finally cap it off with our $Q$-value estimate at step $n$:
+
+$$G_t = r_t + \gamma r_{t+1} + \dots + \gamma^n Q(s_{t+n}, a_{t+n})$$
+
+We simply swap the old 1-step target with our new multi-step calculation inside the standard Sarsa update rule:
+
+$$Q(s_t, a_t) \leftarrow Q(s_t, a_t) + \alpha \left[ r_t + \gamma r_{t+1} + \dots + \gamma^n Q(s_{t+n}, a_{t+n}) - Q(s_t, a_t) \right]$$
+
+By adjusting the value of $n$, engineers can manually tune the algorithm to perfectly balance the unbiased nature of Monte Carlo with the low-variance stability of Temporal Difference learning.
+
+Example code:
+```python
+import numpy as np
+import random
+
+def epsilon_greedy_policy(state, Q_table, epsilon, n_actions):
+    """
+    The Exploration Strategy (Same as standard Sarsa).
+    """
+    if random.uniform(0, 1) < epsilon:
+        return random.randint(0, n_actions - 1)
+    else:
+        return np.argmax(Q_table[state])
+
+def n_step_sarsa(env, num_episodes, n=3, alpha=0.1, gamma=0.99, epsilon=0.1):
+    """
+    The Main Algorithm: Learns Q-values using n-step Sarsa.
+    
+    Args:
+        env: The environment.
+        num_episodes: How many games to play.
+        n: The number of steps to look ahead before bootstrapping.
+        alpha: The learning rate.
+        gamma: The discount factor.
+        epsilon: The exploration probability.
+    """
+    n_states = env.observation_space.n
+    n_actions = env.action_space.n
+    Q_table = np.zeros((n_states, n_actions))
+    
+    for episode in range(num_episodes):
+        # 1. Initialize the episode
+        state, _ = env.reset()
+        action = epsilon_greedy_policy(state, Q_table, epsilon, n_actions)
+        
+        # 2. Set up "memory buffers" to store the last 'n' steps
+        # We need to remember where we were and what we got to calculate the n-step return
+        states = [state]
+        actions = [action]
+        rewards = [0.0] # Index 0 is a dummy value so indices align with time steps
+        
+        # T tracks the exact time step the episode ends (infinity until we hit it)
+        T = float('inf') 
+        t = 0 # Current time step
+        
+        while True:
+            # --- STEP FORWARD ---
+            if t < T:
+                # Take the action, observe the environment
+                next_state, reward, terminated, truncated, _ = env.step(actions[t])
+                done = terminated or truncated
+                
+                # Store the reward and the next state in our memory buffers
+                rewards.append(reward)
+                states.append(next_state)
+                
+                if done:
+                    # If the game is over, we log the exact final time step
+                    T = t + 1
+                else:
+                    # If not done, pick the next action and store it
+                    next_action = epsilon_greedy_policy(next_state, Q_table, epsilon, n_actions)
+                    actions.append(next_action)
+            
+            # --- UPDATE BACKWARD (The n-step delay) ---
+            # tau (τ) is the state we are currently updating. 
+            # It trails 'n' steps behind our actual current time step 't'.
+            tau = t - n + 1
+            
+            if tau >= 0:
+                # 1. Calculate the accumulated n-step return from true rewards
+                # G_t = r_{t+1} + gamma * r_{t+2} + ... + gamma^{n-1} * r_{t+n}
+                G = 0
+                for i in range(tau + 1, min(tau + n, T) + 1):
+                    G += (gamma ** (i - tau - 1)) * rewards[i]
+                
+                # 2. Add the bootstrap value if the sequence didn't end
+                # + gamma^n * Q(s_{t+n}, a_{t+n})
+                if tau + n < T:
+                    G += (gamma ** n) * Q_table[states[tau + n], actions[tau + n]]
+                
+                # 3. Perform the standard Sarsa update using our new n-step target (G)
+                tau_state = states[tau]
+                tau_action = actions[tau]
+                Q_table[tau_state, tau_action] += alpha * (G - Q_table[tau_state, tau_action])
+            
+            # If the state we just updated was the final state of the game, break the loop
+            if tau == T - 1:
+                break
+                
+            t += 1
+            
+    return Q_table
+
+# --- Example of How to Use It ---
+# import gym
+# env = gym.make('CliffWalking-v0')
+# learned_Q_table = n_step_sarsa(env, num_episodes=500, n=4, alpha=0.1)
+```
+
+#### 4.2.4.3 Q-Learning
+
+Q-learning is one of the most famous and widely used model-free Reinforcement Learning algorithms. Like Sarsa, it relies on Temporal Difference (TD) learning to estimate values without needing to know the environment's underlying rules. However, Q-learning takes a fundamentally different philosophical approach to how it learns from the data.
+
+The primary difference between Sarsa and Q-learning lies entirely in how they calculate the Temporal Difference target. In Sarsa, the agent looks at the actual next action ($a'$) it is going to take to update its value. Q-learning completely ignores what the agent is actually going to do next. Instead, it looks at the next state ($s'$) and greedily grabs the maximum possible value of any action available in that state.
+
+The Q-learning Update Formula:
+
+$$Q(s_t, a_t) \leftarrow Q(s_t, a_t) + \alpha \left[ R_t + \gamma \max_a Q(s_{t+1}, a) - Q(s_t, a_t) \right]$$
+
+You can think of Q-learning as the model-free equivalent of Value Iteration. Because it forces the max operator into the update step, it is directly estimating the Optimal Action-Value Function ($Q^*$) using the Bellman Optimality Equation. It learns the absolute best theoretical path, regardless of the random exploratory mistakes it might be making in the moment.
+
+This mathematical difference leads us to one of the most critical conceptual divides in Reinforcement Learning:
+
+- Behavior Policy: The rulebook the agent uses to actually move around and collect data (usually an $\epsilon$-greedy strategy to ensure it explores).
+  
+- Target Policy: The rulebook the agent is trying to learn and optimize.
+
+Sarsa is an On-Policy algorithm. Its Behavior Policy and Target Policy are the exactly same. It requires a 5-tuple $(s, a, r, s', a')$ where that final $a'$ was explicitly chosen by the current $\epsilon$-greedy policy. It learns the value of the exact strategy it is currently executing. Q-learning is an Off-Policy algorithm. Its Behavior Policy and Target Policy are different. It uses an $\epsilon$-greedy policy to interact with the world, gathering a 4-tuple of data $(s, a, r, s')$. But when it updates its brain, it targets a purely greedy policy (using the max operator). It separates the act of exploring from the act of learning the optimal path.
+
+The Q-learning practical implementation is slightly simpler than Sarsa because it doesn't need to select a second action before updating:
+
+- Initialize the $Q(s,a)$ table.
+- Start an episode and get the initial state $s$.
+- Choose action $a$ using an $\epsilon$-greedy policy based on current $Q$ values.
+- Take the action, get reward $r$ and the next state $s'$.
+- Update the Q-table using the TD formula with the max operator.
+- Set the current state to $s'$ ($s \leftarrow s'$). (Notice it does not carry over the action $a'$ like Sarsa does).
+- Repeat until the episode ends.
+
+Example code:
+```python
+import numpy as np
+import random
+
+def epsilon_greedy_policy(state, Q_table, epsilon, n_actions):
+    """
+    The Behavior Policy: (Same as Sarsa)
+    Balances exploration (random action) and exploitation (best known action).
+    """
+    if random.uniform(0, 1) < epsilon:
+        return random.randint(0, n_actions - 1)
+    else:
+        return np.argmax(Q_table[state])
+
+def q_learning(env, num_episodes, alpha=0.1, gamma=0.99, epsilon=0.1):
+    """
+    The Main Algorithm: Learns the Q-values using Off-Policy Q-learning.
+    
+    Args:
+        env: The environment (e.g., OpenAI Gym discrete environment).
+        num_episodes: How many full games to play.
+        alpha: The learning rate (step size).
+        gamma: The discount factor.
+        epsilon: The exploration probability.
+    """
+    # 1. Initialize the Q-table to all zeros
+    n_states = env.observation_space.n
+    n_actions = env.action_space.n
+    Q_table = np.zeros((n_states, n_actions))
+    
+    # 2. Loop through episodes
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        done = False
+        
+        # 3. The Time-Step Loop
+        while not done:
+            # Step A: Select an action using the Behavior Policy (epsilon-greedy)
+            action = epsilon_greedy_policy(state, Q_table, epsilon, n_actions)
+            
+            # Step B: Take the action, observe the environment
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Step C: The Q-learning TD Update (The Target Policy)
+            if done:
+                # Terminal state target is just the immediate reward
+                td_target = reward 
+            else:
+                # THE CRITICAL DIFFERENCE FROM SARSA:
+                # Instead of picking an actual next action, we aggressively grab 
+                # the maximum possible Q-value for the next state.
+                td_target = reward + gamma * np.max(Q_table[next_state])
+                
+            td_error = td_target - Q_table[state, action]
+            
+            # Update the Q-value
+            Q_table[state, action] = Q_table[state, action] + alpha * td_error
+            
+            # Step D: Move forward
+            # Notice we ONLY carry over the state. The action is left behind.
+            state = next_state
+            
+    return Q_table
+
+# --- Example of How to Use It ---
+# import gym
+# env = gym.make('CliffWalking-v0')
+# learned_Q_table = q_learning(env, num_episodes=500, alpha=0.1, gamma=0.99, epsilon=0.1)
+```
+
+Standard Q-learning is powerful, but modern AI has pushed it much further by altering how it views rewards.
+
+- C51 (Distributional Q-Learning): Instead of trying to learn a single expected "average" value for a state-action pair, C51 tries to learn the entire probability distribution of returns. It recognizes that rewards aren't just one static number, but a range of possibilities.
+
+Formula: $Z(s,a) = \sum_{i=1}^N z_i \cdot P(Z = z_i | s,a)$ (where $Z$ is the discretized distribution).
+
+- Rainbow: This is the ultimate "kitchen sink" version of Q-learning. It combines multiple state-of-the-art enhancements—including Double Q-learning (to fix overestimation), Prioritized Experience Replay (learning from the most surprising memories first), and Distributional C51—into one massive algorithm, drastically improving both performance and stability over standard Q-learning.
