@@ -187,3 +187,18 @@
     * **4.1.4.9 AdaLoRA**
 
 **4.2 Reinforcement Learning in LLM**
+* **4.2.1 Markov Decision Process**
+* **4.2.2 Monte Carlo**
+* **4.2.3 Dynamic Programming**
+    * **4.2.3.1 Policy Iteration**
+    * **4.2.3.2 Value Iteration**
+* **4.2.4 Temperal Difference**
+    * **4.2.4.1 Sarsa**
+    * **4.2.4.2 Multi-step Sarsa**
+    * **4.2.4.3 Q-Learning**
+    * **4.2.4.4 DQN**
+    * **4.2.4.5 Double DQN**
+    * **4.2.4.6 Dueling DQN**
+
+    * **4.1.4.8 QLoRA**
+    * **4.1.4.9 AdaLoRA**
