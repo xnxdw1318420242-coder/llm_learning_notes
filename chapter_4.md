@@ -901,6 +901,21 @@ RL isn't just for simple tasks; it is specifically designed for multi-step seque
 
 RL excels in these areas because it can self-adapt through trial-and-error interaction, even when the environment’s probability transition model is unknown or when the dimensions of possible "states" and "actions" are massive. Algorithms in Reinforcement Learning are broadly divided into two categories based on how they view the "world" around them: Model-Free Learning and Model-Based Learning. Model-Free Learning is the most common and "simple" approach. The agent doesn't try to understand the hidden laws of physics or the "why" behind the environment. Instead, it just reacts to what it sees. It doesn't build a mental map (model) of the environment. It focuses on direct optimization of policies or value functions through repeated sampling from the real world. It is simple to implement and highly applicable to complex real-world scenarios where the environment is too messy to model. Model-Based Learning is more "cerebral." The agent tries to build a internal simulation of the world. It first learns or assumes a transition distribution $P(s' | s, a)$—meaning it tries to predict what the next state ($s'$) will be given its current state ($s$) and action ($a$). It then uses this "virtual environment" to plan or simulate future moves. It is excellent for planning future decisions before actually taking them. Its performance is strictly capped by the quality of its model. If the "virtual environment" doesn't match the real environment, the agent's performance will be poor.
 
+There two powerful techniques that utilize the predictive model (Model-Based Learning):
+
+- Model Predictive Control. MPC acts like a chess player thinking several moves ahead, but constantly re-evaluating the board. At every single time step, MPC uses its internal environment model to plan out a sequence of actions for a specific window of time into the future. The core idea is to solve an optimization problem at each step to maximize the sum of rewards over a set "planning horizon":
+
+$$\max_{a_0, \dots, a_H} \sum_{t=0}^H R(s_t, a_t)$$
+
+$H$ represents the length of this time horizon (how many steps ahead it is looking). $s_{t+1} = f(s_t, a_t)$ represents the state transition. Crucially, the next state is predicted mathematically by the agent's internal model ($f$), rather than needing to actually take the action to find out. Even though MPC calculates a perfect sequence of actions for the next $H$ steps, it only executes the very first action of that sequence. After taking that one step, the environment changes, and MPC completely recalculates a brand new plan for the next horizon.
+
+- Expert Iteration. Expert Iteration is a brilliant technique that directly marries the forward-thinking power of planning with the pattern-recognition power of policy learning. It uses a rigorous planning algorithm—such as Monte Carlo Tree Search (MCTS)—to act as an "expert." This expert runs deep simulations to figure out highly optimal moves. The algorithm then takes these "expert actions" and uses them as training data to teach and improve its own baseline policy function. The overarching goal is to constantly upgrade the current policy ($\pi_{old}$) to a new, better policy ($\pi_{new}$) that maximizes the expected infinite-horizon returns:
+
+$$\pi_{new}(a|s) = \arg\max \mathbb{E}_{s \sim \pi_{old}} \left[ \sum_{t=0}^\infty \gamma^t R(s_t, a_t) \right]$$
+
+AlphaZero is the most famous and successful implementation of Expert Iteration. By combining the rigorous planning of MCTS with Deep Reinforcement Learning, AlphaZero was able to train itself from scratch to reach superhuman, top-tier player levels in incredibly complex board games like Go.
+
+
 In large-scale real environments where every action has a huge impact on the future, choosing between these two methods involves a trade-off between the simplicity of Model-Free sampling and the strategic planning of Model-Based simulation.
 
 <p align="center">
@@ -1603,3 +1618,401 @@ Standard Q-learning is powerful, but modern AI has pushed it much further by alt
 Formula: $Z(s,a) = \sum_{i=1}^N z_i \cdot P(Z = z_i | s,a)$ (where $Z$ is the discretized distribution).
 
 - Rainbow: This is the ultimate "kitchen sink" version of Q-learning. It combines multiple state-of-the-art enhancements—including Double Q-learning (to fix overestimation), Prioritized Experience Replay (learning from the most surprising memories first), and Distributional C51—into one massive algorithm, drastically improving both performance and stability over standard Q-learning.
+
+#### 4.2.4.4 DQN
+
+Deep Q-Network (DQN) is a monumental algorithm in AI history. First introduced by DeepMind in 2013 to play Atari games directly from raw screen pixels, it officially opened the curtains on the era of Deep Reinforcement Learning. To understand DQN, we have to look at the massive limitation of traditional Q-learning and the three brilliant innovations DQN uses to solve it. Here is a thorough, structured breakdown of how it works. 
+
+Standard Q-learning relies on a literal "look-up table" (a matrix) to store the $Q(s,a)$ value for every possible state-action pair. This tabular approach only works for simple games with small, discrete state spaces. If a state is defined by a continuous variable (like exact angles or velocities in the CartPole environment) or massive inputs (like an RGB image of $224 \times 224 \times 3$), the number of possible states approaches infinity. Storing a table of that size is computationally impossible. To solve the infinite state problem, DQN discards the Q-table and replaces it with a Neural Network—specifically called a Q-Network.  Instead of looking up a value in a table, we pass the continuous state $s$ into a neural network (parameterized by weights $\omega$). The network acts as a highly complex mathematical function that calculates and outputs the estimated $Q$ values for all possible discrete actions simultaneously. Because it is guessing (approximating) the relationship rather than storing exact, factual historical values, it introduces a slight precision loss. Thus, this is categorized as an approximate method.
+
+To train this neural network, we use the Temporal Difference (TD) target from standard Q-learning. We want our network's prediction ($Q_\omega(s_i, a_i)$) to move closer to the TD target. We achieve this by defining a Mean Squared Error (MSE) loss function for gradient descent:
+
+$$\omega^* = \arg\min_\omega \frac{1}{2N} \sum_{i=1}^N \left[ Q_\omega(s_i, a_i) - (r_i + \gamma \max_{a'} Q_\omega(s'_i, a')) \right]^2$$
+
+Because DQN is an off-policy algorithm, it can use data collected from past strategies. Instead of learning from a single step and immediately throwing it away, DQN stores every 4-tuple interaction (State, Action, Reward, Next State) into a large memory pool called a replay buffer. During training, the neural network samples random mini-batches from this pool. This solves two massive problems in Deep Learning:
+
+- Breaks Data Correlation: If a neural network learns from sequential frames of a game, the data is highly correlated (Frame 2 looks exactly like Frame 1). This causes the network to overfit to the immediate situation and forget overall strategies. Sampling randomly from the buffer breaks this correlation, satisfying the statistical assumption of independent data.
+
+- Improves Sample Efficiency: Real-world interactions can be "expensive" to collect. By saving them in a buffer, the network can learn from the exact same valuable experience multiple times.
+
+If you look at the MSE loss function, you will notice a dangerous loop: the neural network is trying to hit a target ($r_i + \gamma \max_{a'} Q_\omega(s'_i, a')$) that is calculated using its own parameters ($\omega$). Because the parameters update at every single step, the target is constantly shifting. Imagine trying to shoot an arrow at a bullseye that aggressively jumps around every time you aim. This leads to severe training instability. To solve this, DQN introduces a second, identical neural network called the Target Network, parameterized by $\omega^-$. The main training network ($\omega$) updates at every time step to minimize the loss. However, the Target Network ($\omega^-$) is "frozen." It is solely used to calculate the stable TD target. Every $C$ steps, the weights from the main network are copied over to the target network ($\omega^- \leftarrow \omega$), allowing the target to update slowly and smoothly.
+
+Putting it all together, here is the exact step-by-step logic of how a DQN agent trains:
+
+1. Initialize the main Q-network $Q_\omega(s,a)$ with random weights $\omega$.
+2. Initialize the target network $Q_{\omega^-}$ by perfectly copying the main weights ($\omega^- \leftarrow \omega$).
+3. Initialize the empty Experience Replay buffer $R$.
+4. For every episode ($e=1 \to E$):
+5. $\quad$ Get the starting environment state $s_1$.
+6. $\quad$ For every time step ($t=1 \to T$):
+7. $\quad \quad$ Select an action $a_t$ using the $\epsilon$-greedy policy based on the current $Q_\omega(s, a)$.
+8. $\quad \quad$ Execute action $a_t$, collect reward $r_t$, and transition to the next state $s_{t+1}$.
+9. $\quad \quad$ Store the experience tuple $(s_t, a_t, r_t, s_{t+1})$ into the replay buffer $R$.
+10. $\quad \quad$ If the buffer $R$ has enough data, sample a random batch of $N$ tuples.
+11. $\quad \quad$ Calculate the stable target using the frozen target network: $y_i = r_i + \gamma \max_{a} Q_{\omega^-}(s_{i+1}, a)$.
+12. $\quad \quad$ Perform gradient descent to minimize the loss $L = \frac{1}{N} \sum_i (y_i - Q_\omega(s_i, a_i))^2$, updating $\omega$.
+13. $\quad \quad$ Periodically update the target network (sync $\omega^- \leftarrow \omega$).
+
+While you might see some minor oscillations in performance over time (due to the max operator's tendency to sometimes overestimate values), DQN effectively combines the classic logic of Q-learning with the immense representational power of Deep Learning. Mastering it is the gateway to modern advanced AI.
+
+Example code:
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+from collections import deque
+
+# --- INNOVATION 1: Function Approximation (The Q-Network) ---
+class QNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(QNetwork, self).__init__()
+        # A simple 3-layer Multi-Layer Perceptron (MLP)
+        self.fc1 = nn.Linear(state_dim, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, action_dim)
+        
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        # No activation on the final layer because Q-values can be positive or negative
+        return self.fc3(x)
+
+# --- INNOVATION 2: Experience Replay ---
+class ReplayBuffer:
+    def __init__(self, capacity):
+        # A double-ended queue that automatically removes the oldest memories when full
+        self.buffer = deque(maxlen=capacity)
+        
+    def push(self, state, action, reward, next_state, done):
+        # Store the 5-tuple experience
+        self.buffer.append((state, action, reward, next_state, done))
+        
+    def sample(self, batch_size):
+        # Randomly sample a batch of experiences to break data correlation
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (np.array(states), np.array(actions), np.array(rewards), 
+                np.array(next_states), np.array(dones))
+        
+    def __len__(self):
+        return len(self.buffer)
+
+def dqn(env, num_episodes, batch_size=64, gamma=0.99, epsilon=0.1, target_update_freq=10):
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    
+    # 1. Initialize the Main Network and the Optimizer
+    policy_net = QNetwork(state_dim, action_dim)
+    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+    
+    # --- INNOVATION 3: The Target Network ---
+    target_net = QNetwork(state_dim, action_dim)
+    # Copy the exact starting weights from the policy_net to the target_net
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval() # Set to evaluation mode (no gradients needed here)
+    
+    # 2. Initialize the Replay Buffer
+    memory = ReplayBuffer(capacity=10000)
+    
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        done = False
+        
+        while not done:
+            # --- ACTION SELECTION (Epsilon-Greedy) ---
+            if random.uniform(0, 1) < epsilon:
+                action = random.randint(0, action_dim - 1)
+            else:
+                # Ask the neural network for the best action
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                with torch.no_grad():
+                    q_values = policy_net(state_tensor)
+                action = q_values.argmax().item()
+                
+            # --- INTERACT WITH ENVIRONMENT ---
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # Save the experience to memory
+            memory.push(state, action, reward, next_state, done)
+            state = next_state
+            
+            # --- TRAINING STEP (If we have enough memories) ---
+            if len(memory) >= batch_size:
+                # Sample a random batch
+                states, actions, rewards, next_states, dones = memory.sample(batch_size)
+                
+                # Convert arrays to PyTorch Tensors
+                states = torch.FloatTensor(states)
+                actions = torch.LongTensor(actions).unsqueeze(1)
+                rewards = torch.FloatTensor(rewards).unsqueeze(1)
+                next_states = torch.FloatTensor(next_states)
+                dones = torch.FloatTensor(dones).unsqueeze(1)
+                
+                # 1. Calculate Current Q-Values using the MAIN network
+                # gather() pulls the specific Q-value for the action we actually took
+                current_q = policy_net(states).gather(1, actions)
+                
+                # 2. Calculate the Target Q-Values using the FROZEN TARGET network
+                with torch.no_grad():
+                    # max(1)[0] gets the maximum Q-value for the next state
+                    max_next_q = target_net(next_states).max(1)[0].unsqueeze(1)
+                    # If done, there is no next state value
+                    target_q = rewards + (gamma * max_next_q * (1 - dones))
+                    
+                # 3. Calculate Loss (Mean Squared Error)
+                loss = nn.MSELoss()(current_q, target_q)
+                
+                # 4. Optimize the model (Gradient Descent)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+        # --- UPDATE THE TARGET NETWORK ---
+        # Every C episodes, sync the target network weights with the main network
+        if episode % target_update_freq == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+            
+    return policy_net
+
+# --- Example Usage ---
+# import gym
+# env = gym.make('CartPole-v1')
+# trained_model = dqn(env, num_episodes=500)
+```
+
+There are some variants of DQN.
+
+- Double DQN. Standard DQN suffers from "overestimation" because it uses the same network to both pick the best action and evaluate how much that action is worth. Double DQN completely separates action selection from action value estimation (using the Main Network for one and the Target Network for the other) to mitigate this overestimation.
+
+- Dueling DQN. Standard DQN forces the network to learn the exact value of every action, even when the choice of action doesn't really matter. Dueling DQN changes the neural network architecture to physically split the $Q$ value calculation into two parts: the baseline State-Value $V(s)$ plus the relative Action Advantage $A(s,a)$. This helps the agent better differentiate between the value of simply being in a state versus the specific advantage of an action.
+
+- Prioritized Replay. Standard DQN samples past memories from its replay buffer completely at random, treating boring, obvious memories the same as highly surprising, valuable ones. When sampling data, Prioritized Replaygives priority to samples with a large TD-Error. A large error means the agent's prediction was highly inaccurate, so this forces the agent to repeatedly practice and learn from the "difficult" samples.
+
+- Noisy Network. Traditional exploration methods (like $\epsilon$-greedy) rely on taking completely random, sometimes illogical, actions to explore the environment. Noisy Network directly injects mathematical noise into the neural network's weights. This allows the network to automatically and more smoothly explore the environment driven by its own internal uncertainty, rather than relying on external random dice rolls.
+
+- Distributional Q. Standard DQN tries to condense all possible future outcomes into a single "expected average" number.  Instead of outputting a single expected $Q$ value, algorithms like C51 and QR-DQN train the network to learn the entire probability distribution of possible rewards, capturing a much richer picture of the environment's uncertainty.
+
+- The Rainbow algorithm doesn't introduce a completely new concept. Instead, it takes all of the above improvements (along with Multi-step learning) and successfully integrates them into one massive, highly optimized super-algorithm, which vastly outperforms standard DQN.
+
+#### 4.2.4.5 Double DQN
+
+Double DQN is a brilliant and necessary upgrade to the original DQN algorithm. It was specifically designed to fix a subtle but devastating mathematical flaw in how standard DQN calculates its targets. Standard DQN has a bad habit of being overly optimistic. It consistently overestimates the true $Q$ values of actions, which can cause the algorithm to fail entirely, especially in environments with a large number of possible actions. The culprit is the max operator in the traditional TD target formula:
+
+$$r + \gamma \max_{a'} Q_{\omega^-}(s', a')$$
+
+To understand why this is broken, we have to realize that the max operation is actually doing two separate jobs simultaneously:
+
+1. Action Selection: It asks, "Which action $a'$ is the best?" ($a^* = \arg\max_{a'} Q_{\omega^-}(s', a')$)
+2. Action Evaluation: It asks, "What is the exact numerical value of that chosen action?" ($Q_{\omega^-}(s', a^*)$)
+
+Neural networks are not perfect; their estimates always contain some level of error (both positive and negative). Imagine a state where the true value of every single action is exactly $0$. Because of neural network noise, the estimated values might fluctuate (e.g., -0.2, 0.1, -0.1, 0.3). The max operator will blindly grab the highest value ($0.3$). By using the exact same network to pick the action and evaluate it, DQN actively hunts for positive errors. Step after step, these positive errors accumulate, leading to massive, compounding overestimations.
+
+If using one network for both jobs causes a feedback loop of positive errors, the solution is to decouple the process. Double DQN proposes using two entirely independent neural networks:
+
+- Use Network A to select the absolute best action.
+- Use Network B to calculate the actual value of the action Network A just picked.
+
+Even if Network A accidentally picks a bad action because of a positive noise spike, Network B (which has different noise) will likely evaluate it much closer to its true, lower value, stopping the error from accumulating.
+
+The genius of the Double DQN paper is that it realized we do not need to build any new networks. Standard DQN already maintains two separate neural networks during training:
+1. The Training Network ($\omega$)
+2. The Target Network ($\omega^-$)
+Double DQN simply changes which network is responsible for which job when calculating the TD target. Standard DQN uses the Target Network ($Q_{\omega^-}$) to select the action AND the Target Network ($Q_{\omega^-}$) to evaluate it. Double DQN uses the Training Network ($Q_\omega$) to select the best action, but uses the Target Network ($Q_{\omega^-}$) to evaluate the numerical value of that selected action.
+
+By looking at the formulas side-by-side, the precise shift in logic becomes completely clear:
+- Traditional DQN Optimization Target. Action selection relies entirely on the target network $Q_{\omega^-}$.
+
+$$r + \gamma Q_{\omega^-} \left( s', \arg\max_{a'} Q_{\omega^-}(s', a') \right)$$
+
+- Double DQN Optimization Target. Action selection relies on the training network $Q_\omega$, while the evaluation relies on the target network $Q_{\omega^-}$.
+
+$$r + \gamma Q_{\omega^-} \left( s', \arg\max_{a'} Q_{\omega}(s', a') \right)$$
+
+Example code:
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+# (Assume QNetwork and ReplayBuffer are imported/defined here from the previous example)
+
+def double_dqn(env, num_episodes, batch_size=64, gamma=0.99, epsilon=0.1, target_update_freq=10):
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    
+    # Initialize networks and buffer (Identical to standard DQN)
+    policy_net = QNetwork(state_dim, action_dim)
+    target_net = QNetwork(state_dim, action_dim)
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
+    
+    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+    memory = ReplayBuffer(capacity=10000)
+    
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        done = False
+        
+        while not done:
+            # --- ACTION SELECTION (Behavior Policy) ---
+            if random.uniform(0, 1) < epsilon:
+                action = random.randint(0, action_dim - 1)
+            else:
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                with torch.no_grad():
+                    action = policy_net(state_tensor).argmax().item()
+                
+            # --- INTERACT & STORE ---
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            memory.push(state, action, reward, next_state, done)
+            state = next_state
+            
+            # --- THE DOUBLE DQN TRAINING STEP ---
+            if len(memory) >= batch_size:
+                states, actions, rewards, next_states, dones = memory.sample(batch_size)
+                
+                states = torch.FloatTensor(states)
+                actions = torch.LongTensor(actions).unsqueeze(1)
+                rewards = torch.FloatTensor(rewards).unsqueeze(1)
+                next_states = torch.FloatTensor(next_states)
+                dones = torch.FloatTensor(dones).unsqueeze(1)
+                
+                # 1. Current Q-Values (from Main Network)
+                current_q = policy_net(states).gather(1, actions)
+                
+                # 2. TARGET CALCULATION: The Double DQN Decoupling Trick
+                with torch.no_grad():
+                    # STEP A: Use the MAIN network to decide the BEST action 
+                    # (This is argmax Q_omega(s', a'))
+                    best_next_actions = policy_net(next_states).argmax(1).unsqueeze(1)
+                    
+                    # STEP B: Use the TARGET network to EVALUATE that specific action
+                    # (This is Q_omega-(s', argmax...))
+                    # We use .gather() to pull the exact value for the action chosen in Step A
+                    next_q_values = target_net(next_states).gather(1, best_next_actions)
+                    
+                    # Build the final TD Target
+                    target_q = rewards + (gamma * next_q_values * (1 - dones))
+                    
+                # 3. Calculate Loss and Optimize
+                loss = nn.MSELoss()(current_q, target_q)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+        # --- SYNC TARGET NETWORK ---
+        if episode % target_update_freq == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+            
+    return policy_net
+
+# --- Example Usage ---
+# import gym
+# env = gym.make('CartPole-v1')
+# trained_double_dqn = double_dqn(env, num_episodes=500)
+```
+#### 4.2.4.6 Dueling DQN
+
+Dueling DQN is another brilliant, yet surprisingly simple, evolution of the standard DQN algorithm. While Double DQN fixes a mathematical flaw in how targets are calculated, Dueling DQN changes the physical architecture of the neural network itself. To understand Dueling DQN, we first have to introduce a new concept called the Advantage Function ($A$).
+
+In standard reinforcement learning, we know that $Q(s,a)$ tells us the expected return of taking a specific action in a specific state. However, $Q(s,a)$ is actually made up of two separate pieces of information:
+
+- State-Value ($V(s)$): How good is it just to be in this state, regardless of what you do next?
+- Advantage ($A(s,a)$): Compared to the average baseline of this state, how much better or worse is this specific action?
+
+The formula is simply:
+$$A(s,a) = Q(s,a) - V(s)$$
+
+Standard DQN uses one unified neural network to directly output the $Q$ values for all actions. Dueling DQN changes this. It uses shared neural network layers (parameterized by $\eta$) at the beginning to extract features (like looking at the screen). But at the very end, the network splits into two separate streams:
+
+1. Stream 1 (Value Branch): Parameterized by $\alpha$, this branch outputs a single number: the state-value $V_{\eta, \alpha}(s)$.
+2. Stream 2 (Advantage Branch): Parameterized by $\beta$, this branch outputs a vector containing the advantage of every possible action $A_{\eta, \beta}(s, a)$.
+
+Finally, the network adds these two streams back together at the very end to output the final $Q$ values:
+
+$$Q_{\eta, \alpha, \beta}(s, a) = V_{\eta, \alpha}(s) + A_{\eta, \beta}(s, a)$$
+
+While the equation above looks perfect, it has a fatal flaw in practice: unidentifiability. If the neural network is training and looking at the final $Q$ value, it can't tell what came from $V$ and what came from $A$. For example, if the network adds a massive constant $C$ to the $V$ branch, and subtracts that exact same $C$ from all the $A$ outputs, the final $Q$ value remains completely unchanged. This ambiguity causes severe training instability. To force the network to uniquely identify the true $V$ and the true $A$, we have to mathematically anchor the Advantage function. There are two ways to do this:
+
+1. Force the advantage of the absolute best action to be exactly $0$.
+
+$$Q_{\eta, \alpha, \beta}(s,a) = V_{\eta, \alpha}(s) + A_{\eta, \beta}(s,a) - \max_{a'} A_{\eta, \beta}(s, a')$$
+
+In this scenario, $V(s) = \max_a Q(s,a)$.
+
+2. The Mean Approach (Used in Practice). Instead of using the maximum, subtract the average advantage across all actions.
+
+$$Q_{\eta, \alpha, \beta}(s,a) = V_{\eta, \alpha}(s) + \left( A_{\eta, \beta}(s,a) - \frac{1}{|A|} \sum_{a'} A_{\eta, \beta}(s, a') \right)$$
+
+While this technically means $V(s)$ is now the average $Q$ value instead of the optimal $Q$ value (breaking strict Bellman optimality), it has been proven to be far more stable during actual code implementation.
+
+You might wonder why we go through all this trouble just to add two numbers together at the end. The answer is learning efficiency. In standard DQN, if you take an action, you only update the $Q$ value for that specific action. The other actions learn nothing. In Dueling DQN, every single time you take an action and do an update, the shared $V(s)$ branch gets updated. Because $V(s)$ is shared across all actions, learning about one action indirectly updates the baseline value for all other actions in that state. Therefore, Dueling DQN learns state-value functions much more frequently and accurately, making it incredibly effective at learning the true differences between actions, especially in environments with massive action spaces.
+
+Example code:
+```python
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+# (Assume ReplayBuffer and the main training loop are imported/defined here)
+
+class DuelingQNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(DuelingQNetwork, self).__init__()
+        
+        # --- 1. SHARED FEATURE EXTRACTION (eta / η) ---
+        # This part looks at the state and extracts general patterns
+        self.feature_layer = nn.Sequential(
+            nn.Linear(state_dim, 64),
+            nn.ReLU()
+        )
+        
+        # --- 2. THE VALUE STREAM (alpha / α) ---
+        # Estimates the baseline value of being in this state: V(s)
+        # Notice the final output size is exactly 1 (a single number)
+        self.value_stream = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1) 
+        )
+        
+        # --- 3. THE ADVANTAGE STREAM (beta / β) ---
+        # Estimates the relative advantage of each action: A(s, a)
+        # Notice the final output size matches the number of possible actions
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim)
+        )
+        
+    def forward(self, x):
+        # 1. Pass the state through the shared feature layer
+        features = self.feature_layer(x)
+        
+        # 2. Split the features into the two separate streams
+        values = self.value_stream(features)
+        advantages = self.advantage_stream(features)
+        
+        # --- 4. THE AGGREGATION LAYER (Solving Unidentifiability) ---
+        # We combine them using the "Mean Approach" formula: 
+        # Q(s,a) = V(s) + ( A(s,a) - mean(A) )
+        # .mean(1, keepdim=True) calculates the average advantage across all actions
+        q_values = values + (advantages - advantages.mean(1, keepdim=True))
+        
+        return q_values
+
+# --- Example of How to Use It ---
+# To run Dueling DQN, just initialize this network instead of the standard one!
+# policy_net = DuelingQNetwork(state_dim, action_dim)
+# target_net = DuelingQNetwork(state_dim, action_dim)
+# ... then run the exact same training loop as standard DQN or Double DQN.
+
+```
