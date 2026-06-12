@@ -2187,7 +2187,7 @@ def reinforce(env, num_episodes, alpha=1e-3, gamma=0.99):
 # trained_policy = reinforce(env, num_episodes=1000)
 ```
 
-#### 4.2.5.3 Actor-Critic
+#### 4.2.5.2 Actor-Critic
 
 Actor-Critic is one of the most elegant and powerful frameworks in Reinforcement Learning. It represents the ultimate hybrid approach: it takes the direct, goal-oriented nature of Policy-Based algorithms (like REINFORCE) and merges it with the step-by-step efficiency of Value-Based algorithms (like DQN). Fundamentally, Actor-Critic is a policy-based algorithm, but it recruits a value function to serve as an "assistant" to help the policy learn faster and more stably. 
 
@@ -2354,7 +2354,7 @@ def actor_critic(env, num_episodes, alpha_actor=1e-3, alpha_critic=1e-2, gamma=0
 # trained_actor, trained_critic = actor_critic(env, num_episodes=500)
 ```
 
-##### 4.2.5.3.1 TRPO
+##### 4.2.5.2.1 TRPO
 
 Trust Region Policy Optimization (TRPO) is a foundational algorithm in modern Reinforcement Learning, designed to solve a critical flaw in standard Policy Gradient methods: the "cliff fall" problem. In standard algorithms, if the learning rate pushes the policy parameters too far, the new policy might behave completely differently, causing a catastrophic drop in performance. TRPO introduces a mathematical framework to guarantee monotonic improvement—meaning every single update is mathematically proven to result in a policy that is better than (or equal to) the old one.
 
@@ -2670,7 +2670,7 @@ def trpo_update(actor, critic, critic_optimizer, states, actions, rewards, next_
 # trpo_update(actor, critic, critic_optimizer, states, actions, rewards, next_state, done)
 ```
 
-##### 4.2.5.3.2 PPO
+##### 4.2.5.2.2 PPO
 
 Proximal Policy Optimization (PPO) is widely considered the default, state-of-the-art Reinforcement Learning algorithm today. Developed by John Schulman at OpenAI in 2017 (the same lead author as TRPO), PPO was explicitly designed to fix the massive computational headaches of TRPO while keeping all of its stability guarantees. TRPO relies on complex second-order mathematics (Hessian matrices, conjugate gradients) to enforce its "Trust Region." PPO achieves the exact same goal—preventing the policy from changing too drastically—using simple, first-order gradient descent.
 
@@ -2721,6 +2721,128 @@ $$\hat{A}_t = \sum_{l=0}^\infty (\gamma \lambda)^l \delta_{t+l}$$
 
 Where $\delta_t$ is the standard 1-step TD Error, $\gamma$ is the discount factor, and $\lambda$ is the exponential decay factor.
 
+Example code:
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+
+# --- 1. THE NETWORKS ---
+# (Identical to the standard Actor-Critic setup)
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Actor, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, action_dim), nn.Softmax(dim=-1)
+        )
+    def forward(self, x): return self.net(x)
+
+class Critic(nn.Module):
+    def __init__(self, state_dim):
+        super(Critic, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 1)
+        )
+    def forward(self, x): return self.net(x)
+
+# --- 2. GENERALIZED ADVANTAGE ESTIMATION (GAE) ---
+def compute_gae(rewards, values, dones, next_value, gamma=0.99, lam=0.95):
+    advantages = []
+    gae = 0
+    # Loop backwards through the trajectory
+    for step in reversed(range(len(rewards))):
+        if step == len(rewards) - 1:
+            delta = rewards[step] + gamma * next_value * (1 - dones[step]) - values[step]
+        else:
+            delta = rewards[step] + gamma * values[step + 1] * (1 - dones[step]) - values[step]
+        
+        gae = delta + gamma * lam * (1 - dones[step]) * gae
+        advantages.insert(0, gae)
+        
+    returns = [a + v for a, v in zip(advantages, values)]
+    return torch.tensor(advantages, dtype=torch.float32), torch.tensor(returns, dtype=torch.float32)
+
+# --- 3. THE PPO UPDATE ENGINE ---
+def ppo_update(actor, critic, optimizer, memory, eps_clip=0.2, K_epochs=4):
+    """
+    Args:
+        memory: A dictionary/object containing the trajectory data.
+        eps_clip: The clipping hyperparameter (epsilon, usually 0.2).
+        K_epochs: How many times we update the network using this same batch of data.
+    """
+    # Convert memory lists to PyTorch tensors
+    old_states = torch.FloatTensor(memory['states'])
+    old_actions = torch.LongTensor(memory['actions'])
+    old_logprobs = torch.FloatTensor(memory['logprobs'])
+    rewards = memory['rewards']
+    dones = memory['dones']
+    
+    # 1. Calculate GAE and Returns using old network evaluations
+    with torch.no_grad():
+        old_values = critic(old_states).squeeze().numpy()
+        # Assume the episode ended or we bootstrapped the last value
+        next_val = 0.0 
+    
+    advantages, returns = compute_gae(rewards, old_values, dones, next_val)
+    
+    # Normalize advantages for training stability
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    
+    # --- PPO's SECRET WEAPON: K-Epochs ---
+    # Because of the clipping safety net, PPO can reuse the exact same trajectory 
+    # data multiple times (K_epochs) to learn more efficiently.
+    for _ in range(K_epochs):
+        
+        # 2. Evaluate the SAME states/actions using the NEW, currently updating network
+        action_probs = actor(old_states)
+        dist = Categorical(action_probs)
+        
+        new_logprobs = dist.log_prob(old_actions)
+        new_values = critic(old_states).squeeze()
+        entropy = dist.entropy() # Used to encourage exploration
+        
+        # 3. Calculate the Probability Ratio: r_t(theta) = pi_new / pi_old
+        # Note: exp(log_a - log_b) is mathematically identical to (a / b)
+        ratios = torch.exp(new_logprobs - old_logprobs)
+        
+        # 4. Calculate the Clipped Surrogate Objective
+        surr1 = ratios * advantages
+        surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages
+        
+        # PPO-Clip Actor Loss (We take the MINIMUM of the two, and negative for Gradient Ascent)
+        actor_loss = -torch.min(surr1, surr2).mean()
+        
+        # Standard Critic Loss (Mean Squared Error)
+        critic_loss = nn.MSELoss()(new_values, returns)
+        
+        # 5. Combined Loss and Backpropagation
+        # (Subtracting entropy encourages the network to remain slightly uncertain/exploratory)
+        loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy.mean()
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+# --- Example Usage (Pseudo-code loop) ---
+# actor = Actor(state_dim=4, action_dim=2)
+# critic = Critic(state_dim=4)
+# # Notice PPO can use one shared optimizer for both networks
+# optimizer = optim.Adam([
+#     {'params': actor.parameters(), 'lr': 3e-4},
+#     {'params': critic.parameters(), 'lr': 1e-3}
+# ])
+# 
+# memory = {'states': [], 'actions': [], 'logprobs': [], 'rewards': [], 'dones': []}
+# ... collect trajectory data by playing the game ...
+# ppo_update(actor, critic, optimizer, memory, eps_clip=0.2, K_epochs=10)
+# memory.clear() # Must clear memory after updating (On-Policy)
+```
+
 **Advantages**
 - Stable Updates: The clipping/penalty mechanisms brilliantly prevent the catastrophic performance drops seen in basic Policy Gradients.
 
@@ -2733,7 +2855,7 @@ Where $\delta_t$ is the standard 1-step TD Error, $\gamma$ is the discount facto
   
 - Hyperparameter Sensitivity: PPO requires careful tuning of its parameters in practice, specifically the clipping range $\epsilon$ and the GAE decay factor $\lambda$, to achieve optimal performance.
   
-#### 4.2.5.4 A3C
+#### 4.2.5.3 A3C
 
 A3C (Asynchronous Advantage Actor-Critic) represents a massive leap forward in making Deep Reinforcement Learning fast, efficient, and stable. To understand how it works, we can break its name down into its three core components: Asynchronous, Advantage, and Actor-Critic.
 
@@ -2759,7 +2881,7 @@ This calculation is mathematically identical to the TD Error.
 
 Under the hood of every single parallel worker is the classic Actor-Critic architecture. A3C takes the stable, low-variance learning of the Advantage Actor-Critic architecture and supercharges it by deploying an Asynchronous army of agents. By doing so, it learns faster, explores more diversely, and completely eliminates the need for bulky memory buffers like those used in DQN.
 
-#### 4.2.5.5 DDPG (Deep Deterministic Policy Gradient)
+#### 4.2.5.4 DDPG (Deep Deterministic Policy Gradient)
 
 If DQN conquered discrete games like Atari, DDPG was built to conquer the real physical world. It represents a major milestone by successfully adapting the Actor-Critic framework to handle environments where actions aren't simple buttons, but continuous, fine-tuned controls.
 
