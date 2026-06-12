@@ -208,3 +208,11 @@
     * **4.2.5.4 DDPG**
 * **4.2.6 Sparse Reward Processing**
 * **4.2.7 RLHF + PPO**
+* **4.2.8 DPO**
+* **4.2.9 GRPO**
+* **4.2.10 GPG**
+* **4.2.11 GSPO**
+* **4.2.12 SAPO**
+* **4.2.13 GDPO**
+* **4.2.14 FIPO**
+* **4.2.15 Reinforcement Learning in OpenAI**
