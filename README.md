@@ -204,7 +204,7 @@
     * **4.2.5.2 Actor-Critic**
       * **4.2.5.2.1 TRPO**
       * **4.2.5.2.2 PPO**
-    * **4.2.5.4 A3C**
-    * **4.2.5.5 DDPG**
+    * **4.2.5.3 A3C**
+    * **4.2.5.4 DDPG**
 * **4.2.6 Sparse Reward Processing**
 * **4.2.7 RLHF + PPO**
