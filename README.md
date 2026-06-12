@@ -199,3 +199,12 @@
     * **4.2.4.4 DQN**
     * **4.2.4.5 Double DQN**
     * **4.2.4.6 Dueling DQN**
+* **4.2.5 Policy Gradient Methods**
+    * **4.2.5.1 REINFORCE**
+    * **4.2.5.2 Actor-Critic**
+      * **4.2.5.2.1 TRPO**
+      * **4.2.5.2.2 PPO**
+    * **4.2.5.4 A3C**
+    * **4.2.5.5 DDPG**
+* **4.2.6 Sparse Reward Processing**
+* **4.2.7 RLHF + PPO**
