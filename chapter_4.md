@@ -952,6 +952,65 @@ OpenAI and the broader AI industry adopted Reinforcement Learning—specifically
 
 - Continuous Alignment Improvement: Through continuous RL optimization, the model proactively adapts its behavior to consistently maximize the reward, driving its outputs to match human expectations much more reliably than SFT alone.
 
+Both Supervised Fine-Tuning (SFT) and Reinforcement Learning (RL) share a fundamental, underlying objective: they both aim to minimize the "distance" between the estimated distribution representing the large language model's output ($Q_\theta$) and the real-world distribution representing how humans actually speak ($P$). However, if we use Kullback-Leibler (KL) divergence to measure this mathematical distance, their core difference becomes clear: SFT's minimization goal is Forward KL, whereas RL's minimization goal is Reverse KL.
+
+SFT is fundamentally a supervised learning process.
+
+- It relies on a sample dataset $\mathcal{D} = \{(x_i, y_i)\}$ drawn directly from a ground-truth data distribution $P(x, y) = P(x)P(y|x)$, where $x$ is the Prompt and $y$ is the Response.
+- The primary objective is to train a model $\theta$ such that its output distribution $Q_\theta$ minimizes the SFT training loss. This loss is defined as $\mathcal{L}_{SFT}(\theta) = -\mathbb{E}_{(x,y)\sim P} [\log Q_\theta(y | x)]$, which perfectly aligns with the principle of empirical risk minimization.
+- Minimizing this loss function is mathematically equivalent to the estimation goal of maximum likelihood estimation (MLE). The MLE based on the dataset $\mathcal{D}$ is $\arg \max_\theta \mathbb{E}_{(x,y)\sim P} [\log Q_\theta(y | x)]$, which mirrors the loss minimization process: $\arg \min_\theta -\mathbb{E}_{(x,y)\sim P} [\log Q_\theta(y | x)]$.
+
+We can derive the Forward KL divergence by breaking down the loss minimization equation, denoting $D_{KL}(P||Q)$ as the KL divergence from $Q$ to $P$:
+
+$$ \arg \min_\theta \mathcal{L}{SFT}(\theta) = \arg \min\theta -\mathbb{E}{(x,y)\sim P} [\log Q\theta(y | x)] $$
+
+By inserting a constant term relative to $\theta$ (specifically $-\mathbb{E}_{(x,y)\sim P} [-\log P(y | x)]$), the equation expands to:
+
+$$ = \arg \min_\theta \mathbb{E}{(x,y)\sim P} [-\log Q\theta(y | x)] - \mathbb{E}_{(x,y)\sim P} [-\log P(y | x)] $$
+
+This simplifies directly into the Forward KL divergence formulation:
+
+$$ = \arg \min_\theta \mathbb{E}{x \sim P} \left[ \log \frac{P(y|x)}{Q\theta(y|x)} \right] = \arg \min_\theta D_{KL}(P || Q_\theta) $$
+
+Therefore, the ultimate objective of SFT is to optimize Forward KL.
+
+Reinforcement Learning also seeks to optimize the LLM $\theta$, but it views the decoding process differently: as a stochastic policy distribution $\pi(a|s)$ that generates a sequence trajectory $q_\pi(\tau)$.
+
+- The goal of RL is to learn a hypothetical optimal trajectory distribution $P_{opt}(\tau)$.
+- Unlike SFT, we cannot sample directly from this optimal distribution.
+- Using PPO as an example, the algorithm optimizes the expected advantage within a trajectory:
+
+$$J_{PPO}(\theta) = \mathbb{E}_{a \sim \pi_{\theta_{old}}} \left[ \frac{\pi_\theta(a|s)}{\pi_{\theta_{old}}(a|s)} A(s,a) - \beta D_{KL}[\pi_\theta(a|s), \pi_{\theta_{old}}(a|s)] \right]$$
+
+- Under a single-step or short-sighted approximation, this optimization target simplifies to maximizing the advantage: $\arg \max_\theta \mathbb{E}_{a \sim \pi_\theta} [A(s, a)]$.
+
+To connect this goal to KL divergence, we must apply two core hypotheses from Maximum Entropy RL:
+
+- Advantage Approximation: By modeling $Q(s, a) \approx r(s, a) - \log \pi_\theta(a|s) + V(s')$ and substituting it into the formula $A(s, a) = Q(s, a) - V(s)$ (assuming $V(s') \approx V(s)$), we arrive at $A(s, a) \approx r(s, a) - \log \pi_\theta(a|s) + V(s') - V(s)$.
+
+- Trajectory Probability: We assume $\log P(\tau) = \sum_{t=1}^T r(s_t, a_t)$, which establishes that the probability of a trajectory $\tau$ appearing is strictly proportional to the cumulative reward obtained along that path in exponential space.
+
+Applying these assumptions, we expand the optimization target over the summation of time steps $t$:
+
+$$ \arg \max_\theta \mathbb{E}{(a,t) \sim \pi\theta} [A(s_t, a_t)] = \arg \max_\theta \mathbb{E}{a \sim \pi\theta} \left[ \sum_{t=1}^T (r(s_t, a_t) - \log \pi_\theta(a_t|s_t)) \right] $$
+
+We can split this equation into the sum of rewards and the sum of negative log probabilities:
+
+$$ = \arg \max_\theta \mathbb{E}{a \sim \pi\theta} \left[ \sum_{t=1}^T r(s_t, a_t) \right] + \mathbb{E}{a \sim \pi\theta} \left[ \sum_{t=1}^T -\log \pi(a_t|s_t) \right] $$
+
+By substituting our assumption for $\log P(\tau)$ and recognizing the right side as $-\log Q_\theta(\tau)$, we get:
+
+$$ = \arg \max_\theta \mathbb{E}{a \sim \pi\theta} [\log P(\tau)] + \mathbb{E}{a \sim \pi\theta} [-\log Q_\theta(\tau)] $$
+
+Changing the optimization from maximization to minimization flips the signs:
+
+$$ = \arg \min_\theta \mathbb{E}{a \sim \pi\theta} [-\log P(\tau)] + \mathbb{E}{a \sim \pi\theta} [\log Q_\theta(\tau)] $$
+
+This final configuration merges perfectly into the definition of Reverse KL divergence:
+
+$$ = \arg \min_\theta \mathbb{E}{a \sim \pi\theta} \left[ \log \frac{Q_\theta(\tau)}{P(\tau)} \right] = \arg \min_\theta D_{KL}(Q_\theta || P) $$
+
+Therefore, the ultimate objective of RL is to optimize Reverse KL.
 
 ### 4.2.1 Markov Decision Process
 Markov Decision Process (MDP) is the foundational mathematical framework for almost all Reinforcement Learning. An MDP expands upon the simpler Markov models by adding "Actions." It is formally defined by a 5-tuple $\langle S, A, P, R, \gamma \rangle$:
@@ -3287,4 +3346,168 @@ def train_dpo_step(policy_model, ref_model, optimizer, batch, beta=0.1):
 # ref_model.eval() # Reference model is completely frozen
 # optimizer = torch.optim.AdamW(policy_model.parameters(), lr=1e-6)
 # ... loop through dataloader yielding (prompt, chosen, rejected) batches ...
+```
+
+### 4.2.9 GRPO
+
+To understand GRPO, we first have to look at the primary bottleneck of standard Proximal Policy Optimization (PPO). PPO is an Actor-Critic algorithm. During reinforcement learning, it requires a Value Model (Critic) to estimate the expected return of a state, which acts as a baseline to calculate the Advantage ($A_t$) using Generalized Advantage Estimation (GAE). In Large Language Models (LLMs), the Value Model is typically the exact same massive size as the Policy Model. This essentially doubles the memory footprint and compute time during training. In tasks like mathematical reasoning, a reward is usually only given at the very end of the sequence (Solution-level Reward) once the final answer is produced. Training a complex Value Model to predict the value of every single intermediate token is incredibly difficult and often unnecessary.
+
+GRPO solves this by completely eliminating the Value Model. Instead of using a separate neural network to predict a baseline, it establishes a baseline by comparing multiple outputs generated for the same prompt.
+
+Instead of relying on a Critic, GRPO uses a Group-based relative scoring system. For a specific prompt/question $q$, the old policy $\pi_{\theta_{old}}$ samples a group of $G$ different outputs: $\{o_1, o_2, \dots, o_G\}$. Each output is evaluated by the Reward Model to get a raw score: $\{r_1, r_2, \dots, r_G\}$. GRPO calculates the Advantage ($\hat{A}_{i,t}$) for each output by simply normalizing these raw scores using the group's mean and standard deviation:
+
+$$\hat{A}_{i,t} = \tilde{r}_i = \frac{r_i - \text{mean}(\mathbf{r})}{\text{std}(\mathbf{r})}$$
+
+If an output gets a score of $8/10$, PPO needs a Value Model to tell it if $8$ is good or bad for that specific state. In GRPO, if the rest of the group scored $9$, $10$, and $10$, the score of $8$ falls below the mean and gets a negative advantage. It directly aligns with how human preference works—learning through comparison.
+
+With the Advantage calculated, GRPO optimizes the policy using this objective function:
+
+$$\mathcal{J}_{GRPO}(\theta) = \mathbb{E} \left[ q \sim P(Q), \{o_i\}_{i=1}^G \sim \pi_{\theta_{old}}(O|q) \right]$$
+
+$$
+\frac{1}{G} \sum_{i=1}^G \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \left\{ \min \left[ \frac{\pi_\theta(o_{i,t} | q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t} | q, o_{i,<t})} \hat{A}_{i,t}, \text{clip} \left( \frac{\pi_\theta(o_{i,t} | q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t} | q, o_{i,<t})}, 1 - \epsilon, 1 + \epsilon \right) \hat{A}_{i,t} \right] - \beta \mathbb{D}_{KL} [\pi_\theta || \pi_{ref}] \right\}
+$$
+
+This looks intimidating, but it is structured into three clear parts:
+
+- The Probability Ratio & Clipping: Exactly like PPO, it calculates the ratio between the new policy and the old policy $\frac{\pi_{new}}{\pi_{old}}$, and clips it to $1 \pm \epsilon$ to prevent the model from updating too drastically in a single step.
+
+- The Group Advantage ($\hat{A}_{i,t}$): As derived above, this dictates the direction and magnitude of the update based on how well the output performed relative to its peers.
+
+- The KL Divergence Penalty ($\mathbb{D}_{KL}$): Unlike PPO (which adds the KL penalty into the reward signal itself), GRPO adds the KL divergence penalty directly into the loss function.
+
+To ensure the KL penalty is strictly positive and unbiased, GRPO uses a specific estimator:
+
+$$\mathbb{D}_{KL} [\pi_\theta || \pi_{ref}] = \frac{\pi_{ref}(o_{i,t} | q, o_{i,<t})}{\pi_\theta(o_{i,t} | q, o_{i,<t})} - \log \frac{\pi_{ref}(o_{i,t} | q, o_{i,<t})}{\pi_\theta(o_{i,t} | q, o_{i,<t})} - 1$$
+
+Standard GRPO uses Outcome Supervision (rewarding only at the end of the output). However, for complex reasoning tasks, this is often inefficient. DeepSeek adapted GRPO for Process Supervision. Instead of one score at the end, the reward model grades each reasoning step. Given $G$ sampled outputs, with each output having multiple steps, the rewards look like this:
+
+$$\mathbf{R} = \{\{r_1^{\text{index}(1)}, \dots, r_1^{\text{index}(K_1)}\}, \dots, \{r_G^{\text{index}(1)}, \dots, r_G^{\text{index}(K_G)}\}\}$$
+
+The normalization trick is applied to each specific step index across the group: $\tilde{r}_i^{\text{index}(j)} = \frac{r_i^{\text{index}(j)} - \text{mean}(\mathbf{R})}{\text{std}(\mathbf{R})}$.
+
+The final Advantage $\hat{A}_{i,t}$ for a token is the sum of all future normalized step rewards:
+
+$$\hat{A}_{i,t} = \sum_{\text{index}(j) \ge t} \tilde{r}_i^{\text{index}(j)}$$
+
+In practice, the training happens in loops. The policy is updated for $\mu$ iterations using GRPO. Then, the reference model is updated to match the current policy. Concurrently, the Reward Model is continuously trained using a replay mechanism (keeping about 10% historical data) to ensure the judge evolves alongside the generator. DeepSeek proved that SFT, DPO, PPO, and GRPO are all fundamentally doing the same mathematical operation. They formulated a unified gradient equation:
+
+$$\nabla_\theta \mathcal{J}_A(\theta) = \mathbb{E} \left[ \frac{1}{|o|} \sum_{t=1}^{|o|} GC_A(q, o, t, \pi_{ref}) \nabla_\theta \log \pi_\theta(o_t | q, o_{<t}) \right]$$
+
+Every algorithm simply uses a different Gradient Coefficient ($GC_A$) to dictate the strength and penalty of the data updates.
+
+
+Example code:
+```python
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+import copy
+
+# --- 1. SEQUENCE LOG PROBABILITY CALCULATION ---
+# (Identical to the DPO implementation, extracts the log prob of the actual generated tokens)
+def get_batch_logps(logits, labels, pad_token_id=-100):
+    shifted_logits = logits[..., :-1, :].contiguous()
+    shifted_labels = labels[..., 1:].contiguous()
+    log_probs = F.log_softmax(shifted_logits, dim=-1)
+    loss_mask = (shifted_labels != pad_token_id)
+    shifted_labels[shifted_labels == pad_token_id] = 0
+    per_token_logps = torch.gather(log_probs, dim=2, index=shifted_labels.unsqueeze(2)).squeeze(2)
+    return (per_token_logps * loss_mask).sum(-1)
+
+# --- 2. THE GRPO MATH ENGINE ---
+def compute_group_advantages(rewards):
+    """
+    Calculates the relative advantage of each output within the group.
+    rewards: A 1D tensor of scores for the G generated outputs.
+    """
+    mean_reward = rewards.mean()
+    std_reward = rewards.std() + 1e-8 # Add epsilon to prevent division by zero
+    
+    # Advantage = (Reward - Mean) / StdDev
+    advantages = (rewards - mean_reward) / std_reward
+    return advantages
+
+def grpo_loss(policy_logps, old_logps, ref_logps, advantages, epsilon=0.2, beta=0.1):
+    """
+    Calculates the GRPO objective function: Clipped PPO loss + analytical KL penalty.
+    """
+    # 1. The PPO-style Policy Gradient Loss
+    # Ratio = pi_new / pi_old
+    ratio = torch.exp(policy_logps - old_logps)
+    
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - epsilon, 1 + epsilon) * advantages
+    
+    # We take the negative because PyTorch optimizers minimize loss (Gradient Ascent)
+    pg_loss = -torch.min(surr1, surr2).mean()
+    
+    # 2. The Unbiased KL Divergence Penalty
+    # Math: (pi_ref / pi_theta) - log(pi_ref / pi_theta) - 1
+    # Let x = log(pi_ref) - log(pi_theta)
+    x = ref_logps - policy_logps
+    
+    # KL = exp(x) - x - 1
+    kl_penalty = (torch.exp(x) - x - 1).mean()
+    
+    # 3. Total Loss
+    total_loss = pg_loss + beta * kl_penalty
+    
+    return total_loss
+
+# --- 3. THE GRPO TRAINING LOOP (Pseudo-code structure) ---
+def train_grpo_step(policy_model, ref_model, reward_model, optimizer, prompt_input, G=4):
+    """
+    Executes a single step of GRPO for a single prompt.
+    G: The group size (number of responses to sample).
+    """
+    optimizer.zero_grad()
+    
+    # 1. SAMPLE A GROUP OF OUTPUTS (The core mechanic of GRPO)
+    # Note: In practice, this generation step is done with torch.no_grad()
+    with torch.no_grad():
+        # Generate G different responses for the same prompt
+        generated_sequences = policy_model.generate(prompt_input, num_return_sequences=G, do_sample=True)
+        
+        # 2. SCORE THE GROUP
+        # Pass the G (prompt + response) sequences to the Reward Model
+        rewards = reward_model(generated_sequences).squeeze() 
+        
+        # Calculate the Group Relative Advantages
+        advantages = compute_group_advantages(rewards)
+        
+        # Get the "Old" log probabilities before updating the network
+        old_logits = policy_model(generated_sequences).logits
+        old_logps = get_batch_logps(old_logits, generated_sequences)
+        
+        # Get the "Reference" log probabilities from the frozen SFT model
+        ref_logits = ref_model(generated_sequences).logits
+        ref_logps = get_batch_logps(ref_logits, generated_sequences)
+
+    # 3. CALCULATE CURRENT POLICY PROBABILITIES (Requires Gradients)
+    # Now we do a forward pass with the network we are actively training
+    policy_logits = policy_model(generated_sequences).logits
+    policy_logps = get_batch_logps(policy_logits, generated_sequences)
+    
+    # 4. COMPUTE LOSS AND UPDATE
+    loss = grpo_loss(
+        policy_logps=policy_logps, 
+        old_logps=old_logps, 
+        ref_logps=ref_logps, 
+        advantages=advantages, 
+        epsilon=0.2, 
+        beta=0.01 # DeepSeek typically uses a very small KL penalty for GRPO
+    )
+    
+    loss.backward()
+    optimizer.step()
+    
+    return loss.item()
+
+# --- Example Initialization ---
+# policy_model = AutoModelForCausalLM.from_pretrained("path_to_SFT_model")
+# ref_model = copy.deepcopy(policy_model).eval() # Frozen
+# reward_model = CustomRewardModel().eval() # Frozen Judge
+# optimizer = torch.optim.AdamW(policy_model.parameters(), lr=1e-6)
+# ... loop through prompts ...
 ```
