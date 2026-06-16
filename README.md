@@ -214,4 +214,4 @@
 * **4.2.11 SAPO**
 * **4.2.12 GDPO**
 * **4.2.13 FIPO**
-* **4.2.14 Reinforcement Learning in OpenAI**
+* **4.2.14 Reinforcement Learning in ChatGPT**
