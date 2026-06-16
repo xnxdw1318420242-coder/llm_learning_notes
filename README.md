@@ -215,3 +215,9 @@
 * **4.2.12 GDPO**
 * **4.2.13 FIPO**
 * **4.2.14 Reinforcement Learning in ChatGPT**
+    * **4.2.14.1 PRM**
+    * **4.2.14.2 STaR**
+    * **4.2.14.3 Quiet-STaR**
+    * **4.2.14.4 Test-Time Computing**
+    * **4.2.14.5 MCTS**
+* **4.2.15 On-Policy Distillation**
