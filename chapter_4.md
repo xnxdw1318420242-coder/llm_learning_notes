@@ -3511,3 +3511,202 @@ def train_grpo_step(policy_model, ref_model, reward_model, optimizer, prompt_inp
 # optimizer = torch.optim.AdamW(policy_model.parameters(), lr=1e-6)
 # ... loop through prompts ...
 ```
+
+### 4.2.10 GSPO
+
+Group Sequence Policy Optimization (GSPO) is an advanced reinforcement learning algorithm designed to solve the critical instability issues that plague standard token-level algorithms (like PPO and GRPO) when training massive, modern language models. Algorithms like GRPO and PPO have been highly successful, but researchers observed catastrophic and irreversible model collapse when scaling them to handle long responses, large batch sizes, and Mixture of Experts (MoE) architectures. The root cause of this failure is the misuse of token-level importance weights. In standard reinforcement learning, Importance Sampling is used to correct the distribution difference between the old policy ($\pi_{\theta_{old}}$) and the current policy ($\pi_\theta$):
+
+$$\mathbb{E}_{z \sim \pi_\theta}[f(z)] = \mathbb{E}_{z \sim \pi_{\theta_{old}}}\left[ \frac{\pi_\theta(z)}{\pi_{\theta_{old}}(z)} f(z) \right]$$
+
+GRPO retains PPO's per-token importance weight:
+
+$$
+w_{i,t}(\theta) = \frac{\pi_\theta(y_{i,t} \mid x, y_{i, < t})}{\pi_{\theta_{old}}(y_{i,t} \mid x, y_{i, < t})}
+$$
+
+The Shortcomings of this approach:
+
+- High-Variance Noise: A single token weight cannot adequately correct the entire distribution, injecting massive mathematical noise into the training process.
+
+- Noise Accumulation: Over long sequences, this noise accumulates. When passed through clipping functions, the errors are amplified, leading to irreversible model collapse
+
+- Granularity Mismatch: The fundamental unit of the Reward is the entire sequence (e.g., getting the final math answer right), but the unit of Optimization is the individual token. They do not match.
+
+- The MoE Problem: In MoE architectures, this noise is exponentially worse because the old and new policies might route tokens to completely different Experts, destroying the reliability of per-token sampling.
+
+GSPO elevates the importance weights and the optimization objective completely to the Sequence Level, perfectly aligning the sampling with the reward granularity.
+
+GSPO fixes this mismatch through four specific mathematical steps.
+
+1. Group Sampling. Just like GRPO, for each prompt $x$, the algorithm samples a group of $G$ complete responses from the old policy:
+
+$$\{y_i\}_{i=1}^G \sim \pi_{\theta_{old}}(\cdot | x)$$
+
+2. In-Group Relative Advantage. It calculates the advantage $\hat{A}_i$ using the group's relative performance, completely bypassing the need for a Critic/Value network. It uses the group mean ($\mu$) and standard deviation ($\sigma$):
+
+$$\hat{A}_i = \frac{r(x, y_i) - \mu}{\sigma} \quad \text{where} \quad \mu = \frac{1}{G}\sum_{j=1}^G r(x, y_j), \quad \sigma = \sqrt{\frac{1}{G}\sum_{j=1}^G (r(x, y_j) - \mu)^2}$$
+
+3. Sequence-Level Importance Weight ($s_i(\theta)$). Instead of calculating the probability ratio token-by-token, GSPO calculates the ratio for the entire sequence. Crucially, to reduce variance and bias, it performs length normalization using a geometric mean.
+   
+$$
+s_i(\theta) = \exp \left( \frac{1}{\lvert y_i \rvert} \sum_{t=1}^{\lvert y_i \rvert} \log \frac{\pi_\theta(y_{i,t} \mid x, y_{i, < t})}{\pi_{\theta_{old}}(y_{i,t} \mid x, y_{i, < t})} \right) = \left( \frac{\pi_\theta(y_i \mid x)}{\pi_{\theta_{old}}(y_i \mid x)} \right)^{\frac{1}{\lvert y_i \rvert}}
+$$
+
+4. The Sequence-Level Objective Function. GSPO applies the standard PPO clipping mechanism, but applies it to the entire sequence weight $s_i(\theta)$ rather than individual tokens.
+
+$$\mathcal{J}_{GSPO}(\theta) = \mathbb{E}_{x, \{y_i\}} \left[ \frac{1}{G} \sum_{i=1}^G \min \left( s_i(\theta) \hat{A}_i, \text{clip}(s_i(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_i \right) \right]$$
+
+If $s_i(\theta)$ falls outside the $[1-\epsilon, 1+\epsilon]$ bounds, the entire response is excluded from the gradient update, cleanly avoiding token-level noise.
+
+If we look at the unclipped gradient derivation, we can see exactly why GSPO provides vastly superior stability:
+
+$$\nabla_\theta \mathcal{J}_{GSPO}(\theta) = \mathbb{E}_{x, \{y_i\}} \left[ \frac{1}{G} \sum_{i=1}^G \left( \frac{\pi_\theta(y_i|x)}{\pi_{\theta_{old}}(y_i|x)} \right)^{\frac{1}{|y_i|}} \frac{\hat{A}_i}{|y_i|} \sum_{t=1}^{|y_i|} \nabla_\theta \log \pi_\theta(y_{i,t}|x, y_{i,<t}) \right]$$
+
+In GRPO, every single token gets a different weight, causing erratic updates. In GSPO, all tokens within the same response are equally scaled by the exact same multiplier $\left(\frac{\hat{A}_i}{|y_i|}\right)$. This elegantly eliminates the instability caused by per-token weight differences.
+
+While sequence-level optimization is generally superior, some specific tasks (like multi-turn RL) explicitly require token-level advantage adjustments. For these edge cases, the authors provide GSPO-token, a token-level variant that maintains the mathematical safety of the sequence-level approach.
+
+The objective function shifts back to iterating over $t$:
+
+$$
+\mathcal{J}_{GSPO-token}(\theta) = \mathbb{E}_{x, \lbrace y_i \rbrace} \left[ \frac{1}{G} \sum_{i=1}^G \frac{1}{\lvert y_i \rvert} \sum_{t=1}^{\lvert y_i \rvert} \min \left\lbrace s_{i,t}(\theta) \hat{A}_{i,t}, \mathrm{clip}(s_{i,t}(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_{i,t} \right\rbrace \right]
+$$
+
+To calculate the token-level weight $s_{i,t}(\theta)$, it blends the sequence weight with the token probabilities, utilizing a stop-gradient operation (denoted as $\text{sg}[\cdot]$, equivalent to .detach() in PyTorch):
+
+$$
+s_{i,t}(\theta) = \mathrm{sg}[s_i(\theta)] \cdot \frac{\pi_\theta(y_{i,t} \mid x, y_{i, < t})}{\mathrm{sg}[\pi_\theta(y_{i,t} \mid x, y_{i, < t})]}
+$$
+
+If every token is assigned the sequence's overall advantage ($\hat{A}_{i,t} = \hat{A}_i$), this formula is mathematically equivalent to standard GSPO, but its structure allows engineers to safely inject per-token reward adjustments if needed.
+
+### 4.2.11 SAPO
+
+When training massive Mixture-of-Experts (MoE) architectures—like the advanced models in the Qwen family—standard reinforcement learning algorithms run into a severe stability bottleneck. SAPO (Soft Adaptive Policy Optimization) was explicitly designed to cure this bottleneck. Algorithms like PPO, GRPO, and GSPO rely on Hard Clipping to keep the model stable during training. If a policy update deviates too far from the old policy (exceeding the $[1-\epsilon, 1+\epsilon]$ boundary), the algorithm aggressively cuts off the gradient. In MoE models, token-level importance sampling has exceptionally high variance because the old and new policies might route the exact same token to completely different experts. Hard clipping forces an impossible choice between stability and sample efficiency. If a sequence has just a few highly anomalous tokens that breach the hard boundary, algorithms like GSPO will completely discard the gradient for the entire sequence. This ruthlessly sacrifices highly useful learning signals from the rest of the perfectly valid tokens. SAPO replaces brittle hard clipping with a smooth, Temperature-Controlled Soft Gate Mechanism. It builds a continuous trust region that smoothly decays highly off-policy tokens while retaining all the useful signals from near-policy tokens.
+
+SAPO maintains the structural foundation of group-based RL but completely rewrites the clipping mechanism. The objective function is defined as:
+
+$$J(\theta) = \mathbb{E}_{q \sim \mathcal{D}, \{y_i\}_{i=1}^G \sim \pi_{\theta_{old}}(\cdot|q)} \left[ \frac{1}{G} \sum_{i=1}^G \frac{1}{|y_i|} \sum_{t=1}^{|y_i|} f_{i,t}(r_{i,t}(\theta)) \hat{A}_{i,t} \right]$$
+
+Instead of $\min()$ and $\text{clip}()$, SAPO introduces the Soft Gate Function ($f_{i,t}$):
+
+$$f_{i,t}(x) = \sigma(\tau_{i,t}(x - 1)) \cdot \frac{4}{\tau_{i,t}}$$
+
+- $x$ represents the importance ratio $r_{i,t}(\theta) = \frac{\pi_\theta}{\pi_{\theta_{old}}}$.
+- $\sigma(\cdot)$ is the standard Sigmoid function $\frac{1}{1 + e^{-x}}$.
+- $\hat{A}_{i,t}$ is the normalized relative Advantage of the sequence.
+- $\tau_{i,t}$ is the temperature parameter, dictating the shape and strictness of the gate.
+
+To understand why SAPO is so stable, we have to look at its derivative—specifically, the weight function $w_{i,t}(\theta)$ applied to the gradient during backpropagation:
+
+$$w_{i,t}(\theta) = 4 p_{i,t}(\theta)(1 - p_{i,t}(\theta)), \quad \text{where } p_{i,t}(\theta) = \sigma(\tau_{i,t}(r_{i,t}(\theta) - 1))$$
+
+This creates a brilliant Soft Trust Region:
+
+- The Peak: The weight function reaches its absolute maximum value of 1 exactly at $r_{i,t}(\theta) = 1$ (when the new policy exactly matches the old policy).
+
+- The Smooth Decay: As the ratio moves away from $1$, the weight smoothly and near-exponentially decays toward $0$.
+
+- The Coefficient Magic: The $\frac{4}{\tau_{i,t}}$ coefficient in the objective function isn't random. It guarantees that at $r=1$, the soft gate gradient perfectly equals the unclipped objective gradient, regardless of the temperature. This perfectly preserves on-policy behavior while preventing gradient vanishing.
+
+Not all deviations are created equal. Therefore, SAPO utilizes an Asymmetric Temperature Design based on whether the advantage is positive or negative:
+
+$$\tau_{i,t} = \begin{cases} \tau_{pos}, & \text{if } \hat{A}_{i,t} > 0 \\ \tau_{neg}, & \text{otherwise} \end{cases}$$
+
+When a model generates a token with a positive advantage, it increases the logit of that single token and decreases the rest. When a model generates a token with a negative advantage, it penalizes that specific token, but consequently diffuses positive gradients across a massive vocabulary of tens of thousands of unsampled tokens. In LLM RL, acceptable actions are highly sparse. Scattering gradients across thousands of random, irrelevant tokens acts as regularization but injects massive instability. Therefore, SAPO uses a strictly higher temperature ($\tau_{neg}$) for negative advantages, forcing their gradients to decay much faster and stabilizing the entire training loop.
+
+SAPO effectively bridges the gap between GRPO and GSPO, achieving both Sequence-level consistency and Token-level adaptability. Under stable conditions where token fluctuations are low, SAPO's math naturally degrades into sequence-level gating, acting just like GSPO. However, if a few rogue off-policy tokens spike, GSPO drops the entire sequence. SAPO survives by simply down-weighting the anomalous tokens, preserving the rest of the valid learning data. By replacing the sharp, jagged gradient cut-offs of GRPO's hard clipping with the smooth $\text{sech}^2$ curve of the soft gate, SAPO eliminates sudden gradient mutations, easily outperforming traditional methods in both sample efficiency and MoE training stability.
+
+### 4.2.12 GDPO
+
+Group Decoupled Policy Optimization (GDPO) is a targeted algorithmic evolution designed to fix the mathematical blind spots of GRPO when dealing with multi-objective reinforcement learning (where an AI is judged on multiple criteria at once, like accuracy, safety, and formatting). When training an LLM with multiple objectives, standard GRPO takes all the individual rewards, adds them into a single sum, and then normalizes them across the group. This "sum-first" approach causes Advantage Resolution Bias. Because different combinations of rewards can add up to the exact same total, GRPO can no longer mathematically distinguish between them. The algorithm condenses a wide variety of nuanced reward combinations into just a few flat advantage scores. This destroys the richness of the learning signal, leading to sparse rewards and ultimately causing Reward Collapse - where the model fails to converge or learn effectively.
+
+To cure this, GDPO restructures the math. According to the slides detailing Nvidia's modifications to the TRL (Transformer Reinforcement Learning) library, GDPO is implemented in three strict steps:
+
+1. Decoupled Group-Wise Normalization. Instead of summing first, GDPO performs an L2 normalization on each individual reward dimension independently across the generated group. For the $i$-th prompt, the $j$-th rollout, and the $k$-th reward objective, the normalized advantage $A_k^{(i,j)}$ is:
+
+$$A_k^{(i,j)} = \frac{r_k^{(i,j)} - \mathrm{mean}\lbrace r_k^{(i,1)}, \dots, r_k^{(i,G)} \rbrace}{\mathrm{std}\lbrace r_k^{(i,1)}, \dots, r_k^{(i,G)} \rbrace}$$
+
+Apples are normalized against apples, and oranges against oranges. The resolution of each distinct reward signal is perfectly preserved.
+
+2. Advantage Summation. Once decoupled and normalized, the individual advantages are combined into a single scalar advantage. This is typically done using a weighted sum to reflect the priority of different objectives:
+
+$$A_{(i,j)}^{sum} = w_1 A_{(i,j)}^1 + \dots + w_n A_{(i,j)}^n$$
+
+3. Batch-Wise Normalization. Because GDPO adds multiple already-normalized advantages together, the numerical scale of $A_{(i,j)}^{sum}$ will expand as you add more reward objectives. To maintain mathematical stability and prevent the gradient updates from blowing up, GDPO applies a final standardization across the entire training batch:
+
+$$\hat{A}_{(i,j)}^{sum} = \frac{A_{(i,j)}^{sum} - \mu_{batch}}{\sigma_{batch} + \epsilon}$$
+
+A tiny constant $\epsilon$ is added to the denominator to prevent division by zero.
+
+4. Advanced Optimization: Combating Reward Hacking. Even with perfectly decoupled advantages, multi-objective RL faces a behavioral issue: Reward Hacking. If the difficulty between objectives is vastly different (e.g., it is very easy to format text nicely, but very hard to do complex math), the model will lazily optimize the easy goal to farm points while completely ignoring the hard goal. Simply tweaking the weights ($w_1, w_2$) is often unstable and fails to fix this. GDPO introduces a threshold-based mechanism that forces strict prioritization. Given a primary, difficult reward ($r_l$) and a secondary, easy reward ($r_k$), you apply a threshold $t$:
+
+$$r_k = \begin{cases} r_k, & \text{if } r_l \ge t \\ 0, & \text{otherwise} \end{cases}$$
+
+The model earns zero points for the easy task unless it first achieves a baseline level of success on the hard task. This strictly enforces goal hierarchy and thoroughly eliminates the easy-objective domination problem.
+
+### 4.2.13 FIPO
+
+When evaluating the training infrastructure for advanced reasoning models (like the architectures behind DeepSeek and Qwen), a recurring bottleneck emerges. Standard RL algorithms are designed for single-step answers, but modern LLM Agents engage in Multi-step Agentic RL. FIPO is an advanced reinforcement learning method designed to solve the critical "Credit Assignment" failure in these multi-step reasoning models. Here is a thorough, structured breakdown of how FIPO mathematically achieves this.
+
+Previous sequence-level RL algorithms (like standard GRPO or DAPO) suffer from Coarse-grained Credit Assignment. They evaluate an entire reasoning trajectory and assign the exact same final reward to every single token in that trajectory. This causes three major issues:
+
+- Sparse Rewards: The model only gets a binary signal (1 for correct, 0 for incorrect) at the very end of a long chain.
+
+- Exploration Collapse: The model falls into a local optimum, relying on safe, short "single-pass logic" rather than exploring complex thought chains.
+
+- Length Stagnation: As training progresses, the model's Chain-of-Thought (CoT) length abruptly stops growing, and its accuracy ceiling stagnates alongside it.
+
+Not all tokens are equally important. In fact, RL training typically only alters about 2% of the tokens generated by a model. The key to unlocking deeper reasoning is to find those "sparse but critical" reasoning turn-points and assign token-level rewards without needing to train a massive, memory-heavy Value Model.
+
+Instead of using Kullback-Leibler (KL) divergence as a generic penalty (like PPO does to keep the model from straying too far), FIPO completely repurposes it as a directional steering signal. FIPO defines a Token-level Probability Shift ($\Delta \log p_t$):
+
+$$\Delta \log p_t = \log \pi_\theta(o_t \mid q, o_{<t}) - \log \pi_{\theta_{old}}(o_t \mid q, o_{<t})$$
+
+This elegantly measures the optimization direction at a specific token:
+
+- If $\Delta \log p_t > 0$: The current policy is generating this token more often than the old policy. The training is "encouraging" this specific step.
+
+- If $\Delta \log p_t < 0$: The training is actively "suppressing" this step.
+
+However, a single token's shift is just a local, instantaneous snapshot. A token is only truly critical if it positively impacts the rest of the reasoning chain.
+
+To measure a token's true impact, FIPO introduces Future-KL. It sums up all the probability shifts from the current token $t$ all the way to the end of the trajectory $T$. Mathematically, this represents the log-likelihood ratio of the joint probability distribution for the entire subsequent sequence:
+
+$$\mathrm{FutureKL}_t = \sum_{k=t}^T \Delta \log p_k$$
+
+- $\mathrm{FutureKL}_t > 0$: The policy is strengthening the entire trajectory after this point. This means token $o_t$ is a fantastic CoT "anchor" point.
+
+- $\mathrm{FutureKL}_t < 0$: The subsequent trajectory is being suppressed. The path following this token is a mistake.
+
+Vanilla Future-KL is mathematically volatile. Extreme outlier tokens can cause the negative accumulated signal to explode, leading to gradient explosion and complete catastrophic collapse of the model's response length (usually around step 70).
+
+FIPO implements two vital stability mechanisms to fix this:
+
+- Masking: FIPO uses a binary filter $M_k$. If a token's importance ratio exceeds a high dual-clip threshold $c$ (usually $c \ge 10$), it is entirely excluded from the sum. These extreme tokens have already been clipped by the main objective function, so accumulating them only adds noise.
+
+- Soft Decay Window: Instead of a hard cut-off, FIPO applies an exponential decay factor $\gamma^{k-t}$ (parameterized by a half-life $\tau$). This acts as a continuous sliding window, prioritizing the immediate impact of a token and fading out the distant future, much like the GAE $\lambda$ factor in PPO.
+
+The stabilized formula becomes:
+
+$$\mathrm{FutureKL}_t = \sum_{k=t}^T M_k \cdot \gamma^{k-t} \cdot \Delta \log p_k$$
+
+FIPO takes the stabilized $\mathrm{FutureKL}_t$ and transforms it into a multiplicative Influence Weight ($f_t$) that directly modifies the sequence-level advantage $\hat{A}_t$.
+
+$$f_t = \mathrm{clip} \left( \exp(\mathrm{FutureKL}_t), 1 - \epsilon_{flow}, 1 + \epsilon_{fhigh} \right)$$
+
+$$\tilde{A}_t = \hat{A}_t \cdot f_t$$
+
+This creates a brilliant, token-level reward system:
+
+- Amplifying Good Anchors: If the future looks bright ($\mathrm{FutureKL} > 0$), $f_t > 1$. If the overall sequence advantage is positive, this multiplies the reward, highly encouraging the critical token. If the sequence was negative, it penalizes the token harder for ruining a potentially good path.
+
+- Softening Weak Paths: If the future is suppressed ($\mathrm{FutureKL} < 0$), $f_t < 1$. It scales back the rewards and penalties, effectively telling the model, "This path is a dead end anyway, don't worry too much about the specific tokens here."
+
+For massive models like 32B with high capacity, FIPO uses a single-sided clip $[1.0, 1.2]$ to purely amplify critical tokens. For smaller 7B models where noisy exploration is costlier, it uses a precise dual-sided clip $[0.8, 1.2]$ to actively suppress non-critical tokens as well.
+
+The final FIPO objective function is essentially the DAPO objective function, but heavily upgraded with this token-level multiplier to unlock immense Chain-of-Thought capabilities without requiring a Value Model:
+
+$$\mathcal{J}_{\mathrm{FIPO}}(\theta) = \mathbb{E} \left[ \frac{1}{\sum_{i=1}^G \lvert o_i \rvert} \sum_{i=1}^G \sum_{t=1}^{\lvert o_i \rvert} \min \left( r_{i,t} f_{i,t} \hat{A}_{i,t}, \mathrm{clip}(r_{i,t}, 1-\epsilon_{low}, 1+\epsilon_{high}) f_{i,t} \hat{A}_{i,t} \right) \right]$$
+
+### 4.2.14 Reinforcement Learning in ChatGPT
