@@ -3710,3 +3710,184 @@ The final FIPO objective function is essentially the DAPO objective function, bu
 $$\mathcal{J}_{\mathrm{FIPO}}(\theta) = \mathbb{E} \left[ \frac{1}{\sum_{i=1}^G \lvert o_i \rvert} \sum_{i=1}^G \sum_{t=1}^{\lvert o_i \rvert} \min \left( r_{i,t} f_{i,t} \hat{A}_{i,t}, \mathrm{clip}(r_{i,t}, 1-\epsilon_{low}, 1+\epsilon_{high}) f_{i,t} \hat{A}_{i,t} \right) \right]$$
 
 ### 4.2.14 Reinforcement Learning in ChatGPT
+
+#### 4.2.14.1 STaR
+
+STaR (Self-Taught Reasoner) is a highly effective framework designed to improve a Large Language Model's (LLM) reasoning capabilities. STaR is fundamentally a "bootstrap" method. It allows a model to iteratively teach itself how to reason by generating its own step-by-step explanations (rationales), filtering for the correct ones, and learning from them.
+
+Traditional fine-tuning requires massive datasets containing questions, the step-by-step reasoning (rationales), and the final answers. Getting humans to write thousands of step-by-step rationales is incredibly expensive. STaR solves this by requiring only a dataset of questions and ground truth answers. The model is forced to generate the missing rationales itself.
+
+The STaR framework operates in a continuous loop of generation, verification, and learning:
+
+1. Rationale Generation: The LLM receives a Question and attempts to generate both a Rationale and an Answer.
+
+2. Verification: The generated Answer is checked against the known Ground Truth Answer. If correct, the model successfully reasoned its way to the right answer. The (Question, Rationale, Answer) triplet is saved as high-quality training data. If wrong, the generated rationale led to a failure. The model moves to the Rationalization step.
+
+3. Rationalization (The Hint Mechanism): Rationalization is the most important step and performs best. If the model failed initially, it is given a "Hint"—specifically, it is told what the correct answer actually is. The model must then work backward to generate a new rationale that justifies this correct answer. If it succeeds, this new rationalized data is also saved.
+
+4. Fine-Tuning (Outer Loop): The model is fine-tuned on all the successful reasoning chains (both from Step 2 and Step 3). The updated model is then used to start the process all over again, bootstrapping its way to higher intelligence.
+
+#### 4.2.14.2 Quiet-STaR
+
+Quiet-STaR (Quiet Self-Taught Reasoner) is a profound evolution of the standard STaR algorithm. While traditional STaR trains a model to generate a rationale to answer a specific, explicit question at the end of a prompt, Quiet-STaR trains the model to generate a hidden, internal rationale—an "inner monologue"—before generating every single token in any text. The core philosophy is that pausing to "think" before speaking helps the model uncover the deeper, underlying meaning of the text, drastically improving its ability to predict future tokens.
+
+During training, the model doesn't just read a sequence of text; it generates a thought (rationale) after every single token in the input sequence. These internal thoughts are bounded by specific control tokens: <|startofthought|> and <|endofthought|>. Generating a thought for every single word sequentially would be computationally impossible. Quiet-STaR solves this using a clever, highly customized Parallel Inference Mask. This attention mask allows the model to generate continuations of all thoughts simultaneously. Each thought token pays attention to itself, the preceding thought tokens within its own thought bubble, and the preceding base text. Every single inference call generates one additional thought token for all text tokens in parallel, vastly shrinking the generation time.
+
+Once the thoughts are generated, the model has to decide: Did this thought actually help me figure out what word comes next? To do this, Quiet-STaR uses a Mixing Head to blend the predictions made with and without the thought.
+
+The mixing head is a shallow Multi-Layer Perceptron (MLP). At token position $j$, it takes the hidden state of the model before the thought ($h_j^{init}$) and concatenates it ($\oplus$) with the hidden state after the thought is finished ($h_j^{thought}$). It passes this through a Sigmoid activation ($\sigma$) to output a standardized weight between 0 and 1:
+
+$$w_j = \sigma(\text{MLP}_{mix}(h_j^{thought} \oplus h_j^{init}))$$
+
+The model then calculates the final "Talk" probability ($\log p_j^{talk}$) by smoothly blending the initial, thought-free prediction ($\log p_j^{init}$) with the thought-assisted prediction ($\log p_j^{thought}$) using that exact weight:
+
+$$\log p_j^{talk} = w_j \cdot \log p_j^{init} + (1 - w_j) \cdot \log p_j^{thought}$$
+
+This dynamic adjustment acts as a continuous transition. It allows the model to heavily rely on its reasoning when dealing with complex logic, but easily ignore the thought (by shifting $w_j$) if the next word is obvious, preventing unnecessary thoughts from interfering with simple predictions.
+
+Now the model must learn which thoughts are actually useful. It uses the REINFORCE algorithm to optimize the rationale generation parameters. The reward is purely based on whether the thought made predicting the future text more accurate. It calculates the difference between the mixed prediction and the initial prediction over a window of future tokens ($n_{true}$):
+
+$$r_j = \log p_{j:j+n_{true}}^{talk} (X_{j+1:j+n_{true}+1}) - \log p_{j:j+n_{true}}^{init} (X_{j+1:j+n_{true}+1})$$
+
+- If $r_j > 0$: The thought helped the model predict the future text.
+- If $r_j < 0$: The thought harmed the prediction.
+
+The REINFORCE loss uses this reward to adjust the probability of generating that specific thought ($T_j$) again:
+
+$$L_j^{REINFORCE} = -r_j \cdot \log p_\theta (T_j \mid [X_{:j}; \text{<|startofthought|>} ])$$
+
+The model parameters ($\theta$) are then updated:
+
+$$\theta_{new} = \theta - \alpha \nabla_\theta L_j^{REINFORCE}$$
+
+Through this continuous cycle, Quiet-STaR inherently increases the likelihood of generating thoughts that uncover deep contextual truths (because they yield positive rewards) while ruthlessly discarding thoughts that confuse the model or degrade its predictive accuracy.
+
+#### 4.2.14.3 Test-Time Computing
+
+PRM (Process Supervision Reward Model) is a paradigm-shifting approach to reinforcement learning in AI, specifically designed to tackle complex, multi-step reasoning tasks like mathematics and logic. Historically, AI models were trained using an ORM (Outcome Reward Model). In ORM, the model only receives a reward based on whether the final answer is correct or incorrect. PRM (Process Supervision Reward Model) fundamentally changes this by providing fine-grained, step-by-step feedback. Instead of waiting for the final answer, PRM evaluates and estimates a reward for every single intermediate reasoning step the model takes. As highlighted in OpenAI’s paper "Let's verify step by step", process supervision (rewarding each step) performs significantly better than outcome supervision (rewarding only the final result). This is because PRM actively provides process optimization, guiding the model's multi-step decision paths and helping it navigate toward better solutions.
+
+The fatal flaw of PRM is data collection. Because complex tasks require multi-step outputs, you have to label the reward value for every single intermediate step. Step-by-step human labeling is extremely expensive and time-consuming. To bypass human labelers, DeepSeek introduced Math-Shepherd, an automated pipeline to generate process supervision data using a Monte Carlo rollout approach:
+
+1. Base Path Sampling: For a given prompt, the model generates a set of initial reasoning paths (e.g., 15 paths).
+
+2. Intermediate Step Expansion: The system pauses at a specific intermediate step. From that exact step, it forces the model to branch out and sample several new complete paths (e.g., 8 new paths) until it reaches a final answer.
+
+3. Reward Estimation: The system checks how many of those branched paths reached the correct final answer. The reward for that intermediate step is simply the success rate.
+
+PRM can be viewed as a specialized Q-Learning approach tailored for Large Language Models. Both methods rely on propagating rewards across a sequence of actions. Q-Learning calculates long-term returns using the Bellman Equation, relying heavily on estimating the value of State-Action pairs. For PRM, in reasoning tasks, the reward estimation is directly tied to the correctness rate of the intermediate results along the reasoning path. It achieves the same goal as Q-Learning but without needing to explicitly define complex state transition probabilities.
+
+By combining reinforcement learning with generative models in this step-by-step manner, PRM unlocks massive potential in complex reasoning, highlighted by three core benefits:
+
+- Fine-grained Feedback: Because every step is judged, it directly encourages the model to generate more coherent logical chains, rather than just blindly guessing to get the final answer right.
+
+- Enhanced Interpretability: By forcing the model to step through supervised logic, it generates human-readable reasoning. This structure inherently reduces the possibility of model hallucinations.
+
+- Negative Alignment Tax: Usually, aligning an AI to be safer or follow specific formats reduces its raw performance (an "Alignment Tax"). However, in math domain testing, PRM not only improved reasoning performance but actually reduced potential performance losses during the alignment process.
+
+PRM opens new avenues for future AI reasoning systems. Future optimizations will likely focus on:
+
+- Optimizing path sampling strategies to make data generation even more efficient.
+
+- Introducing multi-modal data to expand PRM beyond just text-based math.
+
+- Combining it with other RL techniques like PPO (Proximal Policy Optimization) or DPO (Direct Preference Optimization).
+
+When an LLM generates a complex answer, it is essentially navigating a vast "tree" of possible tokens and steps. There are three distinct search methods for using PRM to traverse this tree:
+
+- Best-of-N (Baseline): The simplest approach. The language model independently generates $N$ complete, full-length answers from start to finish. The PRM (Verifier) is only applied at the very end to score the final outcomes, and the highest-scoring answer is selected. This is safe but inefficient, as compute is wasted generating deeply flawed paths all the way to the end.
+
+- Beam Search: A much more efficient, step-by-step approach. At each reasoning step, the model generates $N$ candidates. The PRM immediately steps in to score these intermediate candidates. It keeps only the top $M$ highest-scoring paths (the "beam width") and discards the rest before moving to the next step. This early pruning prevents the model from wasting compute on dead-end reasoning.
+
+- Lookahead Search: The most advanced and compute-heavy method. It extends Beam Search by "peeking" into the future. Instead of just scoring the current step, the model performs a $k$-step rollout (simulating $k$ steps ahead). The PRM value at the end of that future rollout is propagated back to represent the true value of the current step. This ensures the model doesn't fall for "greedy" steps that look good now but lead to a dead end later.
+
+Beyond just searching for the best path, we can actively train the model to fix its own mistakes. This is done by introducing a Revision Model ($M$). Instead of just generating an answer, the model generates an initial answer, reviews it, and rewrites it to correct errors. Mathematically, the model generates a new answer ($a_t$) conditioned on the original question ($q$) and its previous attempt ($a_{t-1}$):
+
+$$a_t = M(a_{t-1}, q)$$
+
+The revision model is strictly trained to maximize the probability that the revised answer is correct.
+
+There are two primary ways to deploy this revision strategy at inference time:
+
+- Parallel Sampling: The Language Model acts independently, proposing $N$ entirely separate answers simultaneously (e.g., "Here are 5 different ways to solve this").
+
+- Sequential Revisions: The model operates in a serial chain. It proposes an answer, looks at it, revises it to be slightly better, and repeats this process sequentially. Typical algorithms that use this serial method include self-critic, self-refine, revisions, and Reflection-Tuning.
+
+The final slide demonstrates the most robust inference architecture: Combining Sequential and Parallel Strategies. Because compute budgets are finite, engineers must allocate resources smartly. Instead of putting all their eggs in one basket, they do both:
+
+- Generate Parallel Chains: The system spawns multiple, independent parallel attempts at answering the question.
+
+- Iterative Refinement: Within each of those parallel attempts, the model applies a sequence of iterative revisions to polish that specific logic path.
+
+- Two-Tier Verification: The PRM Verifier is then deployed twice. First, it looks inside each sequential chain to select the best specific revision. Finally, it looks across all the parallel chains to select the absolute best overall answer.
+
+This hybrid approach ensures massive exploration diversity (via Parallel sampling) while guaranteeing high-quality, polished execution (via Sequential revisions).
+
+#### 4.2.14.4 MCTS
+
+Monte Carlo Tree Search (MCTS) is a powerful heuristic search algorithm widely used in decision-making processes and AI game playing (most famously in AlphaGo). Instead of trying to calculate every possible future move (which is computationally impossible in games like Go or massive LLM reasoning tasks), MCTS selectively builds a search tree guided by statistical sampling. Its greatest strength is its ability to perfectly balance Exploration—trying out new, unvisited moves—and Exploitation—focusing on moves that are already known to yield high rewards. Because it relies on statistical sampling rather than brute force, it can find high-quality solutions in massive state and action spaces, and its performance scales directly with the number of simulations you allow it to run.
+
+Every single iteration of MCTS runs through four distinct steps to build out the search tree and update its statistics (primarily the average return $Q$ and the visit count $N$).
+
+1. Selection. The algorithm starts at the root node (the current state). It systematically navigates down the tree by selecting successive child nodes until it reaches a "leaf node" (a node that has not yet been fully expanded or represents the end of the game). It chooses which path to take based on a mathematical formula (like UCT) that maximizes expected value.
+
+2. Expansion. Once it hits a leaf node, unless that node is a definitive terminal state (e.g., game over), the algorithm expands the tree. It selects an available action, applies it, and creates one or more new child nodes representing the state after that action is taken.
+
+3. Simulation. Also known as a "rollout." From this newly created node, MCTS performs a stochastic (randomized) simulation of a Markov Decision Process (MDP) all the way to a terminal state. It essentially plays the rest of the game making rapid, often random, moves just to see if the path generally leads to a win (reward) or a loss (penalty).
+
+4. Backpropagation. Once the simulation reaches an end state and receives a final reward, that reward value is propagated backward up the exact path it took to get there, all the way back to the root node. Along the way, it updates the statistical data of every node it passes through (incrementing the visit count $N$ and updating the expected value $Q$ with the new reward).
+
+The magic of MCTS happens in Step 1 (Selection). How does it know which node to pick? It uses a formula called UCT (Upper Confidence bounds applied to Trees), or similar variants like PUCT. The UCT formula calculates a score for every possible action $a$ from the current state $s$, and the algorithm chooses the action $a^*$ that produces the highest score:
+
+$$a^* = \arg\max_{a \in A(s)} \left[ Q(s, a) + w \sqrt{\frac{\ln N(s)}{N(c(s, a))}} \right]$$
+
+This elegant equation is split into two halves that fight against each other:
+
+- Exploitation Term ($Q(s, a)$): This represents the current estimated value or average reward of taking action $a$. It encourages the AI to pick the move that has the highest known win rate.
+
+- Exploration Term ($w \sqrt{\dots}$): This term measures uncertainty. $N(s)$ is the total number of times the parent node has been visited. $N(c(s, a))$ is the number of times this specific child node (action $a$) has been visited. $w$ is a hyperparameter determining the weight of exploration. Because the child visit count is in the denominator, if a node is rarely visited, this entire exploration term becomes mathematically massive. It temporarily overrides the $Q$ value, forcing the AI to explore the neglected path. As the node gets visited more often, the denominator grows, the exploration term shrinks to near zero, and the AI goes back to relying on the $Q$ value.
+
+### 4.2.15 On-Policy Distillation
+
+The evolution of training Large Language Models has constantly wrestled with a fundamental trade-off between Supervised Fine-Tuning (SFT) and Reinforcement Learning (RL). On-Policy Distillation (OPD) emerges as the elegant mathematical bridge between the two. To understand OPD, we must first understand the opposing strengths and fatal flaws of SFT and RL.
+
+SFT uses cross-entropy loss to fine-tune a model on expert data:
+
+$$\mathcal{L}_{SFT}(\theta) = -\mathbb{E}_{(x, y^*) \sim \mathcal{D}} \left[ \sum_{t=1}^{|y^*|} \log \pi_\theta(y_t^* \mid x, y_{<t}^*) \right]$$
+
+It provides dense, token-level supervision. Every single word has a clear "correct" label. It suffers from Exposure Bias because it is Off-Policy. During training, the model is fed perfect expert context ($y_{<t}^*$). During real-world inference, it has to rely on its own generated context ($\hat{y}_{<t}$). This distribution mismatch means if the model makes a slight mistake early on, it doesn't know how to recover, leading to compounding errors.
+
+RL is On-Policy. The model learns by rolling out its own answers, meaning training perfectly matches inference. It is much more stable and mitigates "catastrophic forgetting" because it reinforces its own good habits rather than forcing a completely new distribution. It suffers from sparse supervision. The model generates a massive trajectory and only gets a single reward signal ($r$) at the very end, making it hard to know which specific tokens were responsible for the success or failure.
+
+OPD combines the best of both worlds. It forces the Student model to generate its own rollouts (maintaining the On-Policy advantage) but uses a Teacher model to calculate a logit distribution for every single token along that path (providing the dense supervision of SFT).
+
+How exactly do we mathematically force the Student to learn from the Teacher at every token? The researchers developed two distinct approaches.
+
+Sampled-Token Reverse KL (The Fast, Noisy Method) minimizes the Reverse Kullback-Leibler (KL) divergence between the student ($\pi_\theta$) and the teacher ($\pi_T$) purely based on the specific tokens the student actually sampled:
+
+$$\mathcal{L}_{OPD}(\theta) = D_{KL}(\pi_\theta \| \pi_T) = \mathbb{E}_{y \sim \pi_\theta(\cdot \mid x)} \left[ \sum_{t=1}^{|y|} (\log \pi_\theta(y_t \mid x, y_{<t}) - \log \pi_T(y_t \mid x, y_{<t})) \right]$$
+
+Standard Forward KL is "Mean-Seeking." It forces the student to try and cover the entire probability distribution of the teacher. This causes the student to overestimate low-probability "edge cases," resulting in terrible generation quality. Reverse KL is "Mode-Seeking." It allows the student to focus exclusively on the teacher's highest-quality, most concentrated output modes, ignoring the useless edge distributions. Because it only calculates the loss for the single specific token ($y_t$) that the student happened to generate at that step, it discards a massive amount of information. This leads to a low signal-to-noise ratio and high gradient variance.
+
+To fix the variance issue, Full-Vocabulary Forward KL (The Stable, High-Fidelity Method) expanded the calculation to include the entire vocabulary ($\mathcal{V}$), using the teacher's probability distribution as a weighted guide:
+
+$$\mathcal{L}_{full}(\theta) = \mathbb{E}_{y \sim \pi_\theta(\cdot \mid x)} \left[ \sum_{t=1}^{|y|} \sum_{v \in \mathcal{V}} \pi_T(v \mid x, y_{<t}) \log \frac{\pi_T(v \mid x, y_{<t})}{\pi_\theta(v \mid x, y_{<t})} \right]$$
+
+The outer loop is still an on-policy student rollout. However, the inner calculation effectively computes the Forward KL at every token position across all tens of thousands of words in the vocabulary. By leveraging the complete dimensional information of the teacher's distribution, this version drastically reduces gradient variance, leading to much more stable and higher-performing models (as proven in OPSD ablation studies).
+
+While standard OPD is mathematically sound, deploying it in the real world hits two massive roadblocks:
+
+- Tokenizer Mismatch: To do full-vocabulary distillation (comparing logits token-for-token), the Student and Teacher must share the exact same vocabulary/tokenizer. You cannot easily distill a Qwen2.5-72B teacher into a Llama-3-8B student.
+
+- The Exploration Ceiling: If you use a fixed Teacher model, the Student's ultimate intelligence is strictly capped at the Teacher's level.
+
+Instead of using two different models, the model teaches itself. The same model architecture and weights ($p_\theta$) act as both the Teacher and the Student. How can a model teach itself something it doesn't already know? By utilizing Expert Demonstrations in the prompt.
+
+- The Teacher State: The model is fed the question plus the expert's correct answer. With this "cheat sheet," the model easily generates a flawless, high-quality reasoning trajectory.
+
+$$\pi_T(\cdot \mid x, c) \triangleq p_\theta(\cdot \mid x, c)$$
+
+- The Student State: The model is fed only the question and must do a normal, unassisted rollout.
+
+$$\pi_S(\cdot \mid x) \triangleq p_\theta(\cdot \mid x)$$
+
+The system uses the expert data to force the model to write a perfect answer in its own native "voice" and style. It then uses this self-generated, high-quality sample to perform on-policy supervision. It perfectly preserves the expert's knowledge while completely eliminating the off-policy distribution shift.
