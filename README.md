@@ -229,5 +229,55 @@
 **5.1 Training Optimization**
 * **5.1.1 Memory Usage**
 * **5.1.2 Model Compression**
-  
+* **5.1.3 Parallelism**
+    * **5.1.3.1 Data Parallelism**
+    * **5.1.3.2 Tensor Parallelism**
+    * **5.1.3.3 Pipeline Parallelism**
+    * **5.1.3.4 Sequence Parallelism**
+    * **5.1.3.5 MoE Parallelism**
+    * **5.1.3.6 3D & 4D Parallelism**
+* **5.1.4 Mixed Precision**
+
 **5.2 Inference Optimization**
+* **5.2.1 Algorithm Optimization**
+    * **5.2.1.1 Speculative Decoding**
+    * **5.2.1.2 Early Exit**
+    * **5.2.1.3 FlashMLA**
+    * **5.2.1.4 Switch Transformer**
+    * **5.2.1.5 SoftMoE**
+    * **5.2.1.6 LoRAMoE**
+    * **5.2.1.7 DeepSeekMoE**
+    * **5.2.1.8 KV Cache**
+    * **5.2.1.9 Prefill-Decode Separation**
+* **5.2.2 System Optimization**
+    * **5.2.2.1 Iteration-Level Batching**
+    * **5.2.2.2 Chunked Prefill**
+    * **5.2.2.3 PagedAttention**
+    * **5.2.2.4 FlashAttention**
+    * **5.2.2.5 SGLang**
+* **5.2.3 Optimization Frameworks**
+    * **5.2.3.1 DeepSpeed**
+    * **5.2.3.2 vLLM**
+    * **5.2.3.3 TGI**
+    * **5.2.3.4 Ray Serve**
+* **5.2.4 Repetitiveness**
+
+### **6. Evaluation**
+
+**6.1 Datasets**
+
+**6.2 Capability**
+
+**6.3 Alignment**
+
+**6.4 Safety**
+
+**6.5 SFT Evaluation Pipeline**
+
+**6.6 LLM-as-Judge**
+
+### **7. Prompt Engineering**
+
+### **8. RAG**
+
+### **9. Agent**
