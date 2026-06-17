@@ -1832,7 +1832,230 @@ In practice, instead of multiplying the full $Q$ and $K^\top$ and then applying 
 
 Sparse attention is a go-to solution for scenarios where standard Transformers hit their memory limits. It is primarily used in long-form NLP tasks and massive sequence modeling. A Causal Mask (or Look-ahead Mask) hides all future tokens.
 
-### 1.4.7 Mask
+### 1.4.7 LSH Attention
+While the Transformer architecture is the mainstream model for NLP due to its excellent performance on large-scale tasks, it suffers from severe resource exhaustion as sequence lengths and layer depths increase. The Reformer model was designed to solve two critical bottlenecks:
+
+- Time and Memory Complexity: Traditional attention scales at $\mathcal{O}(L^2)$.
+  
+- Linear Memory Growth: Because each layer's activations must be stored for backpropagation, the total memory cost of the entire model scales linearly with the number of layers
+
+To solve this, the Reformer introduces two major innovations:
+
+- Replace the original global dot-product attention with Locality-Sensitive Hashing (LSH) attention, reducing complexity to $\mathcal{O}(L \log L)$.
+
+- Use reversible residual layers. This ensures that during the training process, activations only need to be stored once, completely eliminating the overhead of repeatedly storing activations for every layer.
+
+To understand LSH, we must first mathematically define the predecessors in Contextual Attention Mechanisms.
+
+In Multi-Head Attention, Queries, Keys, and Values are linearly projected $h$ times (using different learned projection matrices) into their respective dimensions. Attention is computed in parallel, producing $d_v$-dimensional outputs which are concatenated and projected again. The shape of $Q, K, V$ is [batch_size, length, d_model]. The problem is that the $QK^T$ matrix has the shape [batch_size, length, length]. To save memory, Memory-Efficient Attention computes the softmax for each $q_i$ only when needed (e.g., during backpropagation): $\text{softmax}\left(\frac{q_i K^T}{\sqrt{d_k}}\right)V$. This uses memory proportional to sequence length, but computes less efficiently.
+
+Transformer uses three different linear layers to project activation A into Q, K, and V. However, for LSH attention to work, the queries and keys must be identical. This is achieved by letting the mapping from A to Q and K use the SAME linear layer, while A to V uses another independent linear layer. Since $Q=K$, we focus on $\text{softmax}(q_i K^T)$. Because the softmax function is dominated by its maximum values, for any given $q_i$, we only care about the keys closest to it.
+
+How do we find those closest keys quickly? By using LSH. LSH assigns every vector $x$ to a bucket $h(x)$. If two vectors are highly similar, they have a high probability of getting the same hash value.  Vectors that are far apart are unlikely to obtain the same hash value. We construct a random rotation matrix $R$ of shape $[d_k, b/2]$. The hash function is defined as:
+
+$$h(x) = \arg\max\{[xR; -xR]\}$$
+
+Where $[u; v]$ represents the concatenation of two vectors. LSH Attention modifies the normal attention formula to process one position $i$ at a time:
+
+$$o_i = \sum_{j \in P_i} \exp(q_i \cdot k_j - z(i, P_i)) v_j \quad \text{where } P_i = \{j: i \ge j\}$$
+
+Here, $P_i$ represents the set of valid targets for query $i$, and $z$ represents the partition function (normalization term). For simplicity, the scaling of $\sqrt{d_k}$ is omitted
+
+To allow for batch processing, attention is usually computed over a much larger sequence set $\tilde{P}_i = \{0, 1, ..., l\} \supseteq P_i$. To restrict the computation, elements not in $P_i$ must be explicitly masked out using a masking function $m(j, P_i)$: 
+
+$$o_i = \sum_{j \in \tilde{P}_i} \exp(q_i \cdot k_j - m(j, P_i) - z(i, P_i)) v_j \quad \text{where } m(j, P_i) = \begin{cases} \infty & \text{if } j \notin P_i \\ 0 & \text{otherwise} \end{cases}$$
+
+LSH Attention takes this masking logic and restricts the target set $P_i$ so it only allows attention to be applied to a single hash bucket:
+
+$$P_i = \{j: h(q_i) = h(k_j)\}$$
+
+By sorting the queries and keys by their LSH buckets (and then by sequence position), we physically group the similar items together. The probability of similar items falling into the same bucket is very high, allowing attention to be approximated by computing attention ONLY within each bucket.
+
+While LSH drastically reduces complexity, grouping tokens via hash buckets creates distinct mathematical irregularities that the algorithm must actively manage. In a standard Transformer Decoder, masking is used to prevent the current token from attending to future tokens. In LSH attention, because $Q$ and $K$ are perfectly identical ($Q=K$), a massive mathematical conflict arises: A query vector's dot product with itself is always greater than its dot product with vectors at other positions. Therefore, it is forbidden for a token to attend to itself,) unless a token has no other valid attention targets. The algorithm associates each query/key with a position index, re-sorts them using the same permutation method, and applies the causal mask accordingly.
+
+Because LSH hashing is random, the buckets will not be perfectly even. The number of queries and keys in a bucket might be unequal, meaning a bucket might have many queries but zero keys. To guarantee $h(k_j) = h(q_i)$, the algorithm forces $k_j = \frac{q_j}{\|q_j\|}$. It sorts queries by bucket number, and sorts by sequence position within each bucket; this defines a permutation: $i \to s_i$. Once sorted, the valid target set $\tilde{P}_i$ is formally defined by chunk boundaries ($m$):
+
+$$\tilde{P}_i = \left\{ j: \lfloor \frac{s_i}{m} \rfloor - 1 \le \lfloor \frac{s_j}{m} \rfloor \le \lfloor \frac{s_i}{m} \rfloor \right\}$$
+
+In practice, the chunk size is set to $m = \frac{2l}{n_{buckets}}$, making the average bucket size $\frac{l}{n_{buckets}}$.
+
+Because similar items might occasionally fall into different buckets, the algorithm utilizes multiple hash rounds. Using $n_{rounds}$ different hash functions, the final attention set is the union of all rounds:
+
+$$P_i = \bigcup_{r=1}^{n_{rounds}} P^{(r)} \quad \text{where } P^{(r)} = \{j: h^{(r)}(q_i) = h^{(r)}(q_j)\}$$
+
+Even with LSH shrinking sequence complexity, the sheer depth of the network remains a fatal bottleneck. RevNets allow any layer's activations to be recovered entirely from the subsequent layer's output using only the model parameters. Thus, during backpropagation, there is no need to save intermediate values for use; instead, they can be reversed layer by layer during the backpropagation process from the network output to the input. Instead of $y = x + F(x)$, RevNets map pairs $(x_1, x_2) \mapsto (y_1, y_2)$ using the formula:
+
+$$y_1 = x_1 + F(x_2) \qquad y_2 = x_2 + G(y_1)$$
+
+To reverse it (calculating the inputs based purely on the outputs):
+
+$$x_2 = y_2 - G(y_1) \qquad x_1 = y_1 - F(x_2)$$
+
+By combining the attention layer and feed-forward layer within the Revnet block:
+
+$$Y_1 = X_1 + \text{Attention}(X_2) \qquad Y_2 = X_2 + \text{FeedForward}(Y_1)$$
+
+This brilliant substitution entirely eliminates the $n_l$ (number of layers) multiplier from the memory footprint.
+
+While RevNets fix the depth multiplier, the FeedForward network still uses massive intermediate vectors ($d_{ff} = 4K$ or higher). By chunking, FFN computations are completely independent across sequence positions.
+
+$$Y_2 = [Y_2^{(1)}; \dots; Y_2^{(c)}] = [X_2^{(1)} + \text{FeedForward}(Y_1^{(1)}); \dots; X_2^{(c)} + \text{FeedForward}(Y_1^{(c)})]$$
+
+By batching operations executed in parallel across all positions, processing only one chunk at a time can reduce memory usage. 
+
+When a certain layer is not computing, the Transformer swaps its parameters between CPU memory and GPU memory. In a standard Transformer, doing this is very inefficient because memory transfer speed to the CPU is slow. However, in Reformer, the product of batch size and sequence length is massive, meaning the computational workload is large enough to easily amortize (hide) the slow speed of the memory transfer.
+
+
+### 1.4.8 DeepSeek NSA
+
+While existing sparse attention methods lower the theoretical computational complexity of Transformers, they hit severe bottlenecks during actual training and inference. Because current mainstream methods usually introduce sparsity after pre-training (relying on a full-attention backbone), they not only introduce architectural bias but suffer from two major limitations: 
+
+- Inference Efficiency. Most sparse solutions are narrowly designed for a specific phase. They either optimize only the auto-regressive decoding phase (like H2O) or only the pre-filling phase (like MInference). This means the model still has to bear full-attention computation costs for at least one phase, preventing true end-to-end acceleration. Worse, these methods are often incompatible with highly efficient modern architectures like MQA (Multi-Query Attention) and GQA (Grouped-Query Attention). While picking scattered, dispersed KV Cache tokens reduces theoretical calculation, it fails to reduce actual physical memory access volume. This completely breaks the memory-access efficiency that shared KV Caches provide, resulting in a paradox: computationally sparse but memory dense.
+
+- Existing methods generally ignore the efficiency needs of the training phase. If you try to force inference-stage sparsity into the training phase, you hit two massive roadblocks: Untrainable components that rely on discrete operations (like clustering or hashing) block the gradient flow, restricting the model's ability to actually learn optimal sparse patterns; Non-continuous token selection destroys the locality of memory access. This prevents the use of highly optimized training operators like FlashAttention, causing training throughput to plummet.
+
+These issues reveal a core contradiction: Current sparse attention methods pursue theoretical compute compression while ignoring synergistic optimization with advanced architecture design and hardware execution models. Therefore, DeepSeek proposes NSA, a new paradigm built on algorithm-operator co-design to be highly efficient, natively trainable, and hardware-friendly.
+
+To understand how NSA optimizes these phases, we must define the concept of Arithmetic Intensity. Arithmetic Intensity is the ratio of computational operations to memory access volume. This metric fundamentally dictates how an algorithm should be optimized on a GPU. Every GPU has a critical arithmetic intensity threshold (determined by its peak compute and memory bandwidth):
+
+- Compute-Bound: When task intensity is higher than the threshold, performance is limited by GPU FLOPs.
+
+- Memory-Bound: When task intensity is lower than the threshold, performance is limited by memory bandwidth.
+
+Applying this to causal self-attention creates two diverging optimization goals:
+
+- Training and Pre-filling Phase: Because batched matrix multiplications and attention calculations have high arithmetic intensity, they are Compute-bound. Goal: Reduce computation overhead.
+
+- Auto-regressive Decoding Phase: Every forward pass only generates a single token but requires loading the entire massive KV cache. This creates extremely low intensity, making it severely Memory-bound. Goal: Reduce memory access volume.
+
+Standard attention calculates the correlation between a Query $\mathbf{q}_t$ and all previous Keys $\mathbf{k}_{:t}$ to create a weighted sum of Values $\mathbf{v}_{:t}$:
+
+$$o_t = \text{Attn}(\mathbf{q}_t, \mathbf{k}_{:t}, \mathbf{v}_{:t}) = \frac{\sum_{i=1}^t \alpha_{t,i} \mathbf{v}_i}{\sum_{j=1}^t \alpha_{t,j}} \quad , \quad \alpha_{t,i} = e^{\frac{\mathbf{q}_t^T \mathbf{k}_i}{\sqrt{d_k}}}$$
+
+To utilize natural sparsity, NSA replaces the original sequence $(\mathbf{k}_{:t}, \mathbf{v}_{:t})$ with a dynamically constructed, denser, and higher-information representation $(\tilde{\mathbf{K}}_t, \tilde{\mathbf{V}}_t)$. The optimized output becomes:
+
+$$\mathbf{o}_t^* = \text{Attn}(\mathbf{q}_t, \tilde{\mathbf{K}}_t, \tilde{\mathbf{V}}_t)$$
+
+NSA combines multiple mapping strategies into a final output using a learnable gating mechanism. Let $\mathcal{C}$ represent the set of strategies. The final output is:
+
+$$\mathbf{o}_t^* = \sum_{c \in \mathcal{C}} g_t^c \cdot \text{Attn}(\mathbf{q}_t, \tilde{\mathbf{K}}_t^c, \tilde{\mathbf{V}}_t^c)$$
+
+NSA uses three strategies: $\mathcal{C} = \{\text{cmp}, \text{slc}, \text{win}\}$, which stand for Compression, Selection, and Sliding Window. $g_t^c \in [0, 1]$ is the gating score for strategy $c$. It is dynamically generated by passing input features through an MLP and a Sigmoid activation function. To ensure high sparsity, the total number of re-mapped keys ($N_t$) must remain drastically smaller than the sequence length ($t$):
+
+$$N_t = \sum_{c \in \mathcal{C}} \text{size}[\tilde{\mathbf{K}}_t^c] \ll t$$
+
+Compression means that, by aggregating continuous blocks of Keys or Values into a single block-level representation, the model captures coarse-grained, high-level semantic information while drastically lowering the attention computation burden. Formally, the compressed Key tensor is defined as:
+
+$$
+\tilde{\mathbf{K}}_t^{\text{cmp}} = f_K^{\text{cmp}}(\mathbf{k}_{:t}) = \{ \varphi(\mathbf{k}_{id+1:id+l}) \mid 0 \le i \le \lfloor \frac{t-l}{d} \rfloor \}
+$$
+
+- $l$: The block length
+- $d$: The sliding step between adjacent blocks
+- $\varphi$: A learnable MLP with intra-block positional encoding. This MLP is responsible for mapping the multiple Keys inside a block into a single compressed Key vector.
+
+The resulting compressed Key tensor $\tilde{\mathbf{K}}_t^{\text{cmp}}$ belongs to $\mathbb{R}^{d_k \times \lfloor (t-l)/d \rfloor}$. It is common practice to set $d < l$ to create overlapping blocks, which mitigates information fragmentation. The compressed Value representation $\tilde{\mathbf{V}}_t^{\text{cmp}}$ is formed using the exact same logic.
+
+While the Compression branch captures a great high-level overview, only using compressed Keys and Values can cause the loss of important fine-grained information. Therefore, NSA selectively retains a portion of the original, uncompressed Keys and Values. It does this through a highly optimized process:
+
+- Block-Level Selection. Instead of picking scattered individual tokens, NSA processes sequences in contiguous spatial blocks. There are two core reasons for this. On one hand, Block-level selection is crucial for highly efficient computation on GPUs. GPU architectures process continuous block accesses at vastly higher throughput than random indexing, and block-level computing optimally utilizes Tensor Cores. This exact architectural trait is the fundamental principle behind high-performance attention implementations like FlashAttention. On the other hand, Block-level selection aligns with the intrinsic distribution of attention scores. Research shows attention scores exhibit spatial continuity—neighboring Keys usually share similar importance.
+
+- Importance Score Calculation. Calculating brand new importance scores for every block would be computationally expensive. Instead, NSA brilliantly recycles the intermediate scores already generated by the Compression branch. When the compression block and selection block use the same chunking scheme, i.e., $l' = l = d$, we can directly set $\mathbf{P}_t^{\text{slc}} = \mathbf{P}_t^{\text{cmp}}$.
+
+$$\mathbf{p}_t^{\text{cmp}} = \text{Softmax}\left(\mathbf{q}_t^T \tilde{\mathbf{K}}_t^{\text{cmp}}\right)$$
+
+If the block sizes differ (under the condition $l \le l'$, where $d$ divides both $l$ and $l'$), the selection score is derived via spatial summation:
+
+$$\mathbf{P}_t^{\text{slc}}[j] = \sum_{m=0}^{l'/d - 1} \mathbf{P}_t^{\text{cmp}}\left[\frac{l'}{d}j - m\right]$$
+
+- GQA/MQA Group Consistency. or models using Grouped-Query Attention (GQA) or Multi-Query Attention (MQA), the KV Cache is shared among multiple Query heads. NSA enforces consistency across these heads to minimize KV cache loading during decoding. The group-shared importance score is defined as below, and $H$ is the number of Query heads in each group
+
+$$\bar{\mathbf{p}}_t^{\text{slc}'} = \sum_{h=1}^H \mathbf{p}_t^{\text{slc}, (h)}$$
+
+- Top-$n$ Block Selection. Finally, the algorithm isolates the top $n$ sparse blocks based on their descending rank:
+
+$$\mathcal{I}_t = \{ i \mid \text{rank}(\bar{\mathbf{p}}_t^{\text{slc}'}[i]) \le n \}$$
+
+The raw tokens within these winning blocks are concatenated to form the final Selection Key/Value tensors:
+
+$$\tilde{\mathbf{K}}_t^{\text{slc}} = \text{Cat}(\{ \mathbf{k}_{il'+1:(i+1)l'} \mid i \in \mathcal{I}_t \})$$
+
+Attention mechanisms have a dangerous tendency to fixate on immediate, local context. Local patterns usually learn faster and may dominate the training process, hindering the model from effectively learning the information of compressed and selected tokens. To prevent this, NSA isolates local context into a dedicated Sliding Window branch. It maintains the most recent tokens in a window $w$:
+
+$$\tilde{\mathbf{K}}_t^{\text{win}} = \mathbf{k}_{t-w:t} \quad , \quad \tilde{\mathbf{V}}_t^{\text{win}} = \mathbf{v}_{t-w:t}$$
+
+By forcing local context into its own separate branch, the Compression and Selection branches are forced to focus purely on long-range semantic learning. Furthermore, NSA provides strictly independent Keys and Values to all three branches. This design achieves stable learning by avoiding gradient interference between local and long-range pattern recognition, while introducing minimal overhead. The Complete NSA Equation:
+
+$$\mathbf{o}_t^* = \sum_{c \in \mathcal{C}} g_t^c \cdot \text{Attn}(\mathbf{q}_t, \tilde{\mathbf{K}}_t^c, \tilde{\mathbf{V}}_t^c)$$
+
+With all three representations secured ($\text{cmp}$, $\text{slc}$, $\text{win}$), the final attention output is computed alongside $\mathbf{q}_t$.
+
+To ensure NSA actually accelerates training on real GPUs, DeepSeek built a custom hardware-aligned kernel in Triton. While the Compression and Sliding Window branches are natively compatible with existing FlashAttention-2 kernels , the Selection branch required a custom architectural leap.
+
+- The SRAM Flaw: Loading temporally contiguous Query blocks into SRAM will lead to inefficient memory access, because Queries within the block may require completely disjoint KV blocks.
+
+- The NSA Fix: For each position in the Query sequence, load all Query heads within the GQA group that share the same sparse KV block into SRAM together.
+
+Kernel Execution Steps:
+
+1. Group-Centric Data Loading: The inner loop loads the Query $\mathbf{Q} \in \mathbb{R}^{[h, d_k]}$ of all heads in the group alongside their shared sparse KV indices $\mathcal{I}_t$.
+
+2. Shared KV Block Fetching: The continuous KV blocks mapped by $\mathcal{I}_t$ are loaded sequentially into SRAM ($\mathbf{K} \in \mathbb{R}^{[B_K, d_k]}$), keeping the inner block size $B_K$ small to minimize memory load.
+
+3. Grid-Level Outer Loop: The Query/Output loop is pushed to the Triton Grid scheduler to vastly simplify and optimize the kernel.
+
+By sharing among groups, it eliminates redundant KV transfers, and balances the compute load across GPU Streaming Multiprocessors, achieving near-optimal Arithmetic Intensity.
+
+### 1.4.9 Gated Attention
+
+Gating mechanisms are not new to neural networks; they have been widely used in classic architectures like LSTMs, Highway Networks, and more recent State Space Models and linear attention mechanisms. They generally show excellent results. However, there is a distinct gap in the research: While gating mechanisms are widely used, very few works systematically study their specific roles and impacts. Recently, some attention mechanisms (like Switch Heads or DeepSeek's NSA - Native Sparse Attention) have introduced gating. But, they often mix gating with other architectural factors, lacking an independent analysis of the gating mechanism's own contribution. To solve this, a systematic breakdown of standard attention is required to isolate exactly where and how gating can be injected.
+
+To understand where a gate can be placed, we must define the four distinct stages of standard attention computation. Given an input matrix $X \in \mathbb{R}^{n \times d_{model}}$ (where $n$ is the sequence length and $d_{model}$ is the model dimension):
+
+1. QKV Linear Projection. The input $X$ is linearly transformed using learnable weight matrices $W_Q, W_K, W_V \in \mathbb{R}^{d_{model} \times d_k}$ to create the Query ($Q$), Key ($K$), and Value ($V$) matrices (where $Q, K, V \in \mathbb{R}^{n \times d_k}$):
+
+$$Q = XW_Q, \quad K = XW_K, \quad V = XW_V$$
+
+2. Scaled Dot-Product Attention. The attention score between the Query and Key is calculated, normalized via a softmax function, and used to output a weighted sum of the Values:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+
+$\frac{QK^T}{\sqrt{d_k}} \in \mathbb{R}^{n \times n}$ represents the scaled dot-product similarity matrix. The $\text{softmax}(\cdot)$ function ensures that the attention weights in each row are non-negative and sum to exactly 1.
+
+3. Multi-Head Concatenation. The SDPA process is executed in parallel across $h$ different "heads", each possessing its own unique projection matrices ($W_Q^i, W_K^i, W_V^i$). All head outputs are then concatenated together:
+
+$$\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \dots, \text{head}_h)$$
+
+Where $\text{head}_i = \text{Attention}(QW_Q^i, KW_K^i, VW_V^i)$.
+
+4. Final Output Layer. The concatenated SDPA output is passed through a final linear output layer $W_o \in \mathbb{R}^{h d_k \times d_{model}}$:
+
+$$O = \text{MultiHead}(Q, K, V)W_o$$
+
+With the architecture mapped out, we can introduce the Gating Mechanism. The formal mathematical expression of a gate is:
+
+$$Y' = g(Y, X, W_\theta, \sigma) = Y \odot \sigma(XW_\theta)$$
+
+- $Y$: The target input that is going to be gated (e.g., the Values, or the attention output).
+- $X$: Another input used specifically to calculate the gating score.
+- $W_\theta$: The learnable parameters (weights) of the gate itself.
+- $\sigma$: An activation function, typically a sigmoid function, which squashes values between 0 and 1.
+- $Y'$: The final, gated output.
+- $\odot$: Element-wise multiplication.
+
+The gating score $\sigma(XW_\theta)$ essentially acts as a dynamic filter. By selectively retaining or suppressing the features of $Y$, it controls the information flow. To apply this formula to the Attention mechanism, the Qwen Team systematically researched multiple control methods, focusing on two main design choices: Position and Granularity. After systematic testing and ablation studies across the different positions, granularities, and sharing methods, the research concluded with a definitive "Best Practice" setup for Gated Attention. The Final Configuration is strictly defined as follows:
+
+- Gating Position: Directly after the Scaled Dot-Product Attention output. This proved to be the most effective place to control information flow.
+
+- Score Granularity: Elementwise, allowing for precise, dimension-by-dimension filtering.
+
+- Whether Shared: Head-Specific. Each attention head gets its own unique gate, rather than forcing all heads to share the same gating parameters.
+
+- Calculation Method: Multiplicative Gating, utilizing the element-wise multiplication ($\odot$) defined in the formula.
+
+- Activation Function: Sigmoid, ensuring the dynamic filter cleanly scales features between 0 (complete suppression) and 1 (full retention).
+
+### 1.4.10 Mask
 
 In Large Language Models (LLMs), "masking" is a mathematical constraint that tells the model which parts of the data it should ignore. There are three primary reasons why we need masks.
 1. Most LLMs (like GPT) are autoregressive, meaning they predict the next word based on previous ones. During training, we give the model an entire sentence at once to be efficient.
@@ -1864,13 +2087,13 @@ A Padding Mask is a tool used to tell a transformer which parts of a data batch 
 
 Padding masks are used differently depending on where you are in the Transformer architecture, mainly self-Attention in the encoder, self-attention in the decoder and cross-attention.
 
-#### 1.4.7.2 Casual Mask
+#### 1.4.10.2 Casual Mask
 
 A Causal Mask (also known as a Look-ahead Mask) is a mathematical constraint used in generative models like GPT to ensure the model only looks at the past and never at the "future."
 
 In a standard Transformer, every word can see every other word simultaneously. While this is great for understanding a sentence (Encoder), it’s "cheating" during generation (Decoder). The Causal Mask is a lower-triangular matrix applied to the attention scores before the Softmax layer. It is used in the self-attention in the decoder.
 
-#### 1.4.7.3 MLM (Masked Language Model) Mask
+#### 1.4.10.3 MLM (Masked Language Model) Mask
 
 Masked Language Modeling (MLM) is a technique used primarily in "Encoder-only" models like BERT. Unlike the Causal Mask (which hides the future), MLM hides specific words within a sentence to force the model to understand deep, bidirectional context.
 
