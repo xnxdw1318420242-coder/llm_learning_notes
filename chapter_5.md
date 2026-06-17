@@ -25,7 +25,7 @@ $$\text{layers} \times \text{hiddendimensions} \times \text{seqlength} \times \t
 
 During inference, memory calculation is much simpler because there are no gradients or optimizers.
 
-- Model States: Just the weights ($M \times \text{dtype\_bytes}$).
+- Model States: Just the weights ($M \times \text{dtypebytes}$).
 - KV Cache: The memory used to store past key and value vectors during autoregressive generation. The exact formula is:
 
 $$2 \times \text{batchsize} \times \text{numlayers} \times \text{seqlen} \times \text{hiddendim} \times \text{dtypebytes}$$
