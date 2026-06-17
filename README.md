@@ -40,10 +40,13 @@
 * **1.4.4 Multi-head Latent Attention (MLA)**
 * **1.4.5 Linear Attention**
 * **1.4.6 Sparse Attention**
-* **1.4.7 Mask**
-    * **1.4.7.1 Padding Mask**
-    * **1.4.7.2 Casual Mask**
-    * **1.4.7.3 MLM (Masked Language Model) Mask**
+* **1.4.7 LSH Attention**
+* **1.4.8 DeepSeek NSA**
+* **1.4.9 Gated Attention**
+* **1.4.10 Mask**
+    * **1.4.10.1 Padding Mask**
+    * **1.4.10.2 Casual Mask**
+    * **1.4.10.3 MLM (Masked Language Model) Mask**
  
 **1.5 FFN (Feed-Forward Network)**
 * **1.5.1 ReLU**
@@ -220,3 +223,11 @@
     * **4.2.14.3 Test-Time Computing**
     * **4.2.14.4 MCTS**
 * **4.2.15 On-Policy Distillation**
+
+### **5. Model Optimization**
+
+**5.1 Training Optimization**
+* **5.1.1 Memory Usage**
+* **5.1.2 Model Compression**
+  
+**5.2 Inference Optimization**
