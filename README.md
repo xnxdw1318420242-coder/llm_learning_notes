@@ -235,7 +235,7 @@
     * **5.1.3.3 Pipeline Parallelism**
     * **5.1.3.4 Sequence Parallelism**
     * **5.1.3.5 Expert Parallelism**
-    * **5.1.3.6 4D Parallelism**
+    * **5.1.3.6 3D Parallelism**
 * **5.1.4 Mixed Precision**
 
 **5.2 Inference Optimization**
