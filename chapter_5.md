@@ -208,4 +208,85 @@ Unlike Tensor Parallelism (which slices within a layer), Pipeline Parallelism op
 
 5. During training, a device executes its designated set of operations, then passes its output down the pipeline to the next device, which executes a different set of operations.
 
-Pipeline parallelism drastically reduces the communication burden.
+Pipeline parallelism drastically reduces the communication burden.  If you apply Tensor Parallelism to an FFN layer, you must slice the fully connected parameters across different cards within the same device node. To integrate the results, you perform an AllReduce sum, which creates a massive total communication parameter volume of $2MK$ (where $M$ is the matrix row dimension and $K$ is the column dimension). When slicing at the FFN layer boundary across different devices, adjacent devices only need to pass intermediate variables and gradients point-to-point. They only need to send or receive a parameter volume of $MK$. Therefore, compared to Tensor Parallelism, Pipeline Parallelism has a much smaller communication parameter volume.
+
+In a Naive Pipeline, only one device computes at a time while the others sit idle, leading to terrible resource utilization. To fix this, engineers split the mini-batch into multiple smaller micro-batches and use advanced scheduling. In the F-then-B Scheduling mode, a device sequentially executes the Forward (F) passes for all micro-batches first, and then executes the Backward (B) passes for all micro-batches. By computing different parts of the model simultaneously, F-then-B can significantly improve device resource utilization. To calculate the backward pass later, the GPU must keep the intermediate activations for every single forward pass alive in its memory. Because this F-then-B mode caches the intermediate variables and gradients of multiple micro-batches, the actual utilization rate of VRAM is not high. To fix the memory bloat of F-then-B, the 1F1B pipeline was created. Here, forward and backward computations are interleaved. Compared to the F-then-B method, the 1F1B method can save 37.5% of peak memory.
+
+Even with micro-batches, pipeline parallelism inherently suffers from idle computing gaps known as bubbles. We can mathematically derive the proportion of these bubbles.
+
+Let:
+
+- $p$ = the number of pipeline compute units (stages).
+- $t_f$ = the forward computation time for one micro-batch.
+- $t_b$ = the backward computation time for one micro-batch.
+- $m$ = the number of micro-batches within one mini-batch.
+
+- Bubble Time Equation: The total idle bubble time ($t_{pb}$) in one mini-batch is:
+
+$$t_{pb} = (p - 1)(t_f + t_b)$$
+
+- Total Computation Time Equation: The actual compute time ($t_{id}$) for the mini-batch is:
+
+$$t_{id} = m(t_f + t_b)$$
+
+- Bubble Ratio Equation: By dividing the two, we get the fraction of time wasted as bubbles:
+
+$$S_{Bubble} = \frac{t_{pb}}{t_{id}} = \frac{p - 1}{m}$$
+
+With a fixed number of pipeline units $p$, the bubble ratio is entirely controlled by $m$. Under the condition that $m \gg p$ (where micro-batches vastly outnumber pipeline stages), you can effectively reduce the bubble proportion
+
+There are two famous implementations of Pipeline Parallelism, each handling batch updates differently.
+
+PipeDream splits the model across machines and allows a machine to start executing the forward computation for a second batch before the backward propagation of the first batch is fully completed. It will cause gradient convergence instability. When a machine performs gradient descent, it must use saved backups of parameters. If a machine computes the forward pass of task 3 using original parameters, but its backward pass uses parameters that were just updated by task 2, there is a fundamental version mismatch. Therefore, this will bring a large amount of error. We must strictly limit how many forward passes can happen before a backward pass to control this uncertainty.
+
+<p align="center">
+<img width="393" height="194" alt="f145d983-5dd4-49ab-a3bd-dfdcdaf2b780" src="https://github.com/user-attachments/assets/beebd8f7-d16c-402c-980e-dac920b31cf3" />
+</p>
+
+GPipe acts somewhat similarly but is strictly synchronous. It splits a batch into micro-batches, but waits for global gradient synchronization only after the entire global batch is finished. GPipe utilizes Re-materialization (also known as Activation Checkpointing). It intentionally discards intermediate activations and recalculates them during the backward pass. This trades compute time to lower VRAM usage. Overall, GPipe's speed is slower than PipeDream, but its memory footprint is much smaller, and its mathematical convergence is perfectly stable.
+
+<p align="center">
+<img width="437" height="195" alt="a552d239-8794-4c22-b7ae-939a80a9507b" src="https://github.com/user-attachments/assets/58c95862-d5eb-461e-8c5d-525c5d371cf6" />
+</p>
+
+#### 5.1.3.4 Sequence Parallelism
+
+Colossal-AI Sequence Parallelism focuses on breaking sequence length limits, while Megatron-LM Sequence Parallelism focuses on reducing memory bloat leftover by Tensor Parallelism.
+
+In Colossal-AI Sequence Parallelism, considering that long sequence data will exponentially increase intermediate memory usage, heavily restricting the training capability of the device, the authors propose Sequence Parallelism as a memory-efficient systems-level method to physically break the input sequence length limit, while existing work focuses on reducing time and space complexity purely from an algorithmic perspective. It slices the actual input text sequence vertically across devices. To calculate attention when the sequence is physically cut into pieces, Colossal-AI introduces RSA (Ring Self-Attention). Each GPU calculates its local $Q, K, V$ for its assigned chunk of the sequence. Then, the GPUs pass their $K$ and $V$ matrices to their neighboring device in a continuous ring. By passing the keys around the ring, every query eventually gets to calculate attention against every key, achieving full global attention while only holding a fraction of the sequence in memory at any given time. This method is perfectly compatible with Data Parallelism, Pipeline Parallelism, and Tensor Parallelism. When scaled to 64 NVIDIA P100 GPUs, compared to Tensor Parallelism, RSA achieved 13.7x and 3.0x increases in maximum batch size and sequence length, respectively. Combined with Sparse Attention, it can process sequences exceeding 114K tokens, which is over 27 times longer than traditional single-device sparse attention. Unlike Tensor Parallelism (which is restricted by attention head counts), as long as the sequence length is divisible by the sequence parallel size, sequence parallelism can be used.
+
+Megatron-LM approaches Sequence Parallelism from an entirely different angle. Its primary goal is to handle the massive memory footprint left behind by layers that Tensor Parallelism cannot split. Megatron-LM analyzed exactly how much memory a standard Transformer consumes. Assuming:
+
+- $s$ = Sequence length
+- $b$ = Batch size
+- $h$ = Hidden dimension
+- $a$ = Number of attention heads
+
+Every single layer of a standard Transformer consumes memory equal to:
+
+$sbh \left(34 + 5\frac{as}{h}\right)$
+
+hen Tensor Parallelism (size $t$) is activated, the massive Linear and Attention layers are divided among $t$ GPUs. However, the parts that cannot be shared are mainly the input and output of two LayerNorm blocks ($4bsh$); and two dropout mask blocks ($2bsh$); totaling $10bsh$. Because these specific blocks are duplicated identically across every GPU in the Tensor Parallel group, they waste massive amounts of VRAM. Megatron-LM borrows Colossal-AI's concept. Building upon Tensor Parallelism, it slices the inputs of LayerNorm and Dropout in the Transformer layer along the input sequence length dimension, so that each device only needs to perform a fraction of the Dropout and LayerNorm. The computation for LayerNorm and Dropout is evenly spread across devices and reduces compute waste. The intermediate activations generated by LayerNorm and Dropout are distributed, drastically dropping memory usage.
+
+When you slice the sequence dimension alongside the tensor dimension, you break the standard communication flow. Standard Tensor Parallelism relies purely on All-Reduce operations (which sum data across GPUs and return the full sum to all GPUs). For Sequence Parallelism Integration, because the sequence is now physically cut into pieces, All-Reduce is no longer mathematically valid. To fix this, Megatron-LM replaces the standard All-Reduce with two separate, highly optimized operations:
+
+- To collect the results produced by sequence parallelism on each device, an All-Gather operator must be inserted
+
+- And to allow the results produced by tensor parallelism to be passed into the sequence parallel layer, a Reduce-Scatter operator must be inserted.
+
+At first glance, using multiple All-Gather and multiple Reduce-Scatter operators per layer seems like more communication overhead than standard Tensor Parallelism. But this is not the case, because one All-Reduce is mathematically equivalent to one Reduce-Scatter plus one All-Gather, so their total communication volume is exactly the same. Furthermore, during backpropagation, the implementation brilliantly overlaps the Reduce-Scatter communication with the actual gradient calculations, further reducing time and maximizing GPU FLOPS Utilization.
+
+Megatron-LM pairs Sequence Parallelism with a final VRAM optimization trick: Selective Activation Recomputation. The authors noticed that some operations in the Transformer produce massive activation values but require very little computation power to calculate. Instead of saving these massive activations in memory, the model deletes them entirely. When backpropagation occurs, it simply recalculates them on the fly to save space. Other, harder-to-compute activations are kept in memory normally. Sequence Parallelism alone reduces activation memory overhead by ~40%. Selective Activation Recomputation alone reduces activation memory overhead by ~40%. When both features are turned on, the total activation overhead can be reduced by about 80%. While recomputing adds a tiny bit of total math, the massive VRAM savings allow for significantly larger batch sizes, making the overall throughput improvement extremely obvious.
+
+#### 5.1.3.5 Expert Parallelism
+
+Expert Parallelism is a specific parallelization method designed for training MoE (Mixture of Experts) models. The MoE architecture modifies the standard Transformer foundation. Instead of having one massive, dense Feed-Forward Network (FFN) that every single piece of data must pass through, an MoE layer is configured with multiple Expert FFN networks.
+
+While MoE reduces computational FLOPs, it does not reduce memory requirements. The model still possesses a massive number of expert networks, and all of those parameters must be stored in VRAM. If a model has 8 massive experts, storing all of them on a single GPU is likely impossible. Instead of slicing the parameters of a single matrix (like Tensor Parallelism), or slicing the layers of the model (like Pipeline Parallelism), Expert Parallelism simply distributes the separate, whole experts across different physical devices. Training massive LLMs today requires combining multiple parallelization strategies simultaneously to prevent memory and compute bottlenecks. The final crucial point made on the slide is that Expert Parallelism can be combined with 3D Parallelism without any conflicts. Because the routing mechanism of MoE is mathematically independent of how tensors are sliced or how batches are split, EP acts as a highly scalable "4th dimension" of parallelism, allowing MoE models to scale to trillions of parameters seamlessly.
+
+#### 5.1.3.6 3D Parallelism
+
+As deep learning models scale into the hundreds of billions or even trillions of parameters, no single parallelization technique (Data, Tensor, or Pipeline) is sufficient on its own. 3D Parallelism can be said to combine model parallelism, pipeline parallelism, and data parallelism together, and can be used to train models of almost all scales currently available. It is the ultimate composite strategy, forming a three-dimensional grid of computation across massive GPU clusters. 
+
+First, divide the data to form multiple Data Parallel groups. Within each DP group, the model is split by layers into different Pipeline Stages. The tensors within each Pipeline Stage can use Tensor Parallelism.
+
