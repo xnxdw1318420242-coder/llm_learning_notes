@@ -323,4 +323,90 @@ Mixed Precision Training is a method that combines different numerical precision
 
 - Weight Update: The FP16 Weight Gradients are cast back up to FP32. They are then added to the FP32 Master-Weights. This step is crucial because gradient updates are often tiny; doing this addition in FP32 entirely prevents the Rounding Error where tiny updates become zero.
 
-While memory is saved, MPT actually requires keeping an extra master copy of the weights, meaning the memory savings are not a perfect 50% reduction, but rather a strategic reduction that allows larger batch sizes.
+While memory is saved, MPT actually requires keeping an extra master copy of the weights, meaning the memory savings are not a perfect 50% reduction, but rather a strategic reduction that allows larger batch sizes. Copying the weights to FP32 increase memory usage. However, during training, dynamic memory (intermediate variables and activations) takes up 3-4 times more space than static memory. Because all dynamic memory is stored in FP16, compared to training the entire network with FP32, the final memory footprint of the model is still essentially halved.
+
+<p align="center">
+<img width="450" height="198" alt="4461154f-e58f-4ad5-982d-df45a7df55e4" src="https://github.com/user-attachments/assets/10aca006-4b2b-4402-88f1-f064c6e717d5" />
+
+</p>
+
+While storing the master weights in FP32 solves the Rounding Error, it does not solve the Underflow. During backpropagation, activation gradients are often much smaller than weight gradients. The minimum number FP16 can represent is $2^{-24}$. If a calculated gradient falls below this threshold, it becomes exactly 0. If this happens early in the network, all subsequent layers receive a gradient of 0, and the training fails. To prevent gradients from underflowing into zero, we artificially inflate them so they fit safely within FP16's representable range. Before Backpropagation, the final calculated Loss is manually multiplied by a large scaling factor. Because the loss is scaled up, the derivative (the gradient) is also mathematically scaled up by the exact same factor. Therefore, the gradients will not underflow when calculated in FP16. After Backpropagation, before applying these gradients to update the FP32 master weights, the gradients are divided by the exact same scaling factor - shrink the weight gradients to restore their normal values.
+
+To understand why scale the loss instead of gradients: Because of the chain rule, scaling the loss mathematically scales all subsequent gradients automatically. This is much more cost-effective than scaling every single gradient individually.
+
+- Scale Up Phase: After forward propagation and before backpropagation, the loss is multiplied by $2^K$. The scaled gradients remain safely inside FP16's representable range.
+- Scale Down Phase: After backpropagation, the weight gradients are divided by $2^K$ to restore their true values before updating the FP32 master weights.
+
+While you can use a constant scaling factor (like $8$ or $32K$), this is risky. If the gradients naturally grow larger during training, a static multiplier might cause the values to hit the FP16 ceiling ($65504$), causing an Overflow. To fully utilize the FP16 range and mitigate rounding errors, we use Dynamic Loss Scaling to safely use the largest possible multiplier.
+
+1. Start with a very high scale factor, like $2^{24}$.
+
+2. During the training iteration, check for overflow: If there is no gradient overflow, do not change the scale factor. Continue training. If there is gradient overflow, halve the scale factor (divide by 2). Skip the weight update for this step, and try again. Repeat until the gradients fit safely without overflowing.
+
+3. In the later stages of training: Loss convergence stabilizes, and gradient updates become smaller. At this point, we can allow a higher loss scaling factor again to prevent underflow.
+
+4. The F-Multiplier Rule: The algorithm attempts to multiply the loss scale by a factor $F$ every $N=2000$ iterations. If no overflow is detected, the new, higher scale factor is kept.
+
+Even during the FP16 Forward and Backward passes, we can protect against precision loss without abandoning speed. This is done through Precision Accumulation. Use FP16 for matrix multiplication, and use FP32 for addition calculations to make up for the lost precision. Inside Nvidia Volta architectures, the Tensor Core is specifically designed for this. It takes FP16 matrices ($A$ and $B$), multiplies them extremely fast, but accumulates the results into a $C$ and $D$ matrix that is stored in FP32.  Using FP32 in the accumulation phase can drastically reduce precision loss in mixed precision training. 
+
+Modern frameworks handle all this logic automatically. For example, NVIDIA's APEX library provides 4 levels of optimization strategies for mixed precision:
+
+- O0: Pure FP32 training (The baseline).
+
+- O1 (Conservative Mixed Precision): This strategy uses a whitelist/blacklist approach based on Tensor operations. Operations highly friendly to FP16 (like GEMM and CNN Convolutions) have their inputs and weights cast to FP16.  Operations that require high numerical stability (like Softmax and Batch Normalization) are strictly kept in FP32. It automatically includes Dynamic Loss Scaling.
+
+- O2 (Aggressive Mixed Precision): This is the classic MPT architecture we discussed. The model weight parameters and input network data are entirely converted to FP16. Only specific sensitive operations like Batch Normalization remain in FP32. It relies heavily on the Weight Backup (FP32 master weights) and Dynamic Loss Scaling to prevent the rounding errors and underflows caused by moving almost everything to FP16.
+
+- O3: Pure FP16 training (Rarely used because it easily diverges).
+
+Mixed Precision Training is a cornerstone technique in modern deep learning that strategically combines the mathematical stability of 32-bit floating-point (FP32) formats with the blistering speed and efficiency of 16-bit floating-point (FP16) formats. By logically integrating FP32 and FP16, mixed precision drastically elevates training efficiency. This is primarily realized through two massive advantages:
+
+- Faster Computational Speed. Computations performed in FP16 are typically twice as fast, or even faster, compared to those done in FP32. This acceleration is overwhelmingly noticeable on specialized hardware engineered specifically for mixed-precision arithmetic, most notably NVIDIA's Tensor Cores. When these cores are utilized, the mathematical throughput of the network skyrockets.
+
+- Higher Memory Utilization. Because FP16 requires exactly half the bit-width of FP32, it intrinsically uses significantly less memory to store the same number of parameters and activations. This freed-up VRAM is highly valuable: it allows AI researchers to either train much larger model architectures or utilize significantly larger batch sizes on the exact same hardware, directly maximizing training efficiency.
+
+While FP16 offers incredible speed and memory savings, it introduces physical hardware limitations that must be engineered around:
+
+- Numerical Instability. The primary flaw of FP16 is its narrowed dynamic range and lower precision. This makes the training process highly susceptible to numerical underflow or overflow (data disappearing into 0 or exploding to infinity). This is especially dangerous during backpropagation when gradients are exceptionally small. To effectively prevent this network collapse, developers introduce a Loss Scaling mechanism. This algorithm artificially inflates the loss before calculating gradients, ensuring the tiny numbers safely fit inside FP16's limited range without underflowing. Other techniques to prevent underflow or overflow include using bfloat16, choosing stable activation functions such as Leaky ReLU or ELU instead of ReLU to prevent gradients of 0, batch normalization for stable gradient distribution, gradient clipping, adjusting the learning rate, reducing the batch size for smaller gradient, and proper initialization method such as He to prevent abnormal values in the early stage of training.
+
+- Hardware and Software Requirements. Mixed precision is not a pure software trick; it requires a highly specific hardware and software stack to function. It relies on specialized silicon like NVIDIA Tensor Cores.  It requires compatible low-level libraries like CUDA and cuDNN. Fortunately, the deep learning ecosystem has caught up. Mainstream deep learning frameworks, such as PyTorch and TensorFlow, now offer native, out-of-the-box support for mixed precision training.
+
+Mixed precision training is no longer an experimental feature; it is widely deployed as the industry standard for large-scale model training tasks.  It is absolutely vital in scenarios that demand processing massive batches of data through highly complex neural networks. The most prominent examples include the training of foundational Large Language Models (LLMs) like the BERT and GPT series models. On compute-bound hardware, mixed-precision technology unlocks the ability to significantly boost training performance and slash memory overhead. Ultimately, it allows AI engineers to push the boundaries of model scale and dataset size without needing to infinitely scale their physical server resources.
+
+At its core, Mixed Precision achieves the perfect equilibrium: it guarantees the rigorous numerical stability of FP32 while harnessing the unmatched computational efficiency of FP16. This combination brings about profound optimizations in both training velocity and memory consumption, cementing it as an essential, foundational technology in current deep learning. Furthermore, the mandatory introduction of Loss Scaling technology is the linchpin that secures numerical accuracy during FP16 calculations, ensuring that models achieve the ultimate balance of high precision and high performance.
+
+## 5.2 Inference Optimization
+ 
+When generating text using modern Large Language Models, the system struggles against two primary physical limitations: Compute and Storage. The compute bottleneck arises directly from the Autoregressive nature of generative models—also known as the "Next Token Prediction" pattern. This creates a massive problem during the Decode Phase. Because the model can only generate one word at a time, the computation becomes unsaturated. If you are serving a single user (batchsize = 1), the GPU is essentially starving for work. In the Decode phase, the attention mechanism for a single step is written as:
+
+$$ \mathbf{o} = \text{softmax}\left(\frac{\mathbf{q}\mathbf{K}^T}{\sqrt{d}}\right)\mathbf{V} $$
+
+Here is why this equation represents a bottleneck:
+
+- Because we are generating only one token, the query $\mathbf{q}$ is just a single vector, not a matrix. When multiplied by the Keys matrix $\mathbf{K}^T$, the result is a $1 \times L$ vector (where $L$ is the sequence length). This is scaled by $\sqrt{d}$.
+
+- Applying softmax yields an attention weight vector $\alpha \in \mathbb{R}^{1 \times L}$.
+
+- Multiplying this vector by the Values matrix $\mathbf{V} \in \mathbb{R}^{L \times d}$ yields a final output vector $\mathbf{o} \in \mathbb{R}^{1 \times d}$.
+
+On GPUs, we want Matrix-Matrix multiplication, not Matrix-Vector multiplication. Matrix-Vector operations fail to utilize the massive parallel processing power of GPU Tensor Cores.
+
+The Storage Bottleneck must be viewed from two angles:
+
+- Static Storage: Large models have billions of parameters. Simply storing these massive weight matrices takes up a huge amount of GPU VRAM space.
+
+- Dynamic Memory Access / Bandwidth: During the Decode phase, we must use the KV Cache strategy to avoid recalculating past tokens. However, this means for every single new word generated, a massive amount of historical Key and Value data must be read from the slow GPU HBM (High Bandwidth Memory) into the fast shared memory. Frequent HBM access squeezes out the actual time the GPU spends doing real computation.
+
+To accurately pinpoint the bottleneck in a Transformer, we cannot use a broad brush. In Encoder-like Transformers (and LLM Prefill Phase, used in BERT, ViT, or the initial prompt-reading phase of an LLM), we input a sequence of length $\mathcal{O}(n)$ and output a sequence of $\mathcal{O}(n)$. This is highly parallel matrix math. In Transformer-Block with Per-Token Latency as the metric, the bottleneck is the FFN (Feed-Forward Network) module. The FFN simply takes the most time per token. Furthermore, increasing the batch size does not change this latency ratio because the GPU computation is already fully saturated. If the metric is Operation Intensity, the bottlenecks are QKV Projection, Output Projection, and FFN. These are "Skinny MatMuls" (narrow matrix multiplications), which inherently lead to poor utilization of GPU Tensor Cores. In Attention Layer with latency as the metric, the bottleneck lies in non-matmul operations like Softmax. For long sequences, there is constant, heavy memory swapping between the GPU's HBM and SRAM just to calculate softmax. This exact problem led to the invention of FlashAttention. FlashAttention uses "tiling" to load blocks of K, V, and Q into fast on-chip SRAM, computes them there, and writes the output back to HBM. This prevents the slow materialization of the massive $N \times N$ attention matrix on HBM, resulting in a 7.6x speedup. If the metric is Operation Intensity, the bottleneck is in the Activation-Activation Operations, specifically the Logit (L) and Attend (A) operators. Roofline model analysis proves that increasing batch size cannot solve the memory-bound nature of these specific L/A operations. This bottleneck spawned optimizations like Flat Attention.
+
+For Decoder-like LLMs (The Generation Phase), the inference is strictly divided into a Two-Phase KV Cache Paradigm:
+
+- Prefill (Initialization) Phase: The model reads the user's prompt, generates all initial $q, k, v$ matrices, and stores them in the KV Cache. Because this processes all tokens at once (Matrix $\times$ Matrix), it is highly efficient and Compute Bound. Its bottlenecks match the Encoder-like analysis above.
+
+- Decode Phase: The model generates tokens one by one. To do this, it must read the $k, v$ of all previous tokens from the KV Cache for every single step. This makes it severely Memory Bound.
+
+In the decode phase, we no longer look at "operation intensity" because the KV Cache is the absolute undisputed bottleneck. The most important variable here is Batchsize (bs). In Transformer Block when metric is Per-Token Latency, if the batch size is small, the bottleneck is the FFN. If the batch size is large, the bottleneck shifts to the Attention module. In Attention Layer, the absolute bottleneck is the KV Cache Load Time (moving data from GPU HBM to shared memory). At a batch size of 8, computation latency dominates. However, as batch size increases to 256, computation time shrinks drastically per token, but the kv_cache_latency (orange bar) remains static and becomes the overwhelming majority of the processing time. To optimize LLM inference, one must understand that generation is a tale of two phases. You must ensure the GPU has enough computational throughput for the initial prompt processing (Prefill Phase / Compute Bound), but you must urgently optimize memory bandwidth and KV Cache management (via techniques like PagedAttention or quantization) to survive the token-by-token generation (Decode Phase / Memory Bound), as standard GPU matrix-multiplication hardware is fundamentally starved during this process.
+
+### 5.2.1 Algorithm Optimization
+
+#### 5.2.1.1 Speculative Decoding
