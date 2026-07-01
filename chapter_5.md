@@ -410,3 +410,76 @@ In the decode phase, we no longer look at "operation intensity" because the KV C
 ### 5.2.1 Algorithm Optimization
 
 #### 5.2.1.1 Speculative Decoding
+
+Speculative Decoding is a cutting-edge inference optimization technique designed to drastically speed up Large Language Models (LLMs) without altering their final output distribution. By leveraging a smaller, faster model to "guess" tokens and a larger model to "verify" them in parallel, it breaks the compute bottleneck of auto-regressive generation. The fundamental concept of Speculative Sampling (SpS) involves two models:
+
+- Draft Model ($p$): A lightweight, fast auto-regressive model.
+
+- Target Model ($q$): The massive, highly accurate main model.
+
+The process follows three distinct phases:
+
+1. Small Model Auto-regression: The draft model $p$ runs for $K$ steps sequentially, generating a sequence of candidate tokens: $x_1, x_2, \dots, x_K$.
+
+$$p_1(x) = M_p(pf) \rightarrow x_1$$
+
+$$p_2(x) = M_p(pf, x_1) \rightarrow x_2$$
+
+2. Large Model Forward Verification: The target model $q$ takes the entire draft sequence ($pf, x_1, x_2, \dots, x_K$) and runs one single forward pass in parallel to generate its own set of logits for all $K$ positions.
+
+
+$$q_1(x), q_2(x), \dots, q_K(x) = M_q(pf, x_1, \dots, x_K)$$
+
+3. Sampling and Verification (Sampling): The system compares the probability distributions of the draft model $p(x)$ and the target model $q(x)$ token by token. If $q(x) \ge p(x)$, the token is accepted. If $q(x) < p(x)$, the token is accepted with probability $\frac{q(x)}{p(x)}$. If the token is rejected in Case 2, the system discards it and all subsequent draft tokens. It then resamples the correct token from a normalized difference distribution: $\text{norm}(\max(0, q(x) - p(x)))$. Why do we resample from $(q(x) - p(x))_+$ when a token is rejected? The ultimate objective is to mathematically guarantee that the final generated token follows the exact distribution of the target model $q(x)$. The draft model $p$ sometimes overestimates the probability of certain tokens (the red area where $p > q$). When a token is rejected (because $q(x) < p(x)$ and it fails the probability check), it means we need to "make up" for the parts of the $q$ distribution that the draft model missed or underestimated.  The remaining area needed to perfectly match $q(x)$ is exactly $(q(x) - p(x))_+$.
+
+To understand how to improve Speculative Decoding, we look at the formula for Single Token Latency:
+
+
+$$L = \frac{T_{\text{draft}} + T_{\text{verify}}}{\tau}$$
+
+- $T_{\text{draft}}$: Time taken by the draft model to generate a block.
+
+- $T_{\text{verify}}$: Time taken by the target model for one verification pass.
+
+- $\tau$: The average number of accepted tokens per verification round (accepted length).
+
+To lower latency, we must: lower $T_{\text{draft}}$, lower $T_{\text{verify}}$, or raise $\tau$.
+
+Existing head-based drafters face a strict trade-off between causality (which increases $\tau$) and efficiency (which lowers $T_{\text{draft}}$):
+
+- Auto-regressive Drafter, e.g., EAGLE: Predicts tokens serially. Every token depends on the previous one. This maintains causality ($\tau$ is high), but $T_{\text{draft}}$ scales linearly with block length. You can only use short blocks and shallow networks to keep it fast.
+
+- Parallel Drafter, e.g., DFlash: Inspired by block diffusion, it generates all tokens in a block simultaneously in one forward pass. $T_{\text{draft}}$ is incredibly low and independent of block length. However, because predictions are independent (no causal constraints), it easily generates contradictory drafts, severely suppressing the acceptance rate $\tau$.
+
+DFlash attempts to solve this by having the target model pre-calculate hidden states, projecting them into context features ($H_{\text{ctx}}$), and injecting them into the draft layers. However, the positions within the block are still independent. For example, a parallel drafter might evaluate the phrase "of course / no problem". Both "course" and "problem" have high individual probabilities, resulting in a cross-pattern collision: "of problem".
+
+DeepSeek's DSpark framework tackles both sides of the equation simultaneously: it uses Semi-autoregressive generation to raise $\tau$, and Confidence scheduling verification to lower effective $T_{\text{verify}}$. To fix the DFlash flaw, DSpark splits draft generation into two stages: Parallel Backbone + Serial Dependency. 
+
+1. Parallel Phase: The DFlash backbone runs a single forward pass to generate base logits $U_k$ for every position $k$.
+
+2. Serial Phase: It adds a Transition Bias ($B_k$) to the base logits. This bias conditions each position on the tokens already sampled within the block, inducing a true auto-regressive distribution:
+
+$$p_k(v \mid x_0, x_{<k}) = \frac{\exp(U_k(v) + B_k(x_0, x_{<k}, v))}{\sum_{u \in \mathcal{V}} \exp(U_k(u) + B_k(x_0, x_{<k}, u))}$$
+
+The Markov Head Implementation:
+The simplest way to calculate $B_k$ is using a Markov head, where the bias only depends on the immediately preceding token $B(x_{k-1}, x_k)$. This is brilliantly implemented as a low-rank factorization $B = W_1 W_2$. It requires just one Embedding lookup and one Linear projection. Essentially, at the cost of one low-rank lookup, it adds the auto-regressive dependency of Eagle3 back onto the parallel backbone of DFlash. This retains per-token softmax probabilities and solves the "of problem" collision.
+
+Even with semi-autoregressive drafting, verifying a massive block is expensive. If the draft gets rejected early, verifying the tail end of the block wastes GPU compute and crowds batch capacity. DSpark trains a "Confidence Head" that outputs a scalar $c_k \in (0, 1)$ for every draft position $k$. This models the conditional acceptance rate (the probability that position $k$ passes verification, assuming all prior tokens passed). A hardware-aware prefix scheduler uses these confidence scores and the current system load to decide how much of the draft block to actually verify. It only verifies the high-confidence prefix (e.g., E, F, G). It drops the low-confidence tail (e.g., H). This forces the target model's compute power exclusively toward tokens with a high probability of acceptance, dynamically optimizing $T_{\text{verify}}$ based on the live environment.
+
+Speculative Decoding is an elegant statistical trick to trade cheap compute (drafting) for expensive compute (target verification). However, the evolution from basic Speculative Sampling to DSpark highlights a critical engineering journey: balancing the speed of parallel drafting with the logical necessity of causal, auto-regressive relationships, while dynamically managing hardware load through confidence scoring.
+
+#### 5.2.1.2 Early Exit
+
+Early Exit is an inference optimization strategy for Large Language Models. Its primary purpose on the inference side is to allow the model to make an early exit during the deduction process by deliberately skipping some model layers. By not forcing every single token to pass through every single layer of a massive neural network, the system can significantly speed up response times without needing any extra layers or modules. The essence of early stopping is "allowing tokens to cease computation as soon as their hidden states reach saturation". Essentially, if the model is already highly confident about what the next word should be after processing it through 10 layers, it is a waste of computational resources to push it through the remaining 20 layers.
+
+While the idea is intuitive, applying it to modern, massive LLMs is incredibly difficult. Modern GPUs achieve speed through batching (processing many requests simultaneously). If you allow a single sample within a batch to exit early, it breaks the uniformity of the matrix math and brings immense challenges to scheduling. Existing token-level exit strategies usually rely on ML classifiers to decide when to stop. These classifiers are unpredictable and cannot guarantee worst-case scenarios. The KV Cache Recomputation Problem  is the most severe blocker. In standard LLM decoding, the generation of the next token depends on the Key-Value (KV) cache of the previous token. If token $A$ exits at layer 10, but the next token $B$ needs to compute up to layer 20, token $B$ will suddenly find that the KV cache for token $A$ is missing for layers 11-20. The system would be forced to pause and recompute token $A$'s missing KV cache, entirely destroying any speed gained by exiting early.
+
+To solve these challenges, researchers introduced a new method called SkipDecode. This method is built on a very specific linguistic insight regarding how LLMs generate text. Words towards the end of a sequence are generally easier to predict due to more contextual information. When you are at the end of a long sentence, the context is so rich that the model doesn't need to think deeply (use all its layers) to guess the next word. Based on this insight, SkipDecode proposes two structural changes to how we skip layers.
+
+- Monotonically Decreasing Exit Points. Instead of letting an ML classifier guess when to exit, SkipDecode enforces a strict, mathematical rule: the exit point must strictly decrease (or stay the same) as the sequence gets longer. Early in the prompt (low sequence position), the model uses the max_layer to understand the complex context. As the sequence grows, the computational budget drops linearly toward the min_layer.
+
+- Skipping Lower Layers, Not Top Layers. Standard early exit models stop computation halfway up the network (Early Termination). SkipDecode does the exact opposite. In order not to waste the KV calculated by previous tokens, it will choose to skip the lower layers.
+
+By setting a singular exit point for every token in a batch at each sequence position, the matrix math remains perfectly uniform. All tokens in a column exit at the exact same time. Because the exit layers strictly decrease over time, token $n$ will never need to compute deeper than token $n-1$. This strictly guarantees that the problem of KV cache recomputation does not occur. Furthermore, by skipping the bottom layers and enforcing computation at the top layers, the model implicitly attends to the full, rich computation of previous tokens without needing to recalculate them.
+
+#### 5.2.1.3 Switch Transformer
