@@ -757,7 +757,7 @@ Example: If a GPU has a bandwidth of 1 TB/s ($1000 \text{ GB/s}$) and the model 
 
 (Note: This is a highly idealized theoretical lower limit. It ignores instruction scheduling, thread switching, parallel efficiency, and kernel launch delays).
 
-While model weights require a constant read time per token, KV Cache introduces a Linearly Increasing Overhead (线性增长的开销).
+While model weights require a constant read time per token, KV Cache introduces a Linearly Increasing Overhead.
 
 - Step 1: The model reads the prefix context (Prompt).
 
