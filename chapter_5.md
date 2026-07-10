@@ -483,3 +483,290 @@ To solve these challenges, researchers introduced a new method called SkipDecode
 By setting a singular exit point for every token in a batch at each sequence position, the matrix math remains perfectly uniform. All tokens in a column exit at the exact same time. Because the exit layers strictly decrease over time, token $n$ will never need to compute deeper than token $n-1$. This strictly guarantees that the problem of KV cache recomputation does not occur. Furthermore, by skipping the bottom layers and enforcing computation at the top layers, the model implicitly attends to the full, rich computation of previous tokens without needing to recalculate them.
 
 #### 5.2.1.3 Switch Transformer
+
+As deep learning scales, researchers have discovered a clear power-law relationship between model size, dataset size, and computational volume versus overall performance. Following these established scaling laws, the Switch Transformer explores a highly efficient fourth dimension of scaling: Increasing the number of parameters while keeping the floating-point operations (FLOPs) per sample constant. By utilizing a sparse activation model designed for dense matrix multiplication hardware (like GPUs and TPUs), the model scales elegantly. As the number of devices increases, the total weight of the model also grows, while the memory and computational overhead on each device remains manageable.
+
+To understand the Switch Transformer, we must first look at the standard Mixture of Experts (MoE) layer proposed in 2017. In a standard MoE layer, a token $x$ is received and routed to the best $k$ experts out of a total of $N$ experts $\{E_i(x)\}_{i=1}^N$.
+First, a routing variable $W_r$ generates logits:
+
+
+$$h(x) = W_r \cdot x$$
+
+Then, the distribution is normalized by applying a softmax over all $N$ experts in that layer. The gate value (probability) for expert $i$ is calculated as:
+
+
+$$p_i(x) = \frac{e^{h(x)_i}}{\sum_{j=1}^N e^{h(x)_j}}$$
+
+If $\mathcal{T}$ is the set of indices for the selected top-$k$ experts, the output of the layer is the weighted linear combination of those experts based on their gate values:
+
+
+
+$$y = \sum_{i \in \mathcal{T}} p_i(x)E_i(x)$$
+
+
+Previous works suggested that the routing function needs to route to $k > 1$ experts (usually top-2) to maintain non-trivial gradients and model quality. However, the authors of the Switch Transformer chose to route to ONLY a single expert ($k=1$). They proved that this simplification not only maintains model quality but also reduces routing computation and improves performance. This $k=1$ strategy is called the Switch layer, and it has three major advantages:
+
+1. Routing computation is reduced: Because each token is routed to only one expert.
+
+2. Each expert's capacity can be at least halved: Because each token is assigned to only one expert rather than duplicated across multiple.
+
+3. The routing implementation is simpler, and communication costs are lower.
+
+To efficiently distribute this model, the authors used the MTF (Mesh-TensorFlow) library. They achieved this by abstracting the set of physical cores into a logical processor network, allowing tensors and computations to be easily sharded across dimensions. Because routing decisions are dynamic during training and inference, an important technical problem is how to set expert capacity. Expert capacity is defined by equally dividing the tokens in a batch by the number of experts, and then multiplying by a capacity factor:
+
+
+$$\text{expert capacity} = \left( \frac{\text{tokens per batch}}{\text{number of experts}} \right) \times \text{capacity factor}$$
+
+- Handling Overflow: If the capacity factor is $>1$, it introduces a buffer. If a certain expert receives too many tokens (here the authors refer to them as 'dropped tokens'), the expert skips computing them. Instead, the token's representation is passed directly to the next layer via a residual connection.
+
+- The Trade-off: While a higher capacity factor prevents dropped tokens, increasing expert capacity also has drawbacks: excessively high values lead to wasted computation and memory.
+
+To prevent all tokens from being routed to just one or two popular experts, the system must enforce load balancing. For each Switch layer, an auxiliary loss is added to the total model loss during training. Given $N$ experts and $T$ tokens in batch $B$, the auxiliary loss is the scaled dot product of vectors $f$ and $P$:
+
+
+
+$$\text{loss} = \alpha \cdot N \cdot \sum_{i=1}^N f_i \cdot P_i$$
+
+$f_i = \frac{1}{T} \sum_{x \in B} \mathbf{1}\{\arg\max p(x) = i\}$ (The actual proportion of tokens assigned to expert $i$).
+
+$P_i = \frac{1}{T} \sum_{x \in B} p_i(x)$ (The average softmax probability routed to expert $i$).
+
+Ideally, routing is uniform, meaning both vectors equal $\frac{1}{N}$.
+In this objective function, the $P$ vector is differentiable, while the $f$ vector is non-differentiable. The final loss is multiplied by the number of experts $N$ to keep the loss value stable when the number of experts changes. (Under uniform routing: $\sum_{i=1}^N (f_i \cdot P_i) = \sum (\frac{1}{N} \cdot \frac{1}{N}) = \frac{1}{N}$. Multiplying by $N$ normalizes this back to $1$). Finally, the hyperparameter $\alpha$ is the multiplicative coefficient for these auxiliary losses, typically set to $10^{-2}$ to ensure balance without overwhelming the main cross-entropy objective.
+
+Sparse expert models can be difficult to train due to hard switching decisions, and low-precision formats like BF16 can exacerbate instability in the router's softmax calculations. To fix this, the authors introduced Selective Precision.
+Stability can be achieved by selectively converting to FP32 precision only in local regions of the model, while avoiding the high communication cost brought by FP32 tensors.
+
+- The router input is cast to FP32.
+
+- It generates the dispatch and combine tensors used for expert selection and result recombination.
+
+- Crucially, FP32 precision is only used inside the router function. Once the local device computation is done, the output is cast back to BF16 before being broadcasted over the network. This secures the stability of FP32 without the massive network overhead.
+
+Based on the experiments, the Switch Transformer yields three major conclusions:
+
+1. The Switch Transformer outperforms carefully tuned Dense models and MoE Transformers on the speed-quality trade-off.
+
+2. The computational overhead of the Switch Transformer is less than that of the corresponding MoE model.
+
+3. The Switch Transformer performs better under lower capacity factors of 1.0 and 1.25. This reflects that in large model scenarios where memory is scarce, capacity factors should be minimized as much as possible.
+
+To scale models effectively to trillions of parameters, the authors had to implement advanced initialization and regularization techniques to prevent divergence and overfitting. Proper initialization is critical for successful deep learning training. The weight matrices in the Switch Transformer are initialized using a truncated normal distribution with a mean of $\mu = 0$ and a standard deviation of $\sigma = \sqrt{s/n}$ (where $s$ is a scaling hyperparameter and $n$ is the number of input units). As an extra measure against instability, the authors reduced the default Transformer initialization scaling factor $s = 1.0$ by 10 times. The average model quality (measured by negative log perplexity) is significantly improved, and the variance between different training runs is greatly reduced. This initialization scheme allowed them to safely scale from a 223M parameter baseline up to a massive 1T parameter model.
+
+When pre-training on large datasets and fine-tuning on smaller downstream tasks, overfitting becomes a major issue. Because the Switch Transformer has far more parameters than a FLOP-matched dense baseline, it suffers from much more severe overfitting on these small downstream tasks. Simply adding dropout to all layers causes performance degradation. The authors proposed adding a high dropout rate exclusively inside the experts during fine-tuning. If using a smaller dropout rate of 0.1 at non-expert layers, and a larger dropout rate of 0.4 at expert layers, performance improvements are achieved across four small downstream tasks.
+
+The ultimate test of the Switch Transformer is how well it scales. The model was trained on a massive C4 corpus containing over 180B target tokens to ensure it was not restricted by data limits. It's important to note that adding experts keeps the computation costs roughly the same (because only one expert is activated per token), but the router still has to calculate probabilities across all experts, resulting in a minor compute overhead of $\mathcal{O}(d_{model} \times \text{num experts})$. Under the premise of keeping the FLOPs per token constant, more parameters—i.e., more experts—can accelerate training. There is a massive advantage in scaling along this additional dimension of sparse parameters.  Increasing the number of experts can significantly improve the sample efficiency of the model. For example, a Switch-Base 64 expert model reaches the same performance at step 450k that a standard T5-Base model reaches at step 60k. This is equivalent to achieving a 7.5x speedup in terms of step time, meaning it learns much faster when observing the same amount of data.
+
+While step-efficiency is great, sparse models introduce cross-device communication overhead. The ultimate question is: Under a fixed training time and compute budget, should one train a Dense model or a Sparse model?  The Switch Transformer achieves massive real-world speedups. The Switch-Base 64 expert model only needs 1/7 of the wall-clock time required by the T5-Base model to reach similar perplexity. What if we gave those hardware resources to a larger dense model instead of a sparse one? The authors compared the Switch-Base model against the much stronger T5-Large dense model. Although T5-Large uses 3.5 times more FLOPs per token, Switch-Base still has the advantage in sample efficiency, and achieved a 2.5x speedup.
+
+#### 5.2.1.4 SoftMoE
+
+While standard Transformer models excel in vision and language tasks, scaling their performance traditionally requires a massive, linear increase in computational cost.
+
+Standard Sparse Mixture of Experts (MoE) architectures solve this by only activating a small subset of "expert" subnetworks per token. However, because traditional MoE relies on discrete routing mechanisms, it introduces severe challenges: training instability, dropped tokens, unbalanced expert loads, difficulties in scaling expert numbers, and poor performance during fine-tuning. To overcome these dilemmas, researchers introduced Soft MoE, a soft mixture of experts mechanism. The fundamental philosophy of Soft MoE is a shift from "hard" assignments to "soft" assignments. Instead of using hard routing to assign tokens to specific experts, it performs a linear weighted combination of all input tokens, and then distributes them to each expert for processing. This soft allocation method provides a host of benefits: it is fully end-to-end differentiable, trains more stably, and completely avoids token dropping and expert imbalance. Soft MoE maintains the high capacity and efficiency of standard MoE, but easily scales to more experts with minimal computational overhead.
+
+To understand Soft MoE, we must look at how it calculates the weights. Let the input sequence of tokens be represented as $X \in \mathbb{R}^{m \times d}$, where $m$ is the number of tokens and $d$ is the dimensionality.
+The Soft MoE layer contains $n$ expert functions $\{f_i: \mathbb{R}^d \rightarrow \mathbb{R}^d\}_{1:n}$.
+Each expert processes $p$ "slots". Every slot corresponds to a $d$-dimensional parameter vector. All these parameter vectors together form a massive matrix $\Phi \in \mathbb{R}^{d \times (n \cdot p)}$. The input slots $\tilde{X} \in \mathbb{R}^{(n \cdot p) \times d}$ are constructed as convex combinations of the original $m$ input tokens $X$:
+
+$$D_{ij} = \frac{\exp((X\Phi)_{ij})}{\sum_{i'=1}^m \exp((X\Phi)_{i'j})}, \quad \tilde{X} = D^\top X$$
+
+- The matrix $D$ represents the Dispatch Weights. It is calculated by applying the softmax function to every column of the $X\Phi$ logits.
+
+- Because of this, every single input slot is a weighted average of all input tokens.
+
+Next, the corresponding expert function is applied to each slot (each row of $\tilde{X}$) to generate the output slots:
+
+$$\tilde{Y}_i = f_{\lfloor i/p \rfloor}(\tilde{X}_i)$$
+
+Finally, the output tokens $Y$ are generated as a convex combination of all $n \cdot p$ output slots $\tilde{Y}$:
+
+$$C_{ij} = \frac{\exp((X\Phi)_{ij})}{\sum_{j'=1}^{n \cdot p} \exp((X\Phi)_{ij'})}, \quad Y = C\tilde{Y}$$
+
+The matrix $C$ represents the Combine Weights. It is calculated by applying the softmax function to every row of the $X\Phi$ logits.
+
+Following standard MoE design, the Soft MoE module is typically used to replace a portion of the MLP modules in a Transformer (usually the latter half).
+
+The transition from discrete to soft routing unlocks five massive advantages:
+
+- Fully Differentiable. Traditional sparse MoE algorithms solve token allocation using non-differentiable approximations (like Top-$k$ or Expert Choice). In contrast, all operations within the Soft MoE layer are continuous and completely differentiable. The weighted average generated by softmax weights is interpreted as a "soft assignment" rather than a "hard assignment."
+
+- No Token Dropping. Classic routing mechanisms face severe issues with tokens being dropped (unassigned) or expert load imbalance (some experts receiving vastly more tokens). Soft MoE completely avoids these problems because every slot is filled with a weighted average of ALL input tokens, ensuring no token is dropped and every expert receives information.
+
+- Highly Efficient. The computational cost of a Soft MoE layer is purely determined by the total number of slots. As long as the total number of slots is the same, whether it's a few experts with many slots, or many experts with few slots, the computational cost is identical. Furthermore, Soft MoE completely avoids slow sorting operations or Top-$k$ selections, making it noticeably faster and more hardware-friendly than traditional sparse MoE methods.
+
+- Combines Sparse and Dense Traits. Soft MoE is technically not sparse, because every input token fractionally activates all model parameters via the weighted average slots. However, it isn't a standard Dense MoE either, because each physical expert only computes a fraction of the slots, maintaining high efficiency.
+
+- Sequence-level Determinism. Traditional MoE forces tokens into fixed-size groups for load balancing. If a group contains tokens from different sequences, they compete for buffer spots, causing non-determinism. Because Soft MoE doesn't require this grouping mechanism, it achieves complete sequence-level determinism.
+
+Assuming the cost of an expert function per token is $O(k)$, the time complexity of a Soft MoE layer is $O(mnpd + npk)$. If we set the number of slots per expert $p = O(m/n)$ (the ratio of tokens to experts), the total complexity simplifies to $O(m^2d + mk)$. Because each expert has independent parameters, increasing the number of experts $n$ (and adjusting $p$ accordingly) allows you to scale up the total model parameters WITHOUT increasing the time complexity. Even though there is an $m^2d$ term, it is equivalent to the compute cost of standard Self-Attention, meaning Soft MoE will not become the bottleneck of the Transformer. As shown in experiments, increasing experts from 8 to 4096 leaves Soft MoE throughput virtually unchanged.
+
+Because MoE replaces the Feed-Forward Network in a Transformer, its input is usually layer-normalized. However, when the model dimension $d$ is very large, a mathematical stability issue occurs: As $d \rightarrow \infty$, the softmax output will tend to approach a one-hot vector. To fix this, Soft MoE applies an L2 Normalization across specific axes to both the input $X$ and the parameter matrix $\Phi$, multiplied by a trainable scale scalar. This maintains the "soft" property of the softmax and allows for larger dimensions and higher learning rates. When the number of experts scales massively, the model cannot fit on a single device. Just like standard large-scale MoE training, Soft MoE perfectly supports standard model parallelism techniques to distribute experts across multiple GPUs/TPUs.
+
+#### 5.2.1.5 DeepSeekMoE
+
+As Large Language Models (LLMs) continue to scale, the Mixture of Experts (MoE) architecture has become a prominent method to drastically increase model capacity while keeping computational costs (FLOPs) manageable. However, traditional MoE routing has inherent flaws regarding how experts specialize and share knowledge. DeepSeekMoE was introduced to solve these structural inefficiencies. By redesigning how experts are segmented and how general knowledge is routed, it creates a highly specialized and vastly more efficient sparse model.
+
+In a standard dense Transformer, each layer consists of a Self-Attention module and a Feed-Forward Network (FFN). A traditional MoE layer modifies this by replacing the single FFN with multiple expert subnetworks. For a given token, a routing mechanism (Gating Network) selects only the Top-$K$ experts to activate. The output hidden state $\mathbf{h}_t^l$ for token $t$ at layer $l$ is calculated as:
+
+
+$$\mathbf{h}_t^l = \sum_{i=1}^N (g_{i,t} \cdot \text{FFN}_i(\mathbf{u}_t^l)) + \mathbf{u}_t^l$$
+
+The gating value $g_{i,t}$ is determined by a softmax affinity score $s_{i,t}$, and is strictly zero for experts not in the Top-$K$:
+
+$$g_{i,t} = \begin{cases} s_{i,t}, & s_{i,t} \in \text{Topk}(\{s_{j,t} \mid 1 \le j \le N\}, K) \\ 0, & \text{otherwise} \end{cases}$$
+
+$$s_{i,t} = \text{Softmax}_i((\mathbf{u}_t^l)^\top \mathbf{e}_i^l)$$
+
+(Where $N$ is the total number of experts, $\mathbf{e}_i^l$ is the centroid vector of the $i$-th expert, and $\mathbf{u}_t^l$ is the token's hidden state after Self-Attention).
+
+This guarantees sparse activation, meaning only $K$ out of $N$ gating values are non-zero.
+
+To improve upon this, DeepSeekMoE introduces two massive architectural shifts: Fine-Grained Expert Segmentation and Shared Expert Isolation. These two strategies can elevate the degree of expert specialization.
+
+In standard MoE, a token assigned to an expert might cover a wide variety of knowledge domains. Therefore, this expert tends to learn widely differing knowledge in its parameters, which is hard to utilize effectively at the same time. If each token can be routed to more experts, different types of knowledge have the potential to be decoupled and learned in different experts. DeepSeekMoE achieves this by taking standard experts and slicing their intermediate hidden dimensions into $m$ smaller fragments, shrinking them to $\frac{1}{m}$ of their original size. To keep the computational cost perfectly identical, the number of activated experts is multiplied by $m$. The total experts become $mN$, and the activated experts become $mK$:
+
+
+
+$$\mathbf{h}_t^l = \sum_{i=1}^{mN} (g_{i,t} \cdot \text{FFN}_i(\mathbf{u}_t^l)) + \mathbf{u}_t^l$$
+
+$$g_{i,t} = \begin{cases} s_{i,t}, & s_{i,t} \in \text{Topk}(\{s_{j,t} \mid 1 \le j \le mN\}, mK) \\ 0, & \text{otherwise} \end{cases}$$
+
+This fine-grained slicing drastically increases routing flexibility. Assume a baseline of $N=16$ experts using a Top-$2$ routing strategy. This yields $\binom{16}{2} = 120$ possible routing combinations. If we slice each expert into 4 smaller experts ($m=4$), we now have $64$ total experts and route to Top-$8$. This yields $\binom{64}{8} = \mathbf{4,426,165,368}$ possible combinations!
+This massive surge in flexibility allows the model to capture highly targeted, precise knowledge.
+
+In traditional routing, tokens sent to different experts often still require baseline context or common knowledge. As a result, multiple experts might converge to learn the same shared knowledge in their own parameters, leading to parameter redundancy across experts. If we set up dedicated shared experts to capture and consolidate general knowledge across different contexts, this parameter redundancy is mitigated, leaving the routed experts to focus entirely on specialized tasks.
+
+The Final DeepSeekMoE Equation:
+DeepSeekMoE isolates $K_s$ experts specifically as "Shared Experts." Every single token is deterministically passed through these shared experts. To keep the total compute constant, the number of dynamically routed experts is simply reduced by $K_s$.
+
+$$\mathbf{h}_t^l = \sum_{i=1}^{K_s} \text{FFN}_i(\mathbf{u}_t^l) + \sum_{i=K_s+1}^{mN} (g_{i,t} \cdot \text{FFN}_i(\mathbf{u}_t^l)) + \mathbf{u}_t^l$$
+
+$$g_{i,t} = \begin{cases} s_{i,t}, & s_{i,t} \in \text{Topk}(\{s_{j,t} \mid K_s+1 \le j \le mN\}, mK - K_s) \\ 0, & \text{otherwise} \end{cases}$$
+
+Automatically learned routing risks a fatal flaw known as Routing Collapse, where the model only ever picks a few favorite experts, leaving the rest untrained. Furthermore, unbalanced routing across distributed GPUs creates massive communication bottlenecks. DeepSeekMoE implements two levels of balance loss to fix this. To prevent routing collapse, the model calculates the load distribution across experts:
+
+$$\mathcal{L}_{\text{ExpBal}} = \alpha_1 \sum_{i=1}^{N'} f_i P_i$$
+
+- $f_i = \frac{N'}{K'T} \sum_{t=1}^T \mathbb{1}(\text{Token } t \text{ select Expert } i)$ (The fraction of times expert $i$ is selected)
+
+- $P_i = \frac{1}{T} \sum_{t=1}^T s_{i,t}$ (The average routing probability for expert $i$)
+(Where $N' = mN - K_s$ and $K' = mK - K_s$)
+
+There is no need to impose strict balance constraints at the expert level because overly strong load-balancing constraints will damage model performance. Instead, we just need to ensure the total computation happening on each physical GPU is balanced. If all routed experts are divided into $D$ groups $\{E_1, E_2, \dots, E_D\}$ corresponding to physical devices, the device-level loss is:
+
+$$\mathcal{L}_{\text{DevBal}} = \alpha_2 \sum_{i=1}^D f_i' P_i'$$
+
+- $f_i' = \frac{1}{|E_i|} \sum_{j \in E_i} f_j$
+
+- $P_i' = \sum_{j \in E_i} P_j$
+
+The Hyperparameter Strategy (Purple Text):
+DeepSeekMoE sets a smaller expert-level balance factor to mitigate routing collapse risk, while simultaneously setting a larger device-level balance factor to promote computation balance across devices. This ensures high hardware utilization without stifling the model's natural ability to assign specialized tasks unevenly when mathematically necessary.
+
+#### 5.2.1.6 KV Cache
+
+During the inference phase of Large Language Models (LLMs) based on the Transformer architecture, the system generates text auto-regressively—one token at a time. This process is inherently slow and resource-heavy. To combat this, the industry standard is to use a KV Cache (Key-Value Cache).
+
+In a standard Self-Attention mechanism, generating a new token requires calculating the attention scores between the current Query (Q) and the Keys (K) and Values (V) of all previous tokens in the sequence.
+
+- Without Cache (The Problem): Every time a new token is generated, the model recalculates the Keys and Values for all historical tokens from scratch. This redundant computation causes the computational complexity to grow quadratically ($O(n^2)$), severely slowing down inference.
+
+- With KV Cache (The Solution): The model saves the historical Keys and Values in GPU memory. When generating the next token, the model only needs to calculate the Q, K, and V for the new token. It then interacts with the cached historical K and V data.
+
+The core purpose of KV Cache is to avoid repeated calculations, thereby greatly improving efficiency. By trading memory for compute, the mathematical complexity of generation is reduced from quadratic to linear. To truly understand KV Cache, we must look at the two distinct stages of LLM inference: Prefill and Decode. Modern optimization heavily relies on PD Separation, which decouples these two tasks physically or logically.
+
+The Prefill stage is responsible for parsing the user's input Prompt.
+
+- Characteristics: It is a Compute-bound process. Because the input prompt is static and known, it heavily relies on dense matrix multiplications (GEMM), making massive demands on GPU computing power (FLOPs). It has a Static feature, allowing prompts to be processed in batches for high throughput.
+
+- The Output: Once computation is complete, this stage generates the initial Key-Value Cache (KV Cache), which is provided for repeated use in the subsequent decoding stage to avoid repeated calculations.
+
+The Decode stage is the auto-regressive, token-by-token generation phase.
+
+- Characteristics: It is a Memory-bound process. Generating each new token requires reading the massive KV Cache stored in the GPU's High Bandwidth Memory (HBM). Its Dynamic feature makes it incredibly difficult to batch efficiently compared to the Prefill stage.
+
+- The Benefit: Because of the cache, the model doesn't need to recalculate Key and Value for all historical tokens, and can directly reuse Prefill stage results, drastically cutting down compute overhead.
+
+Advanced architectures utilize Level 3 PD Separation, routing the Compute-bound Prefill tasks to heterogeneous hardware like CPUs or FPGAs, while dedicating GPUs strictly to the Memory-bound Decode tasks.
+
+While KV Cache saves compute time, it requires an astronomical amount of VRAM (Video RAM). The memory requirement of KV Cache expands linearly with the sequence length and batch size, often growing to multiple times the size of the model weights themselves.
+
+The exact total size of the KV Cache is determined by the following formula:
+
+$$\text{KVCache Size} = 2 \times \text{precision} \times n_{layers} \times d_{model} \times seqlen \times batch$$
+
+Formula Breakdown:
+
+- $2$: We must cache two vectors: one for Key and one for Value.
+
+- $\text{precision}$: The byte size of the data format (e.g., FP16 = 2 bytes).
+
+- $n_{layers}$: The number of layers in the model (every attention mechanism in every layer caches its own K and V).
+
+- $d_{model}$: The hidden dimension of the model (often equal to $\text{numheads} \times \text{headdimension}$).
+
+- $seqlen$: The sequence length ($s + n$, where $s$ is input length and $n$ is generated length).
+
+- $batch$: The batch size (number of sequences processed simultaneously).
+
+Case Study: GPT-3 (175B Parameters)
+Let's assume we are running GPT-3 with FP16 precision ($2$ bytes), a batch size of $4$, an input sequence length of $4096$, $96$ layers, and a $d_{model}$ of $12288$ ($96$ heads $\times 128$ dim).
+
+
+
+$$\text{KV Cache Size} = 2 \times 2 \times 96 \times 12288 \times 4096 \times 4$$
+
+$$\text{KV Cache Size} = 77,317,495,808 \text{ bytes} \approx \mathbf{72 \text{ GB}}$$
+
+There are  three reasons why managing KV Cache is the most critical hurdle in modern AI deployment:
+
+- The LLM Context Window Trend: The length of context windows is constantly growing. OpenAI's API frequently sees dynamic lengths around 10k tokens (including prefill prompts and conversation history). There is a direct contradiction between the ever-growing context demands and the limited physical GPU VRAM.
+
+- Consumer GPU Limitations: For cost-effective consumer GPUs like the RTX 4090, VRAM is severely limited (24GB). As a result, the massive footprint of KV Cache reduces the model's batch size. to prevent out-of-memory errors.
+
+- Crucial for AIGC & Multi-modal Generation: This issue isn't just for text. Video and image generation models like Sora or Stable Diffusion have relatively small parameters ($<10B$) but incredibly long generation sequences (approaching $1000k$ patches). In these models, KV cache can account for 90% or more of the total VRAM usage.
+
+Because KV Cache dominates VRAM, researchers are attacking the problem through four main avenues:
+
+- Storage Compression: Moving away from FP16 and using highly efficient, lower bit-width numeric representations like FP8, cutting the memory requirement exactly in half.
+
+- Paged/Tiered Caching: Introducing multi-tier memory systems (like swapping data between fast GPU VRAM and slower CPU Host Memory) to securely store massive caches without crashing the GPU.
+
+- Block Storage: Chunking long sequence tasks to reduce peak memory demands (similar to techniques like FastGen).
+
+- Inference Algorithm Optimization: Exploiting the low-rank or sparse nature of attention mechanisms to permanently drop or ignore historical keys/values that are mathematically deemed unimportant, shrinking the cache size dynamically.
+
+To fully grasp why Inference Algorithm Optimization is critical, we must understand the physical constraints of GPU hardware during the decoding phase. In an ideal scenario, computation dictates speed. However, when performing matrix multiplications during decoding, the raw floating-point performance (FLOPS) of CUDA or Tensor Cores is often vastly greater than the data throughput the GPU's memory can provide. This creates a Memory-bound situation:
+
+- Compute Units Idle: The compute units are frequently in a state of "idling" or "waiting for data", unable to operate at full load.
+
+- Massive Data Transfer: Because parameters and intermediate activations must be read from Video RAM (VRAM) for every single step, massive amounts of data must be moved continuously.
+
+Therefore, from a hardware perspective, we can approximate that:
+
+$$\text{Inference Speed} \propto \frac{\text{Memory Bandwidth}}{\text{Data required per generated token}}$$
+
+To understand this physically, we can construct a rough estimation formula for single-step latency ($t_{\text{model}}$). If we only consider the time it takes to read the model's parameters once:
+
+
+
+$$t_{\text{model}} = \frac{\text{ModelSize}}{\text{BW (Memory Bandwidth)}}$$
+
+Example: If a GPU has a bandwidth of 1 TB/s ($1000 \text{ GB/s}$) and the model size is 14.2 GB, the theoretical minimum latency per token is $14.2 \text{ GB} / 1000 \text{ GB/s} = 0.0142 \text{ s} \approx \mathbf{14.2 \text{ ms}}$.
+
+(Note: This is a highly idealized theoretical lower limit. It ignores instruction scheduling, thread switching, parallel efficiency, and kernel launch delays).
+
+While model weights require a constant read time per token, KV Cache introduces a Linearly Increasing Overhead (线性增长的开销).
+
+- Step 1: The model reads the prefix context (Prompt).
+
+- Step 2: Generating token 2 requires reading 1 set of KV Cache.
+
+- Step $n$: Generating token $n$ requires reading $(n-1)$ sets of KV Cache! Because deep networks must visit this KV cache at every single layer, the total memory access volume scales aggressively.
+
+For a standard 7B model, loading 14 GB of weight data completely overshadows the ~130 MB of KV cache in early generation stages. However, in much larger models (30B, 70B, 100B+) or in multi-turn chat scenarios where the context length is incredibly long, the proportion of latency caused by reading the KV cache continuously grows.
+
+How many milliseconds or seconds a single inference takes is usually directly and highly correlated with these three items: 'Model Size', 'Context Length', and 'GPU Bandwidth'. This fundamental physical limitation is why aggressive engineering optimizations—such as quantization, Tensor Parallelism, Pipeline Parallelism, and Algorithm Optimizations (dropping unimportant keys)—are absolutely mandatory to survive in modern LLM deployment.
+
+### 5.2.2 System Optimization
