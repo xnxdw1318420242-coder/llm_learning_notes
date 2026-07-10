@@ -246,7 +246,6 @@
     * **5.2.1.4 SoftMoE**
     * **5.2.1.5 DeepSeekMoE**
     * **5.2.1.6 KV Cache**
-    * **5.2.1.7 Prefill-Decode Separation**
 * **5.2.2 System Optimization**
     * **5.2.2.1 Iteration-Level Batching**
     * **5.2.2.2 Chunked Prefill**
