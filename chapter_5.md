@@ -770,3 +770,39 @@ For a standard 7B model, loading 14 GB of weight data completely overshadows the
 How many milliseconds or seconds a single inference takes is usually directly and highly correlated with these three items: 'Model Size', 'Context Length', and 'GPU Bandwidth'. This fundamental physical limitation is why aggressive engineering optimizations—such as quantization, Tensor Parallelism, Pipeline Parallelism, and Algorithm Optimizations (dropping unimportant keys)—are absolutely mandatory to survive in modern LLM deployment.
 
 ### 5.2.2 System Optimization
+
+#### 5.2.2.1 Iteration-Level Batching
+
+To understand the massive optimization brought about by Iteration-Level Batching (also referred to as Dynamic Batching or continuous batching), we must first understand the fundamental mechanics of Large Language Model (LLM) inference and the severe limitations of traditional scheduling. For Causal Decoder-only models, the inference process is strictly divided into two distinct phases:
+
+- Prefill Stage: The model processes the user's initial prompt all at once.
+
+- Decode Stage: The LLM generates the output text auto-regressively—one token at a time—until it encounters an <EOS> (End of Sentence) token or hits the maximum length limit.
+
+LLM inference is Memory I/O bound, not Compute bound. Loading 1MB of weights into the GPU takes longer than actually performing the math on that 1MB of data. Therefore, the throughput of an LLM is heavily dependent on how much batch data you can cram into the high-speed GPU memory. However, GPU memory consumption increases with both model size and token length. If you limit sequence length to 512, you might fit 28 sequences in a batch. If you raise it to 2048, you might only fit 7. When processing multiple user requests (sequences) simultaneously, the traditional approach is Static Batching. The fundamental flaw of Static Batching is that the LLM doesn't know when a sequence will finish generating its <EOS> token.
+
+When you batch multiple different requests together, some requests will naturally finish much earlier than others. Because it is a static batch, the GPU cannot release the computational resources for shorter sequences until the longest sequence is completely finished. The white empty squares after the red END markers represent the GPU sitting completely idle doing nothing. This means the GPU is severely underutilized. Traditional static batching cannot utilize the white idle time. If you are running a chat application where answer lengths vary wildly, this static method ruins GPU efficiency.
+
+To solve the massive waste of GPU cycles seen in Static Batching, the industry moved to Dynamic Batching (often referred to as continuous batching or iteration-level batching). The concept is beautifully simple: "Once a certain sequence in a batch finishes generating and produces an <EOS> token, you can insert a new sequence in its place to continue generating tokens". By dynamically swapping in new requests at the exact iteration (token generation step) that an old request finishes, the system completely eliminates the "blank cells." This achieves a much higher GPU utilization rate than static batching. 
+
+Reality is more complicated than this simplified model. Because the Prefill stage requires different computation patterns than the Decode stage, it cannot be easily batched together with token generation. This specific challenge leads to even more advanced techniques, such as Chunked Prefill.
+
+#### 5.2.2.2 Chunked Prefill (SARATHI)
+
+Building upon the concepts of Iteration-Level Batching (Dynamic Batching), Chunked Prefill addresses a major flaw in how modern Large Language Models handle the stark differences between processing a prompt and generating a response. Standard Iteration-Level Batching processes requests token-by-token. However, this process fails to consider the fundamental differences between the prefill and decode stages. When we analyze the specific characteristics of these two stages, two critical conclusions emerge:
+
+- Prefill saturates the GPU easily, Decode starves it. Because the Prefill stage processes all the tokens in the user's input prompt in parallel, a very small batch size will max out GPU utilization. Conversely, in the decode stage (with KV Cache enabled), every auto-regressive step only generates exactly one token. Therefore, GPU utilization is very low.
+
+- During Decode, the computational cost of generating a single token is significantly higher than processing a single token during the Prefill stage. As you increase the batch size, the per-token cost of Prefill remains almost completely constant. The per-token cost of Decode drops dramatically. The prefill stage saturates GPU efficiency at a very small batch size, while the decode stage only saturates it at a very large batch size. Prefill takes a long input sequence $L$, resulting in heavy compute (Compute-bound). Decode takes an input length of $1$ but must repeatedly read the massive KV Cache, resulting in heavy Memory IO overhead (Memory-bound).
+
+Because the Prefill stage for a long prompt takes a significantly longer time than a single Decode step, throwing them both into a standard pipeline creates massive computational waste. Due to the existence of the long-latency prefill stage, computation bubbles exist when performing pipeline parallelism. To eliminate these massive bubbles, the industry introduced Chunked Prefill, as demonstrated in the SARATHI schedule. Chunked Prefill introduces two revolutionary steps:
+
+- Splitting the Prompt: It takes long, variable-length prompts and breaks them apart into uniformly sized, smaller "chunks" for prefilling.
+
+- Piggybacking Decodes: Because these chunks are smaller, they leave tiny gaps (bubbles) in the computation schedule. The system inserts (piggybacks) the quick Decode requests of other sequences into these gaps.
+
+You cannot simply chop up a prompt without consequences. Chunked prefill requires special handling of the attention mask because a single prefill is split into multiple times. Furthermore, Chunked Prefill slightly increases the overall overhead of the Prefill stage because the system must repeatedly load the KV Cache of previous chunks from GPU Memory into the Kernel to compute the current chunk.
+
+If Chunked Prefill increases the overhead of the Prefill stage, why do we use it? We do it because piggybacking decode requests onto prefill chunks is overwhelmingly beneficial for the Decode stage. During decoding, the GPU memory overhead comes from fetching the KV Cache and fetching the massive model weights (parameters). When we piggyback a decode task alongside a prefill chunk, it can directly reuse the model parameters fetched during the prefill stage. Doing so can almost convert decode from a memory-bound operation to a compute-bound operation. 
+
+#### 5.2.2.3 PagedAttention
