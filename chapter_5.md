@@ -805,4 +805,978 @@ You cannot simply chop up a prompt without consequences. Chunked prefill require
 
 If Chunked Prefill increases the overhead of the Prefill stage, why do we use it? We do it because piggybacking decode requests onto prefill chunks is overwhelmingly beneficial for the Decode stage. During decoding, the GPU memory overhead comes from fetching the KV Cache and fetching the massive model weights (parameters). When we piggyback a decode task alongside a prefill chunk, it can directly reuse the model parameters fetched during the prefill stage. Doing so can almost convert decode from a memory-bound operation to a compute-bound operation. 
 
-#### 5.2.2.3 PagedAttention
+#### 5.2.2.3 FlashAttention
+
+FlashAttention-1 computes the same dense, softmax-based attention as ordinary attention, but it computes it in a much more GPU-friendly order. It does not replace attention with an approximation. Instead, it:
+
+- Divides Q, K, and V into small blocks.
+- Loads those blocks from relatively slow GPU HBM into very fast on-chip SRAM.
+- Fuses score calculation, masking, softmax, dropout, and multiplication by V.
+- Never writes the full N×N score matrix S or probability matrix P to HBM.
+- Keeps only a small running maximum, a running softmax denominator, and the partial output for each query row.
+- Recomputes S and P during backpropagation instead of saving them.
+
+The key philosophy is: Doing a little more arithmetic can be faster when it avoids moving a great deal of data.
+
+FlashAttention therefore leaves the dense-attention arithmetic complexity at approximately O(N2d), but drastically reduces memory traffic and removes the quadratic-size saved intermediates. It is mathematically exact, apart from ordinary floating-point differences caused by changing the order of operations.
+
+| Memory level             |                             Approximate capacity shown in the slides | Approximate bandwidth shown | Main role                                                       |
+| ------------------------ | -------------------------------------------------------------------: | --------------------------: | --------------------------------------------------------------- |
+| CPU main memory, or DRAM |                                                   **More than 1 TB** |               **12.8 GB/s** | Very large, but far from the GPU                                |
+| GPU HBM                  |                                                         **40–80 GB** |            **1.5–2.0 TB/s** | Holds model activations, (Q,K,V,O), and normal GPU tensors      |
+| On-chip GPU SRAM         | **192 KB per SM**, across **108 SMs**, approximately **20 MB total** |   Approximately **19 TB/s** | Small, extremely fast workspace for currently executing kernels |
+
+<p align="center">
+<img width="521" height="377" alt="image" src="https://github.com/user-attachments/assets/6215782f-8802-4269-a944-2dcc05d042a3" />
+</p>
+
+The smaller a memory level is, the faster it tends to be. On the A100, on-chip SRAM is roughly an order of magnitude faster than HBM, but its capacity is thousands of times smaller. The A100 figures in the original FlashAttention paper are 40–80 GB of HBM at 1.5–2.0 TB/s, and 192 KB of combined on-chip storage for each of 108 streaming multiprocessors, with estimated aggregate bandwidth around 19 TB/s. A hardware nuance is that the quoted 192 KB is the combined L1, texture-cache, and shared-memory structure. CUDA exposes at most about 164 KB of shared memory per A100 SM, and a single thread block can use slightly less than that. Thus, “SRAM” in the FlashAttention explanation is an abstraction covering fast shared memory, caches, and registers—not one globally accessible 20 MB pool.
+
+A GPU operation is usually implemented as a kernel. A kernel generally:
+1. Loads input data from HBM.
+2. Places active data in registers and SRAM.
+3. Performs calculations.
+4. Writes results back to HBM.
+
+Because modern GPUs have become extremely fast at matrix multiplication, many operations are limited not by arithmetic throughput but by how quickly data can be moved. The relevant metric is arithmetic intensity:
+
+$\text{Arithmetic intensity} = \frac{\text{arithmetic operations}}{\text{bytes moved}}$
+
+A high value means the GPU performs substantial computation for every byte loaded. A low value means it spends much of its time moving data.
+
+For a compute-bound operation, arithmetic dominates runtime, while HBM access is a relatively small part of the cost. Examples are matrix multiplication with a large inner dimension, and convolution with many channels. For a memory-bound operation, runtime is determined mainly by memory reads and writes, while the arithmetic itself is comparatively cheap. Examples include: Activation functions, Dropout, Sum and other reductions, Softmax, Batch Normalization, Layer Normalization, etc. This distinction explains an apparent paradox in attention: most mathematical operations may be in matrix multiplications, but masking, softmax, dropout, and other elementwise operations can consume a surprisingly large fraction of wall-clock time because they repeatedly read and write the large attention matrix.
+
+A conventional framework may execute attention as several kernels:
+
+- Matrix multiplication
+- Masking
+- Softmax
+- Dropout
+- Another matrix multiplication
+
+Each kernel may read its input from HBM and write its output back to HBM. Therefore, even inexpensive operations such as masking and dropout can be expensive when they operate on an N×N matrix. Although the two matrix multiplications contain most of the FLOPs, masking, softmax, and dropout occupy a substantial part of the PyTorch runtime. FlashAttention replaces the stack with a fused computation that avoids materializing the large intermediate attention matrix in HBM. The original paper reported a 7.6× speedup for the attention computation in the particular GPT-2 microbenchmark shown in that figure.
+
+For one attention head, let
+
+$$
+Q, K, V \in \mathbb{R}^{N \times d}
+$$
+
+where:
+
+- N is sequence length.
+- d is the dimension of one attention head.
+
+In a normal Transformer, the complete expression is usually closer to
+
+$$
+S = \frac{QK^\top}{\sqrt{d}} + \text{mask}
+$$
+
+$$
+P = softmax_{\text{row}}(S)
+$$
+
+$$
+O = Dropout(P)V
+$$
+
+The scaling factor, mask, and dropout do not change the central FlashAttention idea; they can be incorporated into the fused tile computation.
+
+The standard implementation proceeds as follows.
+
+1. Store Q, K, and V in HBM. The input matrices are normal GPU tensors and reside in the large HBM.
+
+2. Compute the score matrix. Load blocks of Q and K from HBM to SRAM, compute
+
+$$
+S = QK^\top
+$$
+
+Write the complete score matrix
+
+$$
+S \in \mathbb{R}^{N \times N}
+$$
+
+to HBM.
+
+3. Compute softmax. Read \(S\) back from HBM and compute
+
+$$
+P = \softmax(S)
+$$
+
+Then write the complete probability matrix
+
+$$
+P \in \mathbb{R}^{N \times N}
+$$
+
+to HBM.
+
+4. Compute the output. Read blocks of \(P\) and \(V\) from HBM and compute
+
+$$
+O = PV
+$$
+
+Then write \(O\) to HBM. The problem is not merely that the matrices are large. It is that they are repeatedly transferred between HBM and on-chip memory.
+
+Both \(S\) and \(P\) contain \(N^2\) elements for every batch item and every attention head.For batch size \(B\) and \(H\) attention heads, each of these intermediate tensors contains approximately
+
+$$
+BHN^2
+$$
+
+elements. As \(N\) grows:
+
+- Arithmetic grows approximately as \(N^2d\).
+- The storage required for \(S\) and \(P\) grows as \(N^2\).
+- HBM traffic grows rapidly because \(S\) and \(P\) are written and read several times.
+- Masking, softmax, and dropout also process \(N^2\) elements.
+
+This is why attention is often largely **memory-bound**. Communication between HBM and SRAM becomes a major limiter of efficiency.
+
+FlashAttention divides the matrices into blocks small enough to fit in fast on-chip memory. Within a tile, it fuses:
+
+- \(QK^\top\)
+- Scaling
+- Masking
+- Safe softmax
+- Dropout
+- Multiplication by \(V\)
+
+This prevents the complete \(S\) and \(P\) matrices from ever being written to HBM. Ordinary training saves intermediate tensors because backpropagation needs them. FlashAttention instead saves only compact softmax statistics and recomputes the required \(S\) and \(P\) blocks during the backward pass. This resembles **gradient checkpointing**, but there is an important difference. Ordinary checkpointing often trades speed for lower memory usage. FlashAttention’s recomputation can still be faster because recomputing a tile on-chip may be cheaper than reading a huge saved matrix from HBM.
+
+Suppose
+
+$$
+Q,K,V\in\mathbb{R}^{4\times3}.
+$$
+
+Divide \(Q\) into two row blocks:
+
+$$
+Q_1,Q_2\in\mathbb{R}^{2\times3}.
+$$
+
+Divide \(K\) and \(V\) into corresponding blocks:
+
+$$
+K_1,K_2,V_1,V_2\in\mathbb{R}^{2\times3}.
+$$
+
+Equivalently,
+
+$$
+K_1^\top,K_2^\top\in\mathbb{R}^{3\times2}.
+$$
+
+Ignoring softmax for a moment, one output block can be accumulated as
+
+$$
+O_i =
+(Q_iK_1^\top)V_1
++
+(Q_iK_2^\top)V_2.
+$$
+
+The loop structure is:
+
+- Outer loop: fix one $\(K_j,V_j\)$ block.
+- Inner loop: visit the different $\(Q_i\)$ blocks.
+- Compute a partial output block.
+- Add contributions from successive $\(K,V\)$ blocks.
+- Concatenate the completed output row blocks to obtain $\(O\)$.
+
+Every tile calculation contributes directly to part of the final output.
+
+The complete $\(4\times4\)$ score matrix does not need to be retained.
+
+Without softmax, partial matrix products can simply be added. With softmax, each query row must be normalized across all keys:
+
+$$
+P_{ij} =
+\frac{e^{S_{ij}}}
+{\sum_{k=1}^{N}e^{S_{ik}}}.
+$$
+
+A softmax computed independently inside each tile would use a different denominator for every tile. Those independently normalized results cannot simply be added. FlashAttention therefore needs a method for computing softmax incrementally while seeing only one block at a time. For a vector
+
+$$
+X=[x_1,x_2,\ldots,x_N],
+$$
+
+ordinary softmax is
+
+$$
+softmax(x_i) =
+\frac{e^{x_i}}
+{\sum_{j=1}^{N}e^{x_j}}.
+$$
+
+The largest finite value representable by FP16 is 65504. However,
+
+$$
+e^{12}\approx162755,
+$$
+
+which already exceeds that limit. Directly exponentiating moderately large scores can therefore overflow. The stable solution is safe softmax. Define
+
+$$
+m(X)=\max(x_1,x_2,\ldots,x_N).
+$$
+
+Then compute
+
+$$
+softmax(x_i) =
+\frac{e^{x_i-m(X)}}
+{\sum_{j=1}^{N}e^{x_j-m(X)}}.
+$$
+
+
+Subtracting the same constant from every score does not change softmax because the common exponential factor cancels. Choosing the maximum is especially useful because
+
+$$
+x_i-m(X)\leq0,
+$$
+
+so every exponential is at most \(1\). This operation is better described as a maximum shift than as conventional input normalization.
+
+The safe-softmax process can be written as follows:
+
+$$
+X=[x_1,x_2,\ldots,x_N],
+$$
+
+$$
+m(X)=\max(x_1,x_2,\ldots,x_N),
+$$
+
+$$
+p(X) =
+\left[
+e^{x_1-m(X)},
+\ldots,
+e^{x_N-m(X)}
+\right],
+$$
+
+$$
+\ell(X)=\sum_i p(X)_i,
+$$
+
+$$
+softmax(X) =
+\frac{p(X)}{\ell(X)}.
+$$
+
+Here:
+
+- $\(m(X)\)$ is the row maximum.
+- $\(p(X)\)$ is the unnormalized, maximum-shifted exponential vector.
+- $\(\ell(X)\)$ is the softmax denominator after maximum shifting.
+
+Suppose one row is split into two blocks: 
+
+$$
+X=[X^1,X^2].
+$$
+
+For each block, independently calculate
+
+$$
+m_1=m(X^1),
+\qquad
+m_2=m(X^2),
+$$
+
+$$
+p_1=e^{X^1-m_1},
+\qquad
+p_2=e^{X^2-m_2},
+$$
+
+$$
+\ell_1=\sum p_1,
+\qquad
+\ell_2=\sum p_2.
+$$
+
+The global maximum is
+
+$$
+m=\max(m_1,m_2).
+$$
+
+The first block was expressed relative to $\(m_1\)$, while the second block was expressed relative to $\(m_2\)$. To put both blocks on the common global scale \(m\), rescale them:
+
+$$
+p(X) =
+\left[
+e^{m_1-m}p_1,
+\;
+e^{m_2-m}p_2
+\right].
+$$
+
+The combined denominator is
+
+$$
+\ell(X) =
+e^{m_1-m}\ell_1
++
+e^{m_2-m}\ell_2.
+$$
+
+Therefore,
+
+$$
+softmax(X) =
+\frac{p(X)}{\ell(X)}.
+$$
+
+This is the essential online softmax rule. A complete row can be processed piece by piece while retaining only a maximum and a sum for that row. FlashAttention applies this rule simultaneously to many rows in a query block.
+
+FlashAttention does not need to preserve the complete vector \(p(X)\). It only needs the softmax-weighted value sum. For one query row, define the state after some key blocks have been processed:
+
+$$
+m =
+\text{largest score seen so far},
+$$
+
+$$
+\ell =
+\sum_{\text{seen keys}}e^{s_k-m},
+$$
+
+$$
+z =
+\sum_{\text{seen keys}}e^{s_k-m}v_k,
+$$
+
+$$
+o =
+\frac{z}{\ell}.
+$$
+
+Here, \(o\) is the current normalized attention output. For a new block, calculate local statistics
+
+$$
+\widetilde m,
+\qquad
+\widetilde\ell,
+\qquad
+\widetilde z.
+$$
+
+Then merge the old and new states. The new maximum is
+
+$$
+m^{\text{new}} =
+\max(m,\widetilde m).
+$$
+
+The new denominator is
+
+$$
+\ell^{\text{new}} =
+e^{m-m^{\text{new}}}\ell
++
+e^{\widetilde m-m^{\text{new}}}\widetilde\ell.
+$$
+
+The new weighted numerator is
+
+$$
+z^{\text{new}} =
+e^{m-m^{\text{new}}}z
++
+e^{\widetilde m-m^{\text{new}}}\widetilde z.
+$$
+
+The new normalized output is
+
+$$
+o^{\text{new}} =
+\frac{z^{\text{new}}}
+{\ell^{\text{new}}}.
+$$
+
+This is the mathematical heart of FlashAttention-1.
+
+When a later block contains a larger score, the reference maximum changes.
+
+The old contribution is not discarded. It is multiplied by the appropriate exponential correction so that it is expressed relative to the new maximum.
+
+Complete FlashAttention-1 forward algorithm:
+
+| Symbol | Meaning |
+|---|---|
+| \(N\) | Sequence length |
+| \(d\) | Dimension of one attention head |
+| \(M\) | Usable local on-chip memory in the paper’s abstract model |
+| \(B_r\) | Number of query rows in one query block |
+| \(B_c\) | Number of key/value rows in one key/value block |
+| \(T_r=\lceil N/B_r\rceil\) | Number of query blocks |
+| \(T_c=\lceil N/B_c\rceil\) | Number of key/value blocks |
+| \(m_i\) | Running row maximum for query block \(i\) |
+| \(\ell_i\) | Running softmax denominator for query block \(i\) |
+| \(O_i\) | Running normalized output for query block \(i\) |
+
+The pseudocode assumes one batch item and one attention head.
+
+1. Inputs are stored in HBM. The matrices
+
+$$
+Q,K,V\in\mathbb{R}^{N\times d}
+$$
+
+reside in HBM. HBM is measured in gigabytes, so storing these $\(N\times d\)$ matrices is generally manageable. The larger problem is storing the $\(N\times N\)$ matrices $\(S\)$ and $\(P\)$.
+
+2. Select row and column block sizes. The paper’s simplified rule is
+
+$$
+B_c =
+\left\lceil
+\frac{M}{4d}
+\right\rceil,
+$$
+
+$$
+B_r =
+\min
+\left(
+\left\lceil
+\frac{M}{4d}
+\right\rceil,
+d
+\right).
+$$
+
+The factor $\(4d\)$ provides the intuition that on-chip memory must accommodate roughly four \(d\)-wide working blocks:
+
+- A $\(Q\)$ block
+- A $\(K\)$ block
+- A $\(V\)$ block
+- An $\(O\)$ block
+
+The temporary score tile and softmax state must also fit, which is one reason $\(B_r\)$ is capped. Production kernels also choose hardware-friendly tile sizes instead of mechanically applying this theoretical expression. In addition, $\(M\)$ represents memory available to one executing work unit. It is not the aggregate on-chip memory distributed across the entire GPU.
+
+3. Initialize the output and softmax statistics
+
+Initialize the following values in HBM:
+
+$$
+O=0\in\mathbb{R}^{N\times d},
+$$
+
+$$
+\ell=0\in\mathbb{R}^{N},
+$$
+
+$$
+m=-\infty\in\mathbb{R}^{N}.
+$$
+
+Their meanings are:
+
+- $\(O\)$: accumulated normalized attention output
+- $\(\ell\)$: accumulated softmax denominator
+- $\(m\)$: largest score encountered so far in each row
+
+Initializing $\(m\)$ to $\(-\infty\)$ guarantees that the first real score becomes the running maximum.
+
+4. Divide $\(Q\)$, $\(K\)$, and $\(V\)$ into blocks. Split \(Q\) into
+
+$$
+T_r =
+\left\lceil
+\frac{N}{B_r}
+\right\rceil
+$$
+
+blocks:
+
+$$
+Q_1,\ldots,Q_{T_r},
+\qquad
+Q_i\in\mathbb{R}^{B_r\times d}.
+$$
+
+Split \(K\) and \(V\) into
+
+$$
+T_c =
+\left\lceil
+\frac{N}{B_c}
+\right\rceil
+$$
+
+blocks:
+
+$$
+K_1,\ldots,K_{T_c},
+\qquad
+V_1,\ldots,V_{T_c},
+$$
+
+with
+
+$$
+K_j,V_j\in\mathbb{R}^{B_c\times d}.
+$$
+
+5. Divide $\(O\)$, $\(\ell\)$, and $\(m\)$
+
+Partition \(O\) into blocks:
+
+$$
+O_1,\ldots,O_{T_r},
+\qquad
+O_i\in\mathbb{R}^{B_r\times d}.
+$$
+
+Divide $\(\ell\)$ and $\(m\)$ into corresponding vectors of length $\(B_r\)$.
+
+These vectors contain the current state for the query rows in that block.
+
+6. Begin the outer loop over $\(K,V\)$ blocks.
+
+For
+
+$$
+j=1,\ldots,T_c,
+$$
+
+process one key/value block.
+
+The outer loop moves across the $\(K\)$ and $\(V\)$ blocks.
+
+7. Load $\(K_j,V_j\)$ from HBM into SRAM. Transfer the selected key and value blocks into fast on-chip memory. They can then be reused while processing multiple query blocks. Approximately 50% of SRAM remains available at this moment and is reserved for $\(Q\)$ and $\(O\)$. This is a conceptual allocation:
+
+- One portion holds $\(K,V\)$.
+- Another portion holds $\(Q,O\)$ and related state.
+
+The exact fraction in a real kernel depends on tile shapes, score storage, registers, numerical precision, and occupancy.
+
+8. Begin the inner loop over $\(Q\)$ blocks.  For
+
+$$
+i=1,\ldots,T_r,
+$$
+
+process one query block against the fixed $\(K_j,V_j\)$ block.
+
+The inner loop moves across the $\(Q\)$ blocks.
+
+9. Load the current query block and state.
+
+Load
+
+$$
+Q_i,
+\qquad
+O_i,
+\qquad
+\ell_i,
+\qquad
+m_i
+$$
+
+from HBM into on-chip memory.
+
+- $\(Q_i\)$ and $\(O_i\)$ occupy most of this part of the workspace.
+- $\(\ell_i\)$ and $\(m_i\)$ are small vectors of length $\(B_r\)$.
+- These small statistics can often be stored in registers.
+  
+10. Compute one score tile.
+
+Compute on-chip:
+
+$$
+S_{ij} =
+Q_iK_j^\top.
+$$
+
+The shapes are
+
+$$
+(B_r\times d)(d\times B_c) =
+B_r\times B_c.
+$$
+
+Only this small score tile exists at one time.
+
+The complete $\(N\times N\)$ score matrix is never constructed in HBM.
+
+11. Compute local softmax statistics. For every row in \(S_{ij}\), compute the local maximum:
+
+$$
+\widetilde m_{ij} =
+rowmax(S_{ij})
+\in
+\mathbb{R}^{B_r}.
+$$
+
+Compute local unnormalized probabilities:
+
+$$
+\widetilde P_{ij} =
+\exp
+\left(
+S_{ij} -
+\widetilde m_{ij}
+\right)
+\in
+\mathbb{R}^{B_r\times B_c}.
+$$
+
+The row maximum is broadcast across every element in the corresponding row.
+
+Then calculate the local row sums:
+
+$$
+\widetilde\ell_{ij} =
+rowsum
+\left(
+\widetilde P_{ij}
+\right)
+\in
+\mathbb{R}^{B_r}.
+$$
+
+All of these calculations remain on-chip.
+
+12. Merge the current block with previous blocks. Update the running maximum:
+
+$$
+m_i^{\text{new}} =
+\max
+\left(
+m_i,
+\widetilde m_{ij}
+\right).
+$$
+
+The maximum is calculated elementwise across the \(B_r\) rows.
+
+Update the denominator:
+
+$$
+\ell_i^{\text{new}} =
+e^{m_i-m_i^{\text{new}}}\ell_i
++
+e^{\widetilde m_{ij}-m_i^{\text{new}}}
+\widetilde\ell_{ij}.
+$$
+
+13. Update the output. The pseudocode writes the output update as
+
+$$
+O_i
+\leftarrow
+diag
+\left(
+\ell_i^{\text{new}}
+\right)^{-1}
+\left[
+diag
+\left(
+\ell_i
+\right)
+e^{m_i-m_i^{\text{new}}}O_i
++
+e^{\widetilde m_{ij}-m_i^{\text{new}}}
+\widetilde P_{ij}V_j
+\right].
+$$
+
+A clearer rowwise form is
+
+$$
+O_i
+\leftarrow
+\frac{
+e^{m_i-m_i^{\text{new}}}\ell_iO_i
++
+e^{\widetilde m_{ij}-m_i^{\text{new}}}
+\widetilde P_{ij}V_j
+}{
+\ell_i^{\text{new}}
+}.
+$$
+
+All vector multiplication and division in this expression is rowwise. The old $\(O_i\)$ is already normalized:
+
+$$
+O_i =
+\frac{
+\text{old weighted numerator}
+}{
+\ell_i
+}.
+$$
+
+Therefore,
+
+$$
+\ell_iO_i
+$$
+
+recovers the old unnormalized weighted numerator.
+If the maximum changes from $\(m_i\)$ to $\(m_i^{\text{new}}\)$, the old numerator must be rescaled by
+
+$$
+e^{m_i-m_i^{\text{new}}}.
+$$
+
+The current tile’s weighted numerator is
+
+$$
+\widetilde P_{ij}V_j.
+$$
+
+However, it was calculated relative to $\(\widetilde m_{ij}\)$, so it must be rescaled by
+
+$$
+e^{\widetilde m_{ij}-m_i^{\text{new}}}.
+$$
+
+After adding the two corrected numerators, divide by the new denominator
+
+$$
+\ell_i^{\text{new}}.
+$$
+
+The diagonal-matrix notation does not imply an expensive general matrix operation.
+
+It is simply a mathematical way of expressing rowwise scaling and division.
+
+14. Write the compact state back to HBM. Store
+
+$$
+O_i,
+\qquad
+\ell_i^{\text{new}},
+\qquad
+m_i^{\text{new}}
+$$
+
+back to HBM.
+
+The two softmax-statistics vectors each contain only \(B_r\) elements.
+
+This is tiny compared with a
+
+$$
+B_r\times B_c
+$$
+
+score or probability tile, and vastly smaller than an
+
+$$
+N\times N
+$$
+
+matrix.
+
+15. Finish the loops and return $\(O\)$. Repeat the inner loop for every $\(Q\)$ block.
+
+Repeat the outer loop for every $\(K,V\)$ block.
+
+After every key/value block has been processed, $\(O\)$ contains
+
+$$
+O =
+softmax
+\left(
+QK^\top
+\right)V,
+$$
+
+with scaling, masking, and dropout included as required.
+
+The complete score and probability matrices were never materialized in HBM.
+
+The simplified algorithm omits several ordinary Transformer details. The complete FlashAttention forward kernel can combine:
+
+1. Score calculation $\(QK^\top\)$
+2. The $\(1/\sqrt d\)$ scaling factor
+3. Padding or causal masking
+4. Row-maximum calculation
+5. Exponentiation
+6. Row summation
+7. Dropout
+8. Multiplication by $\(V\)$
+9. Output accumulation
+
+<p align="center">
+<img width="1200" height="500" alt="image" src="https://github.com/user-attachments/assets/9e22a655-bc59-4a08-95a2-fe4051d4aa57" />
+</p>
+
+
+This is more powerful than merely fusing a few elementwise operations. The attention algorithm itself is reorganized so that the large intermediate tensors never need to exist outside the on-chip tile.
+
+For dropout, the original implementation saves the random-number-generator state instead of saving an $\(N\times N\)$ dropout mask. The same dropout mask can then be regenerated during backpropagation.
+
+In a real model, tensors usually have a shape similar to
+
+$$
+[
+\text{batch size},
+\text{number of heads},
+N,
+d
+].
+$$
+
+Each batch-head pair performs an independent attention computation. Extending FlashAttention-1 to batch_size > 1 and num_heads > 1 is conceptually straightforward. FlashAttention-1’s main coarse-grained parallelism is across
+
+batch_size×num_heads
+
+Its original execution design used approximately one CUDA thread block for one attention head, producing
+
+batch_size×num_heads
+
+independent thread blocks. A thread block is scheduled onto one streaming multiprocessor, or SM. The A100 has 108 SMs, so utilization is generally good when the number of independent batch-head work units is comparable to or greater than the available number of SMs. When that product is small, some SMs may remain idle. This limited sequence-dimension parallelism was one of the issues later addressed by FlashAttention-2. An SM may sometimes host multiple resident thread blocks, depending on register use, shared-memory use, and occupancy constraints. The one-block-per-SM explanation is a scheduling-level mental model.
+
+The backward pass requires information derived from S and P. A standard attention implementation therefore tends to retain these N×N intermediate matrices. This is particularly expensive for long sequences.
+
+FlashAttention saves compact information such as:
+
+- $\(Q, K, V\)$
+- The output $\(O\)$
+- Final row maxima $\(m\)$
+- Final row denominators $\(\ell\)$
+- The dropout random-number-generator state, when dropout is enabled
+
+It does not save the complete $\(S\)$ and $\(P\)$ matrices.
+
+During backpropagation, it reloads blocks of $\(Q\)$, $\(K\)$, and $\(V\)$, and recomputes
+
+$$
+S_{ij} = Q_iK_j^\top.
+$$
+
+It then reconstructs the corresponding probability block from the final normalization statistics:
+
+$$
+P_{ij} =
+\frac{
+e^{S_{ij}-m_i}
+}{
+\ell_i
+}.
+$$
+
+Because the final maximum and denominator are already known, the backward pass does not need to repeat the forward pass’s incremental online-softmax merging process. This is why backward can be considered conceptually simpler because there is no softmax-rescaling recurrence. Its implementation is still more complicated because it must calculate several gradients and hold more working values in SRAM.
+
+
+Ignoring dropout for clarity, let $\(dO\)$ be the incoming gradient of the attention output.
+
+A simplified backward calculation includes the following operations.
+
+1. Recompute the scores
+
+$$
+S = QK^\top.
+$$
+
+This is matrix multiplication 1.
+
+2. Calculate the gradient with respect to values
+
+$$
+dV = P^\top dO.
+$$
+
+This is matrix multiplication 2.
+
+3. Calculate the gradient with respect to probabilities
+
+$$
+dP = dOV^\top.
+$$
+
+This is matrix multiplication 3.
+
+4. Calculate the softmax gradient
+
+For each row,
+
+$$
+dS =
+P \odot
+\left(
+dP -
+rowsum
+\left(
+dP \odot P
+\right)
+\right).
+$$
+
+An equivalent efficient form uses the identity
+
+$$
+rowsum
+\left(
+dP \odot P
+\right) =
+rowsum
+\left(
+dO \odot O
+\right).
+$$
+
+This avoids materializing another large temporary matrix.
+
+5. Calculate the gradient with respect to queries
+
+$$
+dQ = dSK.
+$$
+
+This is matrix multiplication 4.
+
+6. Calculate the gradient with respect to keys
+
+$$
+dK = dS^\top Q.
+$$
+
+This is matrix multiplication 5.
+
+Therefore:
+
+- Forward: two major matrix multiplications, \(QK^\top\) and \(PV\)
+- Backward: approximately five matrix multiplications, including score recomputation
+
+The backward kernel must also handle:
+
+- Masks
+- Dropout regeneration
+- Row reductions
+- Gradient accumulation
+- Additional on-chip state
+
+This is why backward is mathematically simpler in one narrow respect but more complicated to implement overall.
+
+Recomputation adds FLOPs. However, modern GPUs are extremely efficient at matrix multiplication. Reading and writing a huge $N \times N$ tensor from HBM can take more time than recomputing a small tile in SRAM.
+
+- 10–20× memory savings, depending on sequence length
+- Attention memory that is linear in \(N\), rather than quadratic in \(N\)
+- 2–4× faster backward propagation** due to reduced memory traffic
+
+Recomputation can therefore improve both memory usage and execution speed.
+
+FlashAttention-2 preserves the central idea of FlashAttention-1—compute exact attention in SRAM-sized tiles without materializing the full N×N attention matrix—but reorganizes the arithmetic and GPU work assignment to make the hardware substantially more efficient.  Its three main improvements are:
+
+- Reduce expensive non-matrix-multiplication FLOPs.
+- Add parallelism along the sequence-length dimension, so a single attention head can use multiple GPU thread blocks.
+- Partition work among warps more efficiently, reducing communication through shared memory.
+
+These changes make FlashAttention-2 roughly twice as fast as FlashAttention-1 in the paper’s benchmarks, reaching about 50–73% of the A100’s theoretical peak throughput, compared with roughly 25–40% for FlashAttention-1.
