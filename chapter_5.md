@@ -3907,3 +3907,444 @@ FlashAttention is an efficient and numerically stable implementation of exact se
 - Lower memory usage. FlashAttention divides the attention matrix into small tiles and processes one tile at a time. It does not store the complete S or P matrix in GPU global memory. Because it avoids quadratic intermediate storage, FlashAttention can process sequences containing thousands or even tens of thousands of tokens much more efficiently.
 - Higher computational efficiency. FlashAttention does not substantially reduce the mathematical amount of dense-attention computation. It still evaluates the relevant query-key pairs, so its arithmetic complexity remains approximately O(L2d). Its speed advantage comes from reducing expensive memory traffic.
 - Better numerical stability. FlashAttention uses the stable softmax identity. This greatly reduces the risk of numerical overflow.
+
+#### 5.2.2.4 PagedAttention
+
+PagedAttention is an attention and memory-management method designed for efficient LLM inference. Its main purpose is to manage the KV cache more flexibly and reduce memory waste when many requests with different prompt lengths and output lengths are being served at the same time. The core idea is very similar to virtual memory in an operating system: A sequence’s KV cache is divided into fixed-size logical blocks, and those logical blocks can be mapped to physically noncontiguous blocks in GPU memory. This allows vLLM to allocate KV-cache memory only when needed, reuse freed blocks, share blocks across related sequences, and support dynamic batching more efficiently.
+
+When a user sends a prompt to an autoregressive LLM, the model generates output tokens one at a time. Suppose the prompt is
+
+$$
+x_1,\ldots,x_n
+$$
+
+and the model generates
+
+$$
+x_{n+1},\ldots,x_{n+T}.
+$$
+
+At every generation step, the prediction of the next token depends on:
+
+- All prompt tokens
+- All previously generated output tokens
+
+For attention, the model needs the key and value vectors of all previous tokens. Recomputing those key and value vectors at every step would be wasteful, so they are cached. This cache is called the KV cache. At each decoding step:
+
+1. The model receives the newest token.
+2. It computes only that token’s new key and value vectors.
+3. It appends them to the KV cache.
+4. It uses all previous cached keys and values to predict the next token.
+
+LLM inference can be divided into two main phases. The prompt phase processes the entire user prompt:
+
+$$
+x_1,\ldots,x_n.
+$$
+
+It computes the probability of the first generated token:
+
+$$
+P(x_{n+1}\mid x_1,\ldots,x_n).
+$$
+
+During this phase, the system must calculate the key and value vectors of every token in the prompt. This phase can be highly parallelized because the full prompt is already known. Matrix multiplication can make good use of GPU parallelism.
+
+After the prompt phase, the model generates one token at a time. Suppose $\(t\)$ output tokens have already been generated. At step $\(t+1\)$, the model receives the newest token and uses:
+
+- The KV cache of the prompt
+- The KV cache of all previously generated output tokens
+
+to predict the next token. Only the newest token’s key and value vectors need to be computed and appended to the cache. Generation continues until:
+
+- A maximum output length is reached, or
+- The model generates the end token `<eos>`
+
+This phase depends on all previously generated content, so it cannot be fully parallelized. Most work proceeds token by token. As a result, autoregressive decoding often becomes a bottleneck, especially when:
+
+- Sequences are long
+- Many requests are active
+- Different requests have very different lengths
+
+LLM requests do not all arrive at the same time, and they do not all have the same length. Two important problems appear. Requests arrive asynchronously. If the server waits until a batch is full before processing it, early requests wait too long. If it does not wait, GPU resources may be underutilized. Batch efficiency may fall. Besides, different requests may have very different: 
+
+- Prompt lengths
+- Expected output lengths
+
+If all requests are padded to the same maximum length, the system wastes:
+
+- Memory
+- Computation
+
+This is particularly serious when one request is much longer than the others.
+
+To reduce these problems, LLM serving systems can use more fine-grained batching methods, such as:
+
+- Cellular batching
+- Iteration-level scheduling
+
+Instead of waiting for an entire request to finish, the batch is updated after each decoding iteration. After one token-generation iteration:
+
+- Completed requests are removed.
+- New requests are added.
+- Active requests continue.
+
+This makes the batch dynamic at token granularity. Benefits include:
+
+- Less padding waste
+- Shorter queueing time
+- More flexible request mixing
+- Better GPU utilization
+
+Specialized GPU kernels can also process sequences of different lengths without excessive padding. However, even with fine-grained batching, the number of simultaneous requests is still constrained by GPU memory, especially by the KV cache.
+
+The size of the KV cache grows rapidly with:
+
+- Number of requests
+- Sequence length
+- Number of layers
+- Hidden size
+- Data precision
+
+Since modern GPUs often have only tens of gigabytes of memory, only a limited number of requests may fit simultaneously if memory is used inefficiently. Also, GPU compute speed has increased faster than GPU memory capacity. For example, moving from A100 to H100 greatly increases FLOPs, while maximum memory may still remain around $\(80\)$ GB. Therefore, memory becomes an increasingly important bottleneck.
+
+Traditional KV-cache allocation can waste a large amount of memory. A request may reserve space for future tokens that are never generated. For example, a request may reserve many slots based on an assumed maximum output length, even though the sequence ends early. If a request is allocated a large contiguous region and uses only part of it, unused space inside that reservation is wasted. Free memory may exist, but it may be split into small noncontiguous regions. A large new request may fail to find one sufficiently large contiguous block even though the total free memory is adequate. There are also additional memory-management difficulties:
+
+1. Large KV cache. KV-cache size grows quickly with request count and sequence length. Poor memory management reduces batch size and overall throughput.
+
+2. Different decoding algorithms have different sharing patterns. Memory-management complexity depends on the decoding algorithm. For example, In parallel sampling, multiple outputs share the same prompt KV cache. In beam search, beams may share not only the prompt but also later intermediate prefixes. The sharing structure may change dynamically during decoding. The memory system must support these patterns efficiently.
+
+Prompt lengths vary widely, and output lengths are not known in advance. As decoding continues, a request’s KV cache keeps growing. It may consume memory that could otherwise be used for:
+
+- New requests
+- Other active prompts
+- Larger batches
+
+The system may need to:
+
+- Evict KV-cache blocks
+- Swap them to CPU memory
+- Recompute them later
+
+The authors introduced **PagedAttention** and built the vLLM serving engine around it. vLLM uses a centralized scheduler to coordinate distributed GPU workers. A KV-cache manager manages physical KV-cache memory on GPU workers according to commands from the centralized scheduler. The system contains ideas such as:
+
+- Scheduler
+- KV-cache manager
+- CPU block allocator
+- GPU block allocator
+- Per-worker cache engine
+- Model shards
+
+The scheduler decides which requests are processed, while the KV-cache manager maintains the mapping between logical KV blocks and physical memory blocks.
+
+PagedAttention is inspired by virtual memory in operating systems.
+
+In an operating system:
+
+- Memory is divided into fixed-size pages.
+- A program sees logical pages.
+- Logical pages are mapped to physical pages.
+- Logically adjacent pages do not need to be physically adjacent.
+
+PagedAttention applies the same idea to the KV cache. A sequence’s KV cache is divided into fixed-size KV blocks. Each block contains the key and value vectors for a fixed number of tokens. Let the block size be $\(B\)$. The $\(j\)-th$ key block is
+
+$$
+K_j =
+\left(
+k_{(j-1)B+1},
+\ldots,
+k_{jB}
+\right),
+$$
+
+and the corresponding value block is
+
+$$
+V_j =
+\left(
+v_{(j-1)B+1},
+\ldots,
+v_{jB}
+\right).
+$$
+
+The logical KV blocks of one sequence can be stored in physically noncontiguous locations. That is the key difference from ordinary contiguous KV-cache allocation. 
+
+PagedAttention rewrites attention in block form. For query $\(q_i\)$, the attention score vector for KV block $\(j\)$ is
+
+$$
+A_{ij} =
+\frac{
+\exp
+\left(
+q_i^\top K_j/\sqrt d
+\right)
+}{
+\sum_{t=1}^{\lceil i/B\rceil}
+\exp
+\left(
+q_i^\top K_t/\sqrt d
+\right)
+}.
+$$
+
+The output is
+
+$$
+o_i =
+\sum_{j=1}^{\lceil i/B\rceil}
+V_jA_{ij}^{\top}.
+$$
+
+Here:
+
+- $\(A_{ij}\)$ is the attention-score row vector for block $\(j\)$.
+- It contains the attention weights for all token positions inside that block.
+- The kernel identifies and retrieves the necessary physical KV blocks during attention.
+
+The blocks do not need to be physically contiguous. The KV-cache manager separates:
+
+- Logical KV blocks
+- Physical KV blocks
+
+A request sees its KV cache as a sequence of logical blocks. As tokens are generated, the logical blocks are filled from left to right. Only the unused positions in the final logical block are reserved for future tokens. On the GPU worker:
+
+- The block engine reserves a large physical GPU-memory region.
+- That region is divided into fixed-size physical KV blocks.
+- A block table records how logical blocks map to physical blocks.
+
+Each block-table entry records:
+
+- Which physical block corresponds to a logical block
+- How many token positions in the logical block are currently filled
+
+Because logical and physical blocks are separated, the KV cache can grow without reserving memory for every future token in advance. This eliminates most of the waste caused by large contiguous reservations. Suppose two requests, A and B, have different logical sequences. Their logical KV blocks may be mapped to physical blocks such as:
+
+- Request A logical block 0 → physical block 7
+- Request A logical block 1 → physical block 1
+- Request A logical block 2 → physical block 3
+- Request B logical block 0 → physical block 5
+- Request B logical block 1 → physical block 2
+
+Adjacent logical blocks do not need to be adjacent in GPU memory. This means:
+
+- Free physical blocks can be used immediately.
+- The system does not need one large contiguous region per request.
+- Blocks released by completed requests can be reused by others.
+- External fragmentation is greatly reduced.
+
+One sentence from the slides summarizes it: PagedAttention allows KV blocks to be stored in physically noncontiguous memory, enabling flexible paged memory management in vLLM.
+
+At each decoding iteration, vLLM performs several steps.
+
+1. Select candidate sequences. vLLM chooses a group of active sequences for the next batch. It allocates physical blocks for any new logical blocks they require.
+
+2. Build the model input. vLLM concatenates the input tokens for all requests in the current iteration. These include:
+
+- All prompt tokens during the prompt phase
+- The most recent token during the generation phase
+
+The combined tokens are sent to the LLM.
+
+3. Read old KV cache and write new KV cache. During model execution:
+
+- The block table is used to locate previous KV-cache blocks.
+- Newly generated key and value vectors are written to physical KV blocks.
+
+Because one KV block contains several token positions, the PagedAttention kernel can process multiple positions inside a block in parallel. This improves hardware utilization and reduces latency. However, very large blocks may increase internal fragmentation.
+
+vLLM allocates a new physical block only when needed. Blocks are filled from left to right. A new block is allocated only after all previous blocks are full. Therefore, for each request, unused memory is limited to at most one partially filled block.
+
+This gives two major benefits:
+
+- Efficient use of nearly all available memory
+- More simultaneous requests in a batch
+
+When a request finishes, all of its physical blocks are released and can be reused.
+
+The block size creates a trade-off. For larger blocks, Advantages are:
+
+- More token positions can be processed together
+- Better parallel processing inside the attention kernel
+- Potentially better hardware utilization
+- Lower metadata overhead
+
+Disadvantages are:
+
+- More internal fragmentation in the final block
+- More wasted space if a sequence ends early
+
+For smaller blocks, advantages are:
+
+- Less internal fragmentation
+- Finer-grained allocation
+
+Disadvantages are:
+
+- More block-table entries
+- More metadata
+- Potentially lower kernel efficiency
+
+PagedAttention must balance these competing effects. In parallel sampling, one input prompt generates several output sequences. All output sequences share the same prompt. Therefore, their prompt KV cache is identical and can be shared. The prompt portion may account for roughly $\(12\%\)$ of the entire KV-cache memory in an example. Sharing it reduces memory use. PagedAttention supports sharing because multiple logical blocks can map to the same physical block. Each physical block has a reference count. 
+
+Once two sequences diverge, they may need to write different tokens into a block that was previously shared. vLLM uses **copy-on-write** at block granularity. Suppose samples A1 and A2 share a physical block.
+
+If A1 needs to modify the last logical block:
+
+1. vLLM checks the block’s reference count.
+2. If the reference count is greater than 1, the block is shared.
+3. vLLM allocates a new physical block.
+4. It copies the old block’s content into the new block.
+5. A1 is remapped to the new block.
+6. The original block’s reference count decreases.
+7. A2 continues using the original block.
+
+This resembles process forking in an operating system. The advantage is that shared prompt blocks remain shared, while only the block being modified must be copied. For long prompts, this can significantly reduce memory overhead.
+
+Beam search keeps the top $\(k\)$ most promising candidate sequences at every decoding step. Unlike simple parallel sampling, beam candidates may share:
+
+- The original prompt
+- Several later blocks
+- Different parts of their decoding histories
+
+The sharing structure changes dynamically over time, like a tree of process forks. After ranking the next beam candidates:
+
+- Some previous candidates are no longer selected.
+- Their logical blocks are released.
+- Physical blocks whose reference counts drop to zero are freed.
+- New physical blocks are allocated for the surviving new candidates.
+
+Traditional systems might frequently copy large parts of the KV cache between beam candidates. vLLM reduces this copying through physical block sharing and copy-on-write. Most blocks remain shared. Only the newly modified shared block is copied.
+
+Many users may submit prompts that share a common prefix, such as:
+
+- System instructions
+- Task description
+- Few-shot examples
+- Standard input/output demonstrations
+
+The full request prompt may consist of:
+
+$$
+\text{shared prefix}
++
+\text{user-specific prompt}.
+$$
+
+The service can precompute and store the KV cache of the shared prefix. When a new request includes that prefix:
+
+- Its logical blocks are mapped to the already cached physical blocks.
+- Only the user-specific part needs prompt-phase computation.
+- The last block can be marked copy-on-write if it may be modified.
+
+This is similar to sharing a library across operating-system processes. It reduces repeated prompt computation and lowers memory use.
+
+Different requests may use different decoding methods at the same time. Examples include:
+
+- Greedy decoding
+- Parallel sampling
+- Beam search
+- Shared-prefix workloads
+
+These methods have different KV-cache sharing patterns. vLLM hides this complexity behind a common logical-to-physical block mapping layer. The model and attention kernel only need to know:
+
+- The physical block IDs belonging to each sequence
+
+They do not need to directly manage the sharing relationships among sequences. This allows more requests with different decoding strategies to be batched together, increasing overall throughput. When request volume exceeds system capacity, vLLM must choose which requests to process. The **first-come-first-served**, or FCFS, policy, is used to:
+
+- Preserve fairness
+- Prevent starvation
+
+When preemption is necessary:
+
+- Earlier requests receive higher priority.
+- More recently arrived requests are preempted first.
+
+This is particularly important because:
+
+- Prompt lengths vary greatly.
+- Output lengths are unknown in advance.
+- Active KV caches keep growing.
+- GPU memory can eventually run out of free physical blocks.
+
+Instead of evicting individual blocks from a sequence, vLLM either:
+
+- Evicts all blocks belonging to a sequence, or
+- Keeps all of them
+
+The reason is that all blocks of a sequence are typically accessed together. For decoding algorithms with several related sequences, such as beam search:
+
+- The whole sequence group is scheduled together.
+- The whole group is preempted or resumed together.
+
+This is useful because members of the group may share physical blocks.
+
+To restore preempted sequences, there are two strategies.
+
+1. Swapping. This is similar to operating-system swapping. When vLLM needs free GPU blocks:
+
+1. It selects some sequences for preemption.
+2. Their KV-cache blocks are copied from GPU memory to CPU RAM.
+3. GPU blocks are freed for active requests.
+4. Later, the blocks can be copied back to GPU memory.
+5. The preempted sequences resume.
+
+vLLM includes:
+
+- A GPU block allocator
+- A CPU block allocator
+
+The CPU allocator manages physical blocks stored in CPU RAM. Once some requests have been preempted, vLLM may temporarily stop accepting new requests until the preempted sequences finish. When an active request finishes:
+
+- Its GPU blocks are released.
+- Swapped sequences can be restored.
+
+The number of CPU-swapped blocks never exceeds the total physical KV blocks that can be allocated in GPU memory, so the CPU swap requirement remains bounded relative to the GPU KV-cache capacity.
+
+2. Recomputation. Instead of swapping KV-cache blocks to CPU memory, the system can discard them and recompute them later. When a preempted sequence is rescheduled:
+
+- Its generated tokens are concatenated with the original user prompt.
+- The combined sequence is treated as a new prompt.
+- The entire KV cache is regenerated during a prompt phase.
+
+Recomputation latency may be significantly lower than the original generation latency because:
+
+- Prompt processing is parallel.
+- Autoregressive generation is sequential.
+
+Therefore, regenerating the KV cache in one prompt pass may be cheaper than generating the same tokens one by one again.
+
+Many LLMs are too large to fit on one GPU. They must be distributed across several GPUs using model parallelism. There is a Megatron-LM-style tensor-parallel strategy. The system follows an SPMD model:
+
+$$
+\text{SPMD} =
+\text{Single Program Multiple Data}.
+$$
+
+In this approach:
+
+- Linear layers are split across GPUs.
+- Matrix multiplication is partitioned.
+- GPUs use all-reduce operations to synchronize intermediate results.
+- Attention heads are divided across SPMD processes.
+- Each process handles a subset of attention heads.
+
+Even under model parallelism, every model shard processes the same set of input tokens. Therefore, each shard must have the corresponding KV cache for its assigned attention heads. vLLM maintains one copy of the logical KV-cache manager in the centralized scheduler. Different GPU workers share:
+
+- The same logical-to-physical block mapping
+- The same physical block IDs
+
+However, each worker stores only the KV-cache data for the attention heads handled by that model shard. The shared mapping allows all workers to interpret the same request in the same way.
+
+The distributed execution flow is as below:
+
+1. Scheduler prepares control information. For each request in the batch, the scheduler prepares:
+
+- Input token IDs
+- The request’s block table
+
+2. Broadcast to GPU workers. The scheduler broadcasts this control information to all GPU workers. Each worker begins model execution using the same input token IDs. At the attention layer, each GPU worker reads KV cache according to the supplied block table. During model execution, workers synchronize intermediate results using all-reduce. The scheduler does not need to coordinate the workers during this phase.
+
+3. Return sampled token. At the end of the decoding step, the GPU workers return the sampled token to the scheduler. Workers do not need to synchronize KV-cache memory-management decisions among themselves. They receive all memory-management information at the beginning of each iteration.
+
+#### 5.2.2.5 SGLang
