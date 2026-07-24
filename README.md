@@ -249,8 +249,8 @@
 * **5.2.2 System Optimization**
     * **5.2.2.1 Iteration-Level Batching**
     * **5.2.2.2 Chunked Prefill**
-    * **5.2.2.3 PagedAttention**
-    * **5.2.2.4 FlashAttention**
+    * **5.2.2.3 FlashAttention**
+    * **5.2.2.4 PagedAttention**
     * **5.2.2.5 SGLang**
 * **5.2.3 Optimization Frameworks**
     * **5.2.3.1 DeepSpeed**
