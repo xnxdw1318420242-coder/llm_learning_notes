@@ -4348,3 +4348,111 @@ The distributed execution flow is as below:
 3. Return sampled token. At the end of the decoding step, the GPU workers return the sampled token to the scheduler. Workers do not need to synchronize KV-cache memory-management decisions among themselves. They receive all memory-management information at the beginning of each iteration.
 
 #### 5.2.2.5 SGLang
+
+SGLang is a programming and runtime system for building complex LLM workflows.
+
+It is designed for tasks that go beyond a single prompt followed by a single model response. These tasks may involve:
+
+- Multiple model calls
+- Control flow
+- Parallel branches
+- Structured inputs and outputs
+- Images or videos
+- Repeated prompt prefixes
+- Multiple rounds of reasoning
+- External API models
+- Different models working together
+
+Examples include:
+
+- Few-shot learning
+- Self-consistency
+- Chain-of-thought and tree-of-thought workflows
+- Multi-turn chat
+- Structured JSON generation
+- Multi-model pipelines
+- Agent-style planning and interaction
+
+Treat an LLM workflow as a program, then optimize both how that program is expressed and how it is executed. These programs are called LM programs. A simple chatbot may make one model call:
+
+- Send a prompt.
+- Receive an answer.
+
+More advanced applications are different. They may need to:
+
+1. Call an LLM several times.
+2. Insert those calls into conditional logic.
+3. Branch into several parallel generations.
+4. Merge the results.
+5. constrain the final output to JSON or another schema.
+6. Reuse common prompt prefixes and KV cache.
+7. Interact with external tools or environments.
+
+LM programs generally have two common properties:
+- They contain multiple LLM calls embedded in a control flow.
+- They accept structured inputs and produce structured outputs.
+
+Modern LLM inference is more than inference for one isolated model. It often involves combinations of models running within a particular task workflow. This creates two major problems:
+
+- Users must write complicated prompts and orchestration logic.
+- Repeated model calls often recompute the same KV cache, wasting memory and computation.
+
+SGLang addresses both problems:
+
+- It provides programming primitives for expressing workflows.
+- It provides a runtime that automatically optimizes their execution.
+
+SGLang consists of two main parts:
+
+1. SGLang Client, the frontend
+2. SGLang Runtime, the backend
+
+Between them is an interpreter. A simplified flow is:
+
+SGLang program
+    ↓
+Interpreter
+    ↓
+API server
+    ↓
+SGLang Runtime
+    ↓
+Tokenizer → request queue → scheduler → GPU workers
+    ↓
+Detokenizer → result
+
+The frontend focuses mainly on:
+
+- Expressing LM programs
+- Prompt construction
+- Control flow
+- Parallelism
+- Structured output
+- Multimodal input
+
+The backend focuses mainly on:
+
+- Efficient inference
+- Scheduling
+- KV-cache reuse
+- Faster structured decoding
+- Optimizing repeated API calls
+
+SGLang provides a domain-specific language, or DSL, embedded in Python. It includes primitives for:
+
+- Parallel execution
+- Control flow
+- Nested model calls
+- External calls
+- Structured generation
+- Image and video inputs
+
+Its goal is to make LM programs easier to write while allowing the interpreter, compiler, and runtime to optimize them. The frontend manages the scheduling and control structure of the LM program. The simplest way to run an SGLang program is through its interpreter. The prompt is treated as an asynchronous stream. This allows Python code to continue running without waiting for every generation to finish immediately. Each prompt has a background stream executor that manages execution. The program blocks only when it actually needs a generated result. This is similar to launching an asynchronous CUDA kernel:
+
+- Work is submitted.
+- Independent code can continue.
+- Synchronization occurs only when the result is required.
+
+SGLang programs can also be compiled into computation graphs and executed through a graph executor for further optimization and reduction of redundant work. 
+
+### 5.2.3 Optimization Frameworks
