@@ -4456,3 +4456,163 @@ Its goal is to make LM programs easier to write while allowing the interpreter, 
 SGLang programs can also be compiled into computation graphs and executed through a graph executor for further optimization and reduction of redundant work. 
 
 ### 5.2.3 Optimization Frameworks
+
+#### 5.2.3.1 DeepSpeed
+
+DeepSpeed is an open-source deep learning optimization system developed by Microsoft. It is designed for Large-model training, Distributed training, Inference, and Model compression. Its most important training optimization is ZeRO, short for Zero Redundancy Optimizer. The central problem DeepSpeed addresses is: In distributed training, memory efficiency and communication overhead often conflict with each other. Ordinary data parallelism is computationally efficient, but it duplicates a large amount of model state on every GPU. ZeRO changes this by progressively partitioning those states across devices.
+
+There are two common ways to distribute neural-network training across multiple GPUs. In data parallelism, every GPU stores a complete copy of the model. Data parallelism usually has high computational efficiency because every GPU can work on a different subset of the data at the same time. However, every GPU stores the entire model, gradients, and optimizer states. This creates a large amount of memory redundancy. In model parallelism, the model itself is divided across multiple GPUs. This is necessary when the entire model cannot fit into one GPU.
+
+The key challenge in data parallelism is ensuring that all model replicas remain identical. For every process to end with identical parameters, two things must be true:
+
+- Every process begins with the same initial parameters W0.
+- Every process uses the same gradient ΔW at each update.
+
+Two common approaches are used in synchronizing initial paramters. The first one is that every process uses the same random seed and initializes parameters in the same order. The second one is that, one process initializes the model, then broadcasts the parameters to all other processes. Each process independently runs the forward pass on its local micro-batch. Because the input data differs, each process obtains a different local loss. Each process independently computes gradients from its own local loss. Therefore, different processes initially produce different local gradients. Before updating the model, these gradients must be synchronized. Gradient synchronization is commonly implemented with an AllReduce sum. All local gradients are added together across processes. The result is then divided by the number of data-parallel processes to obtain the average gradient. After synchronization, every process has the same global gradient. Each process can then update its local model independently. The main difference from single-GPU training is therefore: In data parallelism, gradients must be synchronized across all processes before the parameter update.
+
+Modern language-model training commonly uses Mixed-precision training and the Adam optimizer. Mixed-precision training stores and computes some values in FP16 while keeping more numerically sensitive values in FP32. 
+
+DeepSpeed separates GPU memory into two broad categories: Model states and Residual states. Model states include:
+
+- Model parameters
+- Gradients
+- Optimizer states
+
+For mixed-precision Adam training, the major model states are as follows. 
+
+1. FP16 model parameters. Each parameter is stored in FP16. Each value requires 2 bytes. For Φ parameters, the memory requirement is 2Φ bytes.
+
+2. FP16 gradients. The number of gradient values equals the number of parameters. Each gradient also uses 2 bytes. The memory requirement is 2Φ bytes.
+
+3. Adam optimizer states. Adam maintains several FP32 values for every parameter. Adam often maintains an FP32 copy of each model parameter for more accurate updates. Memory cost is 4Φ bytes. Adam stores a first-moment estimate, or momentum, for every parameter. For this part, memory cost is 4Φ bytes. Adam also stores a second-moment estimate, or variance, for every parameter. This part is also 4Φ bytes. Therefore, Adam optimizer states require 12Φ bytes.
+
+The complete model-state memory is 16Φ bytes. The Adam-related FP32 states account for 75%. Therefore, in mixed-precision Adam training, optimizer states consume approximately 75% of model-state memory. This is why optimizer-state partitioning is the first and most valuable ZeRO step.
+
+In addition to model states, training consumes memory for:
+
+- Activations
+- Temporary buffers
+- Memory fragmentation
+- Other intermediate tensors
+
+ZeRO mainly targets redundancy in the model states. Activation-memory optimization is a separate concern, although DeepSpeed has other mechanisms for it. In ordinary distributed data parallelism, every GPU stores a complete copy of:
+
+- Model parameters
+- Gradients
+- Optimizer states
+
+This is highly redundant. ZeRO partitions these states across GPUs so that the distributed system collectively maintains one complete copy, rather than every GPU independently maintaining a full copy. If there are N GPUs, each GPU ideally stores only 1/N of a partitioned state. ZeRO has four conceptual stages:
+
+- Stage 0: ordinary DDP with no ZeRO memory optimization
+
+- Stage 1: partition optimizer states
+
+- Stage 2: partition optimizer states and gradients
+
+- Stage 3: partition optimizer states, gradients, and model parameters
+
+If no stage is specified in deepspeed_config, DeepSpeed defaults to Stage 0. Stage 0 is standard distributed data parallelism. Each GPU stores complete copies of parameters, gradients, and optimizer states. The memory requirement per GPU is 16Φ bytes. There is no ZeRO partitioning.
+
+Stage 1 partitions the optimizer states across all devices. Each GPU stores only 1/N of of the optimizer states. However, every GPU still stores a complete copy of FP16 parameters and FP16 gradients. The memory per GPU becomes 2Φ+2Φ+12Φ​/N. As N becomes large, this approaches 4Φ. That is about one quarter of the original 16Φ. Each GPU is responsible for updating only the parameter partition associated with its optimizer-state shard. After local updates, the updated parameter pieces are gathered so that all GPUs again have a complete parameter copy. Stage 1 has approximately the same communication volume as ordinary data parallelism.
+
+Stage 2 additionally partitions gradients. Now each GPU stores:
+
+- A complete copy of parameters
+- Only 1/N of gradients
+- Only 1/N of optimizer states
+
+The memory per GPU becomes 2Φ+ (2Φ+12Φ​) / N. As N grows, this approaches 2Φ. That is about one eighth of the original 16Φ. Instead of every GPU keeping the full synchronized gradient, each GPU ultimately retains only the gradient partition for which it is responsible. The global synchronization can be implemented using ReduceScatter. ReduceScatter reduces gradient contributions across all GPUs, and distributes different pieces of the reduced result to different GPUs. Therefore, each GPU receives only its assigned averaged-gradient partition. Stage 2 has approximately the same communication volume as ordinary data parallelism.
+
+Stage 3 further partitions the model parameters. Each GPU stores only:
+
+- 1/N of parameters
+- 1/N of gradients
+- 1/N of optimizer states
+
+The model-state memory per GPU becomes 16Φ​ / N. As N becomes large, per-GPU model-state memory approaches zero relative to the unpartitioned model. This enables the training of extremely large models even when no single GPU can store the full model state.
+
+Although parameters are partitioned at rest, a layer needs its full parameters when that layer is computed. Therefore, the required parameter shards must be communicated before forward and backward computation. This introduces extra communication, commonly through operations such as Broadcast and AllGather. After the layer no longer needs the gathered parameters, the temporary full copy can be released. Stage 3 increases communication volume to approximately 1.5× the data-parallel baseline. The extra communication occurs because model parameters are also partitioned and must be reconstructed when needed.
+
+| Stage   |  Parameters |   Gradients | Optimizer states | Approximate per-GPU model-state memory |
+| ------- | ----------: | ----------: | ---------------: | -------------------------------------: |
+| Stage 0 |  Replicated |  Replicated |       Replicated |                               $(16\Phi)$ |
+| Stage 1 |  Replicated |  Replicated |      Partitioned |               $(4\Phi+\frac{12\Phi}{N})$ |
+| Stage 2 |  Replicated | Partitioned |      Partitioned |               $(2\Phi+\frac{14\Phi}{N})$ |
+| Stage 3 | Partitioned | Partitioned |      Partitioned |                     $(\frac{16\Phi}{N})$ |
+
+The progression is:
+
+- Remove redundant optimizer states.
+- Remove redundant gradients.
+- Remove redundant parameters.
+
+When to use each ZeRO stage:
+
+1. ZeRO-1. Appropriate when:
+
+- The model fits on one GPU.
+- Optimizer states cause out-of-memory errors.
+- Maximum training speed is important.
+- Communication overhead should remain similar to baseline data parallelism.
+
+2. ZeRO-2. Appropriate for:
+
+- Large models, including models below roughly 70B parameters 
+- Situations requiring a balance between memory reduction and training speed
+
+If ZeRO-2 memory consumption exceeds approximately 75% of GPU capacity, upgrade to ZeRO-3.
+  
+3. ZeRO-3. ZeRO-3 can be combined with offload and DeepSpeed Infinity to extend training to even larger scales. It is appropriate for:
+
+- Models with hundreds of billions or trillions of parameters
+- Cases in which parameters themselves cannot fit on one GPU
+- GPT-4-scale model training scenarios
+
+DeepSpeed can move some training states from GPU memory to CPU memory. The configuration can include offload_optimizer and offload_param. This reduces GPU-memory usage and makes larger models trainable. However, there are more communication between CPU and GPU, increased data-transfer latency, and potentially slower the training.
+
+Distributed training relies on collective communication primitives. There are five important operations.
+
+1. Reduce. Reduce aggregates data from multiple processes onto one destination process. For example, it may sum the values from all GPUs and place the result on one root GPU. The data flow is from many devices to one device. Typical use is to combine gradients or statistics onto one processor.
+
+2. Broadcast. Broadcast sends data from one source process to every process. Data flow is from one device to all devices. Typical use is to broadcast initialized model parameters from one root process.
+
+3. AllGather. AllGather collects each process’s local data and sends the complete combined result to every process. Afterward, every GPU has the same concatenated result. Data flow is that every device communicates with every device, so that every device receives the complete data. Typical uses include reconstructing complete model parameters from shards or distributing parameter partitions.
+
+4. AllReduce. AllReduce combines data across all processes and distributes the aggregated result to all processes. For gradients, it typically reduces local gradients by summing them, and broadcasts the result to all GPUs. After division by the number of processes, every GPU has the same average gradient. Typical use is gradient synchronization in ordinary data parallelism. A common Ring AllReduce can be implemented as ReduceScatter and AllGather.
+
+5. ReduceScatter. ReduceScatter combines values across all processes and distributes a different partition of the reduced result to each process. Each GPU receives only one shard of the globally reduced data. The data flow is every device sends and receives data, and each device ends with a different partition. Typical uses include grdient partitioning in ZeRO Stage 2 and synchronizing only the gradient shard owned by each GPU.
+
+In ordinary data parallelism, every GPU computes a complete gradient tensor. AllReduce is used to obtain the global average gradient. The communication volume per GPU is 2Φ bytes for the gradient synchronization process, assuming FP16 gradients. In Stage 2, every GPU keeps only 1/N of the gradients and optimizer states. For a given GPU, the required gradient partition must be reduced across all N GPUs. For one partition, the total reduction communication is Φ. The system uses a bucket strategy so that gradient communication can overlap with backward computation. Gradients are communicated as soon as suitable buckets are ready instead of waiting for the entire backward pass to finish. Once a GPU has the averaged gradient for its partition, it updates its local optimizer states. At the end, the updated parameter partitions are gathered. Globally, this corresponds to ReduceScatter for gradients and AllGather for updated parameters.  The total communication is approximately the same as ordinary data parallelism. Suppose the final two layers’ gradients belong to GPU 0. Other GPUs do not need to permanently keep these gradients. They can:
+
+1. Compute a gradient bucket.
+2. Send the bucket while continuing to backpropagate through earlier layers.
+3. Delete the local gradients after the communication and dependent computation are complete.
+
+This overlaps communication with computation and reduces the peak gradient-memory requirement.
+
+In Stage 3, each GPU stores only 1/N of the model parameters. Therefore, before computing a layer, the full layer parameters must be made available. This requires extra communication during forward propagation and backward propagation. This involves Broadcast operations, although equivalent implementations may use collective gathering of parameter shards. Because parameter communication happens in both forward and backward passes, Stage 3 increases total communication compared with Stage 1 and Stage 2.
+
+Traditional thinking says:
+
+- Data parallelism is computationally efficient but duplicates memory.
+- Model parallelism saves memory but adds communication.
+
+ZeRO introduces another option:
+
+- Keep the data-parallel execution model.
+- Partition model states to remove redundancy.
+- Communicate only the required state shards at the appropriate time.
+
+This allows DeepSpeed to preserve much of the efficiency of data parallelism while greatly reducing memory usage.
+
+Here we also introduce DeepSpeed-MII as a system for low-latency inference and high-throughput inference. 
+
+- Prompt caching. The model can be run once for a fixed prompt, and the resulting model state can be cached. Future requests using the same static prompt can reuse the cached state.
+
+- Dynamic memory utilization. DeepSpeed-MII includes cache allocators on both CPU and GPU. Memory utilization can change dynamically according to request size while still meeting performance requirements.
+
+#### 5.2.3.2 vLLM
+
+
+
+
