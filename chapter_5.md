@@ -1780,3 +1780,1180 @@ FlashAttention-2 preserves the central idea of FlashAttention-1—compute exact 
 - Partition work among warps more efficiently, reducing communication through shared memory.
 
 These changes make FlashAttention-2 roughly twice as fast as FlashAttention-1 in the paper’s benchmarks, reaching about 50–73% of the A100’s theoretical peak throughput, compared with roughly 25–40% for FlashAttention-1.
+
+Modern GPUs contain specialized units, such as Tensor Cores, designed to execute matrix multiplications extremely quickly. FlashAttention-1 already reduced HBM traffic, but it still reached only about 25–40% of the theoretical device throughput. Profiling showed that the remaining inefficiency came largely from suboptimal work division among thread blocks and warps, together with unnecessary non-matmul operations and shared-memory traffic.
+
+FlashAttention-2 still computes exact dense attention:
+
+$$
+O =
+softmax
+\left(
+\frac{QK^\top}{\sqrt d}
++
+\text{mask}
+\right)V.
+$$
+
+It does not use a sparse, low-rank, linear-attention, or other approximate replacement. It still:
+
+- Divides $\(Q\)$, $\(K\)$, and $\(V\)$ into tiles.
+- Loads tiles from HBM into fast on-chip SRAM.
+- Computes one small score tile at a time.
+- Uses online softmax to combine successive key blocks.
+- Avoids storing the full score matrix $\(S\)$.
+- Avoids storing the full probability matrix $\(P\)$.
+- Recomputes attention probabilities during backpropagation.
+- Uses $\(O(N)\)$ additional memory rather than storing $\(O(N^2)\)$ intermediates.
+
+Its arithmetic complexity remains
+
+$$
+O(N^2d).
+$$
+
+The improvement is not a reduction in the number of query-key pairs. It is a more efficient mapping of the same mathematical work onto GPU hardware.
+
+The first major change is a modification to the online-softmax update. Suppose attention is processed in key/value blocks. After processing the first block, FlashAttention-1 has a normalized partial output \(O^{(1)}\). When it processes the second block, the running softmax maximum and denominator may change. Conceptually, the normalized update has the form
+
+$$
+O^{(2)} =
+diag
+\left(
+\frac{\ell^{(1)}}{\ell^{(2)}}
+\right)
+e^{m^{(1)}-m^{(2)}}O^{(1)}
++
+diag
+\left(
+\ell^{(2)}
+\right)^{-1}
+e^{S^{(2)}-m^{(2)}}V^{(2)}.
+$$
+
+Both terms are scaled by the new denominator $\(\ell^{(2)}\)$. This means FlashAttention-1 performs repeated:
+
+- Divisions
+- Rowwise scaling
+- Exponentiation-based corrections
+- Normalization of the partial output
+
+These are non-matmul operations. FlashAttention-2 instead maintains an unnormalized accumulated numerator. Let
+
+$$
+\widetilde O^{(j)}
+$$
+
+denote the unnormalized output after processing key/value blocks $\(1,\ldots,j\)$. For the second block, it updates
+
+$$
+\widetilde O^{(2)} =
+e^{m^{(1)}-m^{(2)}}
+\widetilde O^{(1)}
++
+e^{S^{(2)}-m^{(2)}}V^{(2)}.
+$$
+
+Only after all key/value blocks have been processed does it normalize:
+
+$$
+O =
+diag
+\left(
+\ell^{(\text{last})}
+\right)^{-1}
+\widetilde O^{(\text{last})}.
+$$
+
+In plain language: Do not repeatedly divide the partial output by the current softmax denominator. Keep the numerator unnormalized, and divide only once at the end.
+
+This removes many repeated non-matmul FLOPs while preserving the exact same result. Suppose there are two score blocks:
+
+$$
+S^{(1)}
+\quad\text{and}\quad
+S^{(2)}.
+$$
+
+For the first block, compute the row maximum:
+
+$$
+m^{(1)} =
+rowmax
+\left(
+S^{(1)}
+\right)
+\in
+\mathbb{R}^{B_r}.
+$$
+
+Compute the rowwise exponential sum:
+
+$$
+\ell^{(1)} =
+rowsum
+\left(
+e^{S^{(1)}-m^{(1)}}
+\right)
+\in
+\mathbb{R}^{B_r}.
+$$
+
+Compute the first unnormalized weighted value sum:
+
+$$
+\widetilde O^{(1)} =
+e^{S^{(1)}-m^{(1)}}V^{(1)}
+\in
+\mathbb{R}^{B_r\times d}.
+$$
+
+Now process the second score block. The new global maximum is
+
+$$
+m^{(2)} =
+\max
+\left(
+m^{(1)},
+rowmax
+\left(
+S^{(2)}
+\right)
+\right).
+$$
+
+If there are only two blocks, this final maximum can also be denoted by
+
+$$
+m=m^{(2)}.
+$$
+
+The updated denominator is
+
+$$
+\ell^{(2)} =
+e^{m^{(1)}-m^{(2)}}\ell^{(1)}
++
+rowsum
+\left(
+e^{S^{(2)}-m^{(2)}}
+\right).
+$$
+
+Equivalently,
+
+$$
+\ell^{(2)} =
+rowsum
+\left(
+e^{S^{(1)}-m}
+\right)
++
+rowsum
+\left(
+e^{S^{(2)}-m}
+\right).
+$$
+
+The updated unnormalized output is
+
+$$
+\widetilde O^{(2)} =
+e^{m^{(1)}-m^{(2)}}
+\widetilde O^{(1)}
++
+e^{S^{(2)}-m^{(2)}}V^{(2)}.
+$$
+
+Because
+
+$$
+\widetilde O^{(1)} =
+e^{S^{(1)}-m^{(1)}}V^{(1)},
+$$
+
+the first term becomes
+
+$$
+e^{m^{(1)}-m}
+\widetilde O^{(1)} =
+e^{S^{(1)}-m}V^{(1)}.
+$$
+
+Therefore,
+
+$$
+\widetilde O^{(2)} =
+e^{S^{(1)}-m}V^{(1)}
++
+e^{S^{(2)}-m}V^{(2)}.
+$$
+
+Finally,
+
+$$
+O^{(2)} =
+diag
+\left(
+\ell^{(2)}
+\right)^{-1}
+\widetilde O^{(2)}.
+$$
+
+This is exactly the same result as applying softmax to the concatenated score blocks and multiplying by the corresponding values.
+
+FlashAttention-1 typically retained two rowwise statistics for backward:
+- The final maximum $\(m\)$
+- The final shifted exponential sum $\(\ell\)$
+
+FlashAttention-2 combines them into the rowwise log-sum-exp value:
+
+$$
+L =
+m+\log(\ell).
+$$
+
+For one row,
+
+$$
+L_i =
+\log
+\left(
+\sum_j e^{S_{ij}}
+\right).
+$$
+
+To see why, recall that
+
+$$
+\ell_i =
+\sum_j e^{S_{ij}-m_i}.
+$$
+
+Then
+
+$$
+m_i+\log(\ell_i) =
+m_i
++
+\log
+\left(
+\sum_j e^{S_{ij}-m_i}
+\right).
+$$
+
+Pulling \(e^{-m_i}\) out of the sum gives
+
+$$
+m_i+\log(\ell_i) =
+\log
+\left(
+\sum_j e^{S_{ij}}
+\right).
+$$
+
+This single vector is sufficient to reconstruct probabilities during backpropagation:
+
+$$
+P_{ij} =
+e^{S_{ij}-L_i}.
+$$
+
+Thus FlashAttention-2 stores
+
+$$
+L\in\mathbb{R}^{N}
+$$
+
+instead of separately storing both
+
+$$
+m\in\mathbb{R}^{N}
+\quad\text{and}\quad
+\ell\in\mathbb{R}^{N}.
+$$
+
+This reduces persistent state and simplifies the backward formula.
+
+Let
+
+$$
+Q,K,V\in\mathbb{R}^{N\times d}.
+$$
+
+Let:
+
+- $\(B_r\)$: number of query rows in a query tile
+- $\(B_c\)$: number of key/value rows in a key/value tile
+- $\(T_r=\lceil N/B_r\rceil\)$: number of query tiles
+- $\(T_c=\lceil N/B_c\rceil\)$: number of key/value tiles
+
+The complete FlashAttention-2 forward pass is:
+
+1. Partition the input matrices. Divide $\(Q\)$ into row blocks:
+
+$$
+Q_1,\ldots,Q_{T_r},
+\qquad
+Q_i\in\mathbb{R}^{B_r\times d}.
+$$
+
+Divide $\(K\)$ and $\(V\)$ into blocks:
+
+$$
+K_1,\ldots,K_{T_c},
+\qquad
+V_1,\ldots,V_{T_c},
+$$
+
+where
+
+$$
+K_j,V_j\in\mathbb{R}^{B_c\times d}.
+$$
+
+Divide the output into
+
+$$
+O_1,\ldots,O_{T_r},
+\qquad
+O_i\in\mathbb{R}^{B_r\times d}.
+$$
+
+Divide the log-sum-exp vector into
+
+$$
+L_1,\ldots,L_{T_r},
+\qquad
+L_i\in\mathbb{R}^{B_r}.
+$$
+
+2. Make the query-block loop outermost. For each query block
+
+$$
+i=1,\ldots,T_r,
+$$
+
+load
+
+$$
+Q_i
+$$
+
+from HBM into SRAM. This loop ordering differs from the simplified FlashAttention-1 presentation in which a $\(K,V\)$ block was often loaded and reused across many $\(Q\)$ blocks. FlashAttention-2 keeps one $\(Q_i\)$ resident while it walks through all key/value blocks. This makes each query-row block an independent unit of forward work, which later enables sequence-length parallelism across thread blocks.
+
+3. Initialize the on-chip state. For the current query block, initialize
+
+$$
+O_i^{(0)} =
+0
+\in
+\mathbb{R}^{B_r\times d},
+$$
+
+$$
+\ell_i^{(0)} =
+0
+\in
+\mathbb{R}^{B_r},
+$$
+
+$$
+m_i^{(0)} =
+-\infty
+\in
+\mathbb{R}^{B_r}.
+$$
+
+Here \(O_i^{(0)}\) is an unnormalized numerator accumulator, despite the pseudocode naming it $\(O\)$. 
+
+4. Loop over key/value blocks. For
+
+$$
+j=1,\ldots,T_c,
+$$
+
+load
+
+$$
+K_j,V_j
+$$
+
+from HBM into SRAM.
+
+Compute the current score tile:
+
+$$
+S_i^{(j)} =
+Q_iK_j^\top
+\in
+\mathbb{R}^{B_r\times B_c}.
+$$
+
+In a complete Transformer implementation, the score also includes scaling and possibly a mask:
+
+$$
+S_i^{(j)} =
+\frac{Q_iK_j^\top}{\sqrt d}
++
+M_i^{(j)}.
+$$
+
+5. Update the running maximum. Compute
+
+$$
+m_i^{(j)} =
+\max
+\left(
+m_i^{(j-1)},
+rowmax
+\left(
+S_i^{(j)}
+\right)
+\right).
+$$
+
+This is an elementwise maximum over the $\(B_r\)$ rows.
+
+6. Compute the local shifted exponentials. Compute
+
+$$
+\widetilde P_i^{(j)} =
+\exp
+\left(
+S_i^{(j)}-m_i^{(j)}
+\right)
+\in
+\mathbb{R}^{B_r\times B_c}.
+$$
+
+These are not yet final normalized probabilities. They are unnormalized exponential weights expressed relative to the latest running row maximum.
+
+7. Update the denominator. The old denominator was expressed relative to \(m_i^{(j-1)}\). It must be converted to the scale of \(m_i^{(j)}\):
+
+$$
+\ell_i^{(j)} =
+e^{m_i^{(j-1)}-m_i^{(j)}}
+\ell_i^{(j-1)}
++
+rowsum
+\left(
+\widetilde P_i^{(j)}
+\right).
+$$
+
+8. Update the unnormalized output. Update
+
+$$
+O_i^{(j)} =
+diag
+\left(
+e^{m_i^{(j-1)}-m_i^{(j)}}
+\right)
+O_i^{(j-1)}
++
+\widetilde P_i^{(j)}V_j.
+$$
+
+A clearer rowwise form is
+
+$$
+O_i^{(j)} =
+e^{m_i^{(j-1)}-m_i^{(j)}}
+\odot
+O_i^{(j-1)}
++
+\widetilde P_i^{(j)}V_j.
+$$
+
+The exponential vector is broadcast across the $\(d\)$ output dimensions. Notice what is missing: there is no division by $\(\ell_i^{(j)}\)$ inside the loop.
+
+9. Normalize only after the loop. After all $\(T_c\)$ key/value blocks have been processed, compute
+
+$$
+O_i =
+diag
+\left(
+\ell_i^{(T_c)}
+\right)^{-1}
+O_i^{(T_c)}.
+$$
+
+Equivalently, rowwise:
+
+$$
+O_i =
+\frac{
+O_i^{(T_c)}
+}{
+\ell_i^{(T_c)}
+}.
+$$
+
+This is the only final normalization required for the query block.
+
+10. Compute log-sum-exp. Compute
+
+$$
+L_i =
+m_i^{(T_c)}
++
+\log
+\left(
+\ell_i^{(T_c)}
+\right).
+$$
+
+Then write
+
+$$
+O_i
+\quad\text{and}\quad
+L_i
+$$
+
+to HBM.
+
+After all query blocks are complete, the algorithm returns the exact output
+
+$$
+O =
+softmax
+\left(
+QK^\top
+\right)V,
+$$
+
+using
+
+$$
+O(N^2d)
+$$
+
+FLOPs and only
+
+$$
+O(N)
+$$
+
+extra storage beyond the inputs and outputs.
+
+In autoregressive attention, token $\(i\)$ must not attend to a future token $\(j>i\)$. Therefore,
+
+$$
+S_{ij} =
+-\infty
+\qquad
+\text{when}
+\qquad
+j>i.
+$$
+
+A naive implementation could calculate every score and then apply an elementwise causal mask. FlashAttention-2 can do better because attention is already divided into tiles. If every key-column index in a tile is greater than every query-row index in that tile, the entire tile is masked.
+
+The kernel can skip the tile completely:
+
+- Do not calculate $\(Q_iK_j^\top\)$.
+- Do not perform softmax work.
+- Do not load unnecessary values.
+- Do not execute elementwise masking.
+
+This is much cheaper than computing the tile and filling it with $\(-\infty\)$. With square tiles, most tiles are either:
+
+- Completely valid
+- Completely invalid and skipped
+
+Only tiles crossing the causal diagonal contain a mixture of allowed and disallowed elements. Therefore, each query-row tile generally needs detailed causal masking in only one diagonal key tile. Optimized causal attention can be approximately 1.7–1.8 times faster than unmasked attention in relevant comparisons because a large portion of the upper-triangular work is skipped. The exact ratio depends on shape and implementation. Conceptually, causal attention performs roughly half as many score computations for long square sequences.
+
+The FlashAttention-2 backward pass receives:
+
+$$
+Q,K,V,O,dO
+\in
+\mathbb{R}^{N\times d}
+$$
+
+and
+
+$$
+L\in\mathbb{R}^{N}.
+$$
+
+Its goal is to produce:
+
+$$
+dQ,
+\quad
+dK,
+\quad
+dV.
+$$
+
+The main difference from FlashAttention-1 is that probabilities are reconstructed using only the log-sum-exp vector $\(L\)$:
+
+$$
+P_{ij} =
+\exp
+\left(
+S_{ij}-L_i
+\right).
+$$
+
+There is no need to separately load a row maximum and exponential sum.
+
+Let
+
+$$
+P =
+softmax(S),
+\qquad
+O =
+PV.
+$$
+
+Given \(dO\), first compute
+
+$$
+dP =
+dOV^\top.
+$$
+
+The rowwise softmax derivative is
+
+$$
+dS =
+P
+\odot
+\left(
+dP -
+rowsum
+\left(
+dP\odot P
+\right)
+\right).
+$$
+
+FlashAttention uses the identity
+
+$$
+rowsum
+\left(
+dP\odot P
+\right) =
+rowsum
+\left(
+dO\odot O
+\right).
+$$
+
+Define
+
+$$
+D =
+rowsum
+\left(
+dO\odot O
+\right)
+\in
+\mathbb{R}^{N}.
+$$
+
+Then the score gradient can be written as
+
+$$
+dS =
+P
+\odot
+\left(
+dP-D
+\right),
+$$
+
+where $\(D\)$ is broadcast across each row.
+
+The pseudocode screenshot appears to label $\(D\)$ as belonging to $\(\mathbb{R}^{d}\)$, but the rowwise quantity has one value per query row, so the intended shape is
+
+$$
+D\in\mathbb{R}^{N}.
+$$
+
+Below is the step-by-step backward algorithm:
+
+1. Partition all tensors.
+
+Partition $\(Q\)$, $\(O\)$, $\(dO\)$, $\(dQ\)$, $\(L\)$, and $\(D\)$ according to query-row tiles.
+
+Partition $\(K\)$, $\(V\)$, $\(dK\)$, and $\(dV\)$ according to key/value-row tiles.
+
+2. Initialize $\(dQ\)$. Initialize
+
+$$
+dQ =
+0
+\in
+\mathbb{R}^{N\times d}
+$$
+
+in HBM.
+
+The gradient blocks $\(dK_j\)$ and $\(dV_j\)$ will be accumulated while processing one key/value block.
+
+3. Precompute $\(D\)$. Compute
+
+$$
+D =
+rowsum
+\left(
+dO\odot O
+\right).
+$$
+
+Write $\(D\)$ to HBM and divide it into blocks
+
+$$
+D_1,\ldots,D_{T_r},
+\qquad
+D_i\in\mathbb{R}^{B_r}.
+$$
+
+4. Outer loop over key/value blocks. For each
+
+$$
+j=1,\ldots,T_c,
+$$
+
+load
+
+$$
+K_j,V_j
+$$
+
+from HBM into SRAM.
+
+Initialize
+
+$$
+dK_j=0,
+\qquad
+dV_j=0
+$$
+
+in SRAM.
+
+5. Inner loop over query blocks. For each query block $\(i\)$, load
+
+$$
+Q_i,
+\quad
+O_i,
+\quad
+dO_i,
+\quad
+dQ_i,
+\quad
+L_i,
+\quad
+D_i
+$$
+
+from HBM into SRAM.
+
+6. Recompute the score tile
+
+Compute
+
+$$
+S_i^{(j)} =
+Q_iK_j^\top
+\in
+\mathbb{R}^{B_r\times B_c}.
+$$
+
+This recomputation avoids storing the complete $\(N\times N\)$ score matrix during the forward pass.
+
+7. Reconstruct the probability tile. Using the saved log-sum-exp vector:
+
+$$
+P_i^{(j)} =
+\exp
+\left(
+S_i^{(j)}-L_i
+\right)
+\in
+\mathbb{R}^{B_r\times B_c}.
+$$
+
+The entries are already correctly normalized because
+
+$$
+L_i =
+\log
+\left(
+\sum_k e^{S_{ik}}
+\right).
+$$
+
+8. Accumulate the value gradient. Since
+
+$$
+O=PV,
+$$
+
+the value gradient is
+
+$$
+dV =
+P^\top dO.
+$$
+
+For the current tiles:
+
+$$
+dV_j
+\leftarrow
+dV_j
++
+\left(
+P_i^{(j)}
+\right)^\top
+dO_i.
+$$
+
+Its shape is
+
+$$
+(B_c\times B_r)(B_r\times d) =
+B_c\times d.
+$$
+
+9. Compute the probability gradient
+
+Compute
+
+$$
+dP_i^{(j)} =
+dO_iV_j^\top
+\in
+\mathbb{R}^{B_r\times B_c}.
+$$
+
+10. Compute the score gradient. Compute
+
+$$
+dS_i^{(j)} =
+P_i^{(j)}
+\odot
+\left(
+dP_i^{(j)}-D_i
+\right).
+$$
+
+Here $\(D_i\)$ is broadcast across the $\(B_c\)$ columns of each row.
+
+If attention scores include the usual scaling
+
+$$
+S =
+\frac{QK^\top}{\sqrt d},
+$$
+
+then the corresponding $\(1/\sqrt d\)$ factor must also be included when propagating into $\(Q\)$ and $\(K\)$.
+
+11. Accumulate the query gradient. The query gradient is
+
+$$
+dQ =
+dSK.
+$$
+
+For the current tiles:
+
+$$
+dQ_i
+\leftarrow
+dQ_i
++
+dS_i^{(j)}K_j.
+$$
+
+Because multiple $\(j\)-blocks$ contribute to the same $\(dQ_i\)$, the algorithm must repeatedly:
+
+- Load $\(dQ_i\)$ from HBM.
+- Update it in SRAM.
+- Write it back to HBM.
+
+This shared accumulation becomes important when backward work is parallelized across key-column blocks.
+
+12. Accumulate the key gradient. The key gradient is
+
+$$
+dK =
+dS^\top Q.
+$$
+
+For the current tiles:
+
+$$
+dK_j
+\leftarrow
+dK_j
++
+\left(
+dS_i^{(j)}
+\right)^\top
+Q_i.
+$$
+
+13. Write $\(dK_j,dV_j\)$ to HBM
+
+After all query blocks have contributed to the current key/value block, write
+
+$$
+dK_j
+\quad\text{and}\quad
+dV_j
+$$
+
+back to HBM.
+
+Finally return
+
+$$
+dQ,
+\quad
+dK,
+\quad
+dV.
+$$
+
+FlashAttention-2 explicitly supports:
+
+- MQA: Multi-Query Attention
+- GQA: Grouped-Query Attention
+
+In ordinary multi-head attention, every query head generally has its own key and value head. In MQA, many query heads share one key head and one value head. In GQA, query heads are divided into groups, and all query heads in one group share a key/value head. This reduces the KV cache required during autoregressive inference. A naive implementation might physically duplicate the shared $\(K\)$ and $\(V\)$ tensors so that every query head appears to have a matching key/value head.
+
+FlashAttention-2 does not need to do this. Instead, it uses indexing logic to map several query heads to the same key/value head:
+
+$$
+\text{KV head index} =
+f
+\left(
+\text{query head index}
+\right).
+$$
+
+The shared $\(K,V\)$ data is reused without explicit tensor replication. During backpropagation, however, multiple query heads contribute gradients to the same shared $\(K\)$ and $\(V\)$. Therefore, the corresponding gradients must be summed:
+
+$$
+dK_{\text{shared}} =
+\sum_{h\in\text{group}}dK_h,
+$$
+
+$$
+dV_{\text{shared}} =
+\sum_{h\in\text{group}}dV_h.
+$$
+
+FlashAttention-2 added support for MQA and GQA, together with support for head dimensions up to 256. FlashAttention-1 primarily parallelized over:
+
+$$
+\text{batch size}
+\times
+\text{number of attention heads}.
+$$
+
+That gives approximately
+
+$$
+B\times H
+$$
+
+independent thread blocks.
+
+A thread block is scheduled onto an SM, or streaming multiprocessor.
+
+The A100 has 108 SMs. When
+
+$$
+B\times H
+$$
+
+is reasonably large—one slide uses roughly 80 or more as a practical example—the GPU can use most of its SMs efficiently.
+
+However, long-sequence workloads often use:
+
+- Small batches
+- Fewer attention heads
+- Large sequence length
+
+For example, if
+
+$$
+B=1,
+\qquad
+H=16,
+$$
+
+there may be only 16 coarse-grained attention work units for 108 SMs. Much of the GPU can remain idle even though the attention matrix itself is enormous.
+
+FlashAttention-2 parallelizes not only across batch items and heads but also across blocks of the sequence dimension. In the forward pass, different query-row blocks are independent. For a fixed attention head:
+
+- Worker 1 can process query-row block 1.
+- Worker 2 can process query-row block 2.
+- Worker 3 can process query-row block 3.
+- And so on.
+
+Each worker owns one row block of the conceptual attention matrix. It scans through the required $\(K,V\)$ blocks and produces the corresponding rows of $\(O\)$. These thread blocks do not need to communicate with one another because different output rows are independent. The number of forward work units becomes approximately
+
+$$
+B\times H\times T_r,
+$$
+
+instead of merely
+
+$$
+B\times H.
+$$
+
+This raises occupancy when batch size and head count are small but the sequence is long.
+
+In backward, the slides illustrate assigning workers by column blocks of the attention matrix. For a fixed key/value block $\(j\)$, one worker can accumulate:
+
+$$
+dK_j
+\quad\text{and}\quad
+dV_j
+$$
+
+across all query blocks.
+
+Different $\(j\)-workers$ own different $\(dK_j,dV_j\)$ outputs, so these quantities do not conflict. The complication is $\(dQ\)$. Every key block contributes to the same query gradient:
+
+$$
+dQ_i =
+\sum_j
+dS_i^{(j)}K_j.
+$$
+
+Therefore, different workers may attempt to update the same $\(dQ_i\)$. The slides identify this as the main shared computation among column-parallel workers:
+
+1. Load $\(dQ_i\)$ from HBM.
+2. Add the worker’s contribution.
+3. Write $\(dQ_i\)$ back to HBM.
+
+When several thread blocks update the same $\(dQ_i\)$, atomic additions or another reduction mechanism are required to combine their contributions correctly. Despite this coordination, adding sequence-dimension parallelism substantially improves occupancy in long-sequence, low-batch, low-head-count settings.
+
+A CUDA thread block contains several warps. A warp is normally a group of 32 threads that execute instructions together. Even after choosing the right number of thread blocks (e.g. 4 or 8), the work inside each block must be divided efficiently.
+
+In FlashAttention-1’s forward pass:
+
+- $\(Q\)$ was visible to all warps.
+- $\(K\)$ was split among the warps.
+- $\(V\)$ was split among the warps.
+
+With four warps:
+
+- Warp 1 handled one slice of $\(K,V\)$.
+- Warp 2 handled another slice.
+- Warp 3 handled another slice.
+- Warp 4 handled another slice.
+
+Each warp computed a partial contribution to
+
+$$
+QK^\top.
+$$
+
+After multiplication by its corresponding $\(V\)$ slice, the partial output contributions had to be summed across warps. This is called a $split-\(K\)$ decomposition because the reduction or inner dimension of the matrix multiplication is divided among workers.
+
+Why $split-\(K\)$ is costly here? Each warp produces only a partial result. To combine those partial results, the warps must:
+
+1. Write intermediate values to shared memory.
+2. Synchronize.
+3. Read the other partial values.
+4. Add them together.
+
+These shared-memory reads and writes are not free. They add communication and synchronization around the extremely fast matrix multiplications. The result is that Tensor Cores may spend time waiting for data exchange rather than continuously performing matmuls. 
+
+FlashAttention-2 reverses the partitioning:
+
+- $\(Q\)$ is divided among the warps.
+- $\(K\)$ is visible to all warps.
+- $\(V\)$ is visible to all warps.
+
+For example, with four warps:
+
+- Warp 1 owns one group of query rows.
+- Warp 2 owns another group.
+- Warp 3 owns another group.
+- Warp 4 owns another group.
+
+Every warp independently computes the output rows corresponding to its own $\(Q\)$ slice. After calculating its part of
+
+$$
+QK^\top,
+$$
+
+the warp multiplies by the shared $\(V\)$ tile and produces the final contribution for its own output rows.
+
+Why this avoids communication? Different query rows correspond to different output rows. Therefore:
+
+- Warp 1 writes one output-row region.
+- Warp 2 writes another.
+- Warp 3 writes another.
+- Warp 4 writes another.
+
+Their results do not have to be summed together. Consequently, warps do not need to exchange partial output accumulators through shared memory. This reduces:
+
+- Shared-memory writes
+- Shared-memory reads
+- Synchronization
+- Inter-warp communication
+
+This improved warp partitioning is one of FlashAttention-2’s central performance gains.
+
+FlashAttention-2 assigns different portions of $\(Q\)$ to different warps while sharing $\(K\)$ and $\(V\)$. This works naturally because output rows are independent. The backward pass is more complicated because it involves:
+
+$$
+Q,
+\quad
+K,
+\quad
+V,
+\quad
+O,
+\quad
+dO,
+\quad
+dQ,
+\quad
+dK,
+\quad
+dV
+$$
+
+and several dependencies between them. Even so, FlashAttention-2 avoids the earlier $split-\(K\)$ arrangement where possible. This reduces shared-memory traffic and improves performance again.
+
+Some synchronization remains necessary because gradients can be shared across computation partitions, particularly when several workers contribute to the same $\(dQ\)$, $\(dK\)$, or $\(dV\)$. The important distinction is: FlashAttention-2 does not eliminate every synchronization. It eliminates an unnecessarily communication-heavy work partition used by FlashAttention-1.
+
+Larger tiles often reduce the number of shared-memory loads and stores because more computation is performed per tile. However, making a tile larger also increases:
+
+- Register usage
+- Shared-memory usage
+- The number of live intermediate values
+- Pressure on occupancy
+
+If register demand becomes too high, values can spill from registers into slower local memory. Register spilling can cause a substantial performance loss. If shared-memory demand exceeds the capacity available to a thread block, the kernel cannot be launched with that configuration. The best choice depends on:
+
+- Head dimension $\(d\)$
+- GPU architecture
+- Available shared memory
+- Register-file capacity
+- Forward versus backward
+- Causal versus noncausal attention
+- Desired occupancy
+
+Therefore, “use the largest possible tile” is not a correct universal strategy. The real goal is: Choose a tile large enough to reuse data efficiently, but small enough to avoid excessive register pressure, shared-memory consumption, or reduced occupancy.
+
+---
