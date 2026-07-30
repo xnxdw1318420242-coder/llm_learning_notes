@@ -4613,6 +4613,473 @@ Here we also introduce DeepSpeed-MII as a system for low-latency inference and h
 
 #### 5.2.3.2 vLLM
 
+vLLM is an LLM serving system that sits between incoming API requests and the model’s GPU kernels. It does not change the model’s probability distribution. Instead, it continuously decides:
 
+- Which requests should run in the current iteration
+- How many tokens each request should compute
+- Where each request’s KV cache should be stored
+- When requests should enter, leave, pause, or resume
+- How outputs should be streamed back to the caller
 
+The best way to understand vLLM is to treat one request as a complete lifecycle:
 
+Request arrival
+→ protocol parsing and tokenization
+→ scheduling
+→ model execution
+→ sampling and output processing
+→ streaming response
+→ resource release
+
+Its core abstractions are not a fixed training-style batch. They are a dynamically changing set of tokens to compute, the KV-cache blocks that store token state, and a scheduler that rebuilds the executable batch every iteration. Training usually operates on preassembled batches with stable boundaries including forward pass, backward pass, and optimizer step. Online serving is much less regular.
+
+A serving system must deal with:
+
+- Prompts of different lengths
+- Unknown output lengths
+- Requests arriving at arbitrary times
+- Requests ending at different times
+- Streaming one token at a time
+- Cancellations and timeouts
+- Limited KV-cache capacity
+- Different sampling and multimodal configurations
+
+Therefore, simply loading a model onto a GPU does not complete the serving system. vLLM is the control layer between HTTP requests and model kernels. It decides which tokens run during every engine iteration and manages their associated state. Autoregressive inference has two computation phases. Prefill processes multiple prompt tokens at once. For every layer, it computes Q, K, V and MLP operations. The K and V values for all prompt positions are written into the KV cache. Because tokens within a prompt can be processed in parallel, prefill commonly has larger matrix multiplications, better GPU compute utilization, and a workload closer to compute-bound execution.
+
+Decode normally advances each active sequence by one or a small number of tokens per iteration. For every new query token, attention reads the cached K and V values of all preceding positions. Decode therefore tends to have very thin matrices for each request, large KV reads, strong memory-bandwidth pressure, more kernel-launch and scheduling overhead, and lower arithmetic intensity than prefill. Prefill and decode use the same model, but they have very different execution shapes.
+
+Assume a Transformer has:
+
+- $\(L\)$ layers
+- $\(n_{kv}\)$ KV heads
+- Head dimension $\(d_h\)$
+- $\(b\)$ bytes per KV element
+- Sequence length $\(T\)$
+
+The theoretical KV-cache memory required by one sequence is approximately:
+
+$$
+M_{KV}(T) = 2LTn_{kv}d_hb.
+$$
+
+The factor $\(2\)$ represents:
+
+- Keys
+- Values
+
+For multi-head attention, the number of KV heads may equal the number of query heads.
+
+GQA and MQA reduce $\(n_{kv}\)$, so they reduce the KV-cache memory required for the same context length.
+
+For an online batch, total KV memory is not a fixed rectangle based on the longest sequence. It is approximately:
+
+$$
+\sum_i M_{KV}(T_i),
+$$
+
+and it grows as active sequences generate more tokens.
+
+In training, a batch is usually a fixed collection of samples. In vLLM, the core scheduling object is closer to a changing collection of tokens together with the KV blocks carrying their state. Each engine iteration consists approximately of three stages:
+
+1. Schedule
+2. Model execution
+3. Postprocessing
+
+The scheduler chooses tokens from waiting and running requests. The worker executes the model using selected token IDs, slot mappings, block tables, and attention metadata. After sampling, the engine updates stopping conditions and streams results. New requests can join while older requests are still generating, and completed requests immediately release their resources. This is the basis of continuous batching.
+
+A mixed prefill/decode schedule tries to combine the large-matrix efficiency of prefill, the concurrency and throughput of decode, and the avoidance of waiting for the slowest sequence in a static batch. However, prefill and decode compete for the same GPU. Too much prefill can delay currently streaming requests, increase inter-token latency, and stretch the time between decode iterations; And too much decode can delay newly arrived requests, increase time to first token, and build a long admission queue. Therefore, serving optimization is not simply maximizing tokens per second. The scheduler must find a working point among admission rate, KV-cache capacity, per-iteration token budget, time-to-first-token targets, and inter-token-latency targets.
+
+Online workloads are dynamic. The following may change continuously: Sequence lengths; Prefill/decode ratio; Sampling branches; Request arrival rate; Output lengths; and KV-cache use. The same request concurrency may correspond to very different numbers of scheduled tokens, KV-memory consumption, and kernel shapes. A reproducible serving benchmark should therefore fix at least the model, the data type, the input-length distribution, output-length distribution, the arrival process, the concurrency limit, the sampling parameters, and the hardware topology. During training, larger batch size could be better, but this is unreliable during inference.
+
+Offline inference is often summarized by tokens per second. Online serving requires separate measurements of queueing and token experience. It may include queueing, admission, tokenization, prefill, initial sampling, and network transmission. Its common bottlenecks include admission delay, prefill work, and tokenization. A good average TTFT alone can hide a long tail for large prompts.
+
+ITL is the interval between consecutive streamed output tokens. Average ITL is often called TPOT, or time per output token. Common sources of poor ITL include decode-bandwidth limits, preemption, interference from prefill, and poor decode batching. A good average TPOT does not guarantee that a request’s output stream is smooth.
+
+For $\(N_o\)$ output tokens, a useful approximation is:
+
+$$
+T_{e2e} \approx T_{TTFT} + (N_o - 1)T_{TPOT}.
+$$
+
+This is not an exact identity because streaming, network transfer, detokenization, queueing, and tail processing also contribute.
+
+Request throughput measures completed requests per unit time. It depends strongly on input and output lengths, scheduling, and KV-cache capacity. It cannot be compared fairly across workloads with different output-length distributions.
+
+Token throughput measures the total number of processed tokens per unit time. It is influenced by tokens scheduled per batch, kernel efficiency, and batch shape. It may improve by sacrificing individual-request latency.
+
+Goodput measures useful throughput that satisfies an explicit service-level objective. It depends on tail latency, error rate, timeout rate, cancellation, preemption, and defined TTFT and ITL targets. For online systems, the objective should usually be to maximize goodput subject to latency constraints. It should not be unconstrained peak throughput.
+
+Production evaluation should inspect percentiles such as P50, P90, and P99. It should also include successful request throughput, timeouts, cancellations, preemptions, recomputation, and queue growth. A good stress test should increase request arrival rate gradually until the SLO first becomes unsatisfied. At that point, record request mix, KV-cache utilization, preemption frequency, running and waiting request counts, prompt and generation token counts, and engine iteration time. Testing only one request’s latency ignores continuous batching. Testing only offline throughput ignores queueing and tail latency.
+
+Separating metrics by serving phase makes tuning more diagnostic.
+
+- High TTFT: inspect queueing, admission, tokenization, and prefill.
+- High ITL: inspect decode batch shape, communication, and preemption.
+- Low throughput: inspect kernels, quantization, tensor parallelism, and batch formation.
+- Poor goodput: inspect tail latency, error rate, and SLO definitions.
+
+Monitoring should include running requests, waiting requests, KV-cache usage, cache-hit rate, preemption count, prompt-token count, generation-token count, and engine iteration time.
+
+System capacity is constrained jointly by three main boundaries.
+
+1. Model-weight capacity and bandwidth. The model weights must fit, and they must be read efficiently during inference. Quantization primarily changes weight size and some GEMM characteristics.
+
+2. KV-cache capacity. The KV cache determines how many active token states can be retained. KV quantization primarily changes bytes per cached token. GQA changes the number of KV heads and KV bytes per token.
+
+3. Scheduler token budget. The scheduler must form a sufficiently large and efficient executable batch under a per-iteration token budget. PagedAttention primarily changes KV allocation efficiency. These techniques affect different accounting categories. One should not use a vague statement such as “memory usage decreased” to substitute for measuring each effect separately.
+
+At low concurrency, the GPU may be underutilized because:
+
+- GEMMs are too small
+- Kernel launches are frequent
+- Batches are too thin
+
+As concurrency rises, batching improves throughput. At still higher concurrency, the system may become limited by KV-cache capacity, queueing, network saturation, scheduling, and prermption. P99 can then worsen sharply. The correct objective is the maximum goodput satisfying the latency constraint, not the highest unconstrained throughput. This is also why the same configuration may not serve equally well:
+
+- Short conversational requests
+- Long-document prefill
+- Very long reasoning outputs
+
+Their token shapes and ideal budgets are different. 
+
+vLLM V1 separates user-facing request handling, scheduling and KV management, and GPU model execution into clearer process boundaries. An offline LLM class drives synchronous requests through an LLMEngine. An OpenAI-compatible API server uses an AsyncLLMEngine. It creates asynchronous channels among HTTP handling, tokenization, streaming output, and engine iterations. The Engine Core is responsible for per-iteration scheduling, KV-cache management, and maintaining request state. The GPU Worker is responsible for loading the model and executing model kernels. This separation lets API concurrency and GPU execution scale more independently.
+
+In a multi-GPU configuration:
+
+- Each data-parallel rank corresponds to an Engine Core.
+- Each Engine Core controls a number of workers equal to:
+
+$$
+TP \times PP,
+$$
+
+where:
+
+- $\(TP\)$ is the tensor-parallel degree.
+- $\(PP\)$ is the pipeline-parallel degree.
+
+If:
+
+- $\(A\)$ is the number of API-server processes,
+- $\(D\)$ is the data-parallel degree,
+
+then the total process count is described as:
+
+$$
+N_{\text{proc}} =
+A + D + D(TP \times PP) + \mathbf{1}[D > 1].
+$$
+
+The final term represents an additional data-parallel coordinator when $\(D > 1\)$.
+
+Data parallelism in serving is not training gradient synchronization. Each serving replica handles different requests independently. It does not perform per-step gradient AllReduce. Tensor parallelism and pipeline parallelism distribute one model execution across multiple GPUs, so they enter the latency path. A useful deployment principle is, first make a single replica large enough to hold and run the model. Then use data parallelism to scale request throughput. Data parallelism, tensor parallelism, and pipeline parallelism should not be treated as interchangeable decompositions of the same GPU count.
+
+The API server and Engine Core communicate through ZMQ. When multiple data-parallel replicas are present, a coordinator collects load information from ranks and helps route requests. Each replica processes different requests independently. Tensor- and pipeline-parallel communication is used only inside a replica to execute the sharded model. The Engine Core often runs a persistent busy loop and can be sensitive to CPU scheduling and process contention. The API server also performs tokenization, JSON handling, template rendering, and network I/O. Therefore, apparent GPU idleness, TTFT jitter, or streaming stalls may be caused by CPU-side problems. Potential hidden bottlenecks include CPU quotas, NUMA placement, thread pools, tokenizer parallelism, network-card interrupts, and ZMQ fan-out. Increasing API-server process count can reduce an entry-layer bottleneck for high-QPS, short-request workloads. It is less helpful when a single request’s model execution is itself slow. In that case, the relevant options may be tensor parallelism, pipeline parallelism, quantization, CUDA graph, or a more suitable model.
+
+Each API-server and Engine-Core process consumes CPU, memory, connections, and IPC resources. Too many API processes may cause tokenization contention and ZMQ fan-out overhead. Excessive tensor parallelism may place collective communication on the critical path. Pipeline parallelism may introduce pipeline bubbles. A deployment should be verified using process-level CPU usage, resident set size, IPC queue behavior, and GPU utilization. vLLM’s interface layer, scheduler, KV-cache manager, attention backend, and model implementation may evolve at different rates. Before applying a configuration, verify:
+
+- Whether the system is using the V1 path or a compatibility path
+- Which attention backend is active
+- Whether a parameter truly participates in the current execution graph
+
+Blindly copying a configuration from an older version may produce a setup that launches but does not behave as expected. The difficult part of KV caching is not merely total size. It is the irregular lifecycle. When a request arrives, only the prompt is known. Generation may end after one token, continue to the maximum length, be cancelled, or be preempted. If every request reserves contiguous memory for its maximum possible length, several types of waste appear. Unused capacity is reserved for future tokens that may never be generated. The final partially used allocation wastes space inside the reserved region. Free memory exists, but not as one sufficiently large contiguous region. A request cannot enter because no sufficiently large contiguous segment exists, even when total free memory is adequate.
+
+PagedAttention divides KV cache into fixed-size blocks containing a fixed number of token slots. The allocation unit changes from a contiguous region for the request’s possible maximum length to the blocks required by the sequence’s current length. It solves an address-space and physical-memory-binding problem. It does not make the mathematical attention pattern sparse.
+
+Let:
+
+- $\(B\)$ be the block size in tokens
+- $\(T\)$ be the current sequence length
+
+The number of logical blocks required is:
+
+$$
+N_{\text{block}}(T) =
+\left\lceil
+\frac{T}{B}
+\right\rceil.
+$$
+
+All blocks except the final block are full. Therefore, the internal waste for one sequence is strictly less than B token slots.
+
+If one token’s KV state occupies $\(m_t\)$ bytes, then one block occupies:
+
+$$
+M_b = Bm_t.
+$$
+
+If the KV-memory pool has capacity \(M_{\text{pool}}\), the number of blocks that fit is approximately:
+
+$$
+\left\lfloor
+\frac{M_{\text{pool}}}{M_b}
+\right\rfloor.
+$$
+
+Admission then becomes how many free blocks are available. It no longer depends on finding one large contiguous region.
+
+Fixed blocks provide several direct benefits:
+
+- Requests can grow incrementally.
+- Completed requests can immediately return blocks.
+- Requests of different lengths can share one memory pool.
+- External fragmentation is largely removed.
+- The scheduler can admit requests according to available blocks.
+- Shared-cache mechanisms can operate on block IDs and reference counts.
+
+The same basic block abstraction can support parallel sampling, beam search, prefix caching and cross-instance KV transfer without copying an entire contiguous cache.
+
+Block size balances memory efficiency and kernel efficiency. Smaller blocks have less tail waste, finer-grained allocation and better chance of matching shorter prefixes. But they also have longer block tables, more metadata, more block-ID lookups and more address segments for kernels. Larger blocks have better contiguous access, better vectorization and lower metadata overhead, but more waste in the final block, lower utilization for short sequences, and a shared prefix ofte nmust cover a whole block before it can be reused. The appropriate value depends on model KV-head count, data type, typical request lengths, attention backend, and head dimesion. It should not be tuned in isolation.
+
+Each request sees a contiguous sequence of logical blocks. The GPU KV-cache pool contains fixed-ID physical blocks. A block table maps logical block to physical block. The scheduler and KV-cache manager can assign any available physical block to a new logical block. Logical token order remains contiguous even when physical addresses are not. This is similar to virtual-memory page tables.
+
+For token position $\(t\)$:
+
+$$
+j =
+\left\lfloor
+\frac{t}{B}
+\right\rfloor,
+\qquad
+o =
+t \bmod B.
+$$
+
+Here:
+
+- $\(j\)$ is the logical block number.
+- $\(o\)$ is the offset inside that block.
+
+The physical block is:
+
+$$
+p =
+table[j].
+$$
+
+The token’s $\(K\)$ and $\(V\)$ values are written to offset $\(o\)$ inside physical block $\(p\)$.
+
+The actual slot mapping expands this logical location into addresses usable by the kernel across:
+
+- Layers
+- KV heads
+- Head dimensions
+
+The model sees tokens in logical order. Address rearrangement is handled jointly by the cache manager and attention backend.
+
+Block allocation is incremental. During prefill, it will estimate how many new token positions will be added, and allocate a new block only if the current tail block is full or insufficient. During decode, most iterations add one position. Usually only the tail block’s filled count changes. The block table changes only when a block boundary is crossed. When a request finishes, is cancelled or is preempted, blocks whose reference count reaches zero return to the free queue. 
+
+The logical interpretation of a sequence is determined by token order and causal masking. The physical memory location is determined by the block allocator. These are separate coincerns. This is why logical and physical separation matters. 
+
+The block pool usually precreates block metadata rather than creating large numbers of Python objects every iteration. Each block may track immutable block ID, reference count, reusable hash, and free-queue links. The free queue supports efficient removal and reinsertion. A cached block may remain in the free queue while still containing valid reusable data. If that block is hit by prefix caching, the system can “touch” it by removing it from the free queue, incrementing its reference count, and reusing it without rewriting the GPU KV data. Only when a truly free block is required does the allocator evict from the head of the queue. This makes the fast allocation path mostly metadata manipulation.
+
+A block appearing in the free queue does not mean its contents have been erased. A cache system may retain its hash and its previous KV contents until the block is actually reassigned. This is delayed eviction. It prevents reusable KV data from being deleted as soon as a request releases it. However, incorrect handling of hashes, tenant isolation and reference counts can cause incorrect cache hits or cross-tenant leakage. For multi-tenant systems, cache key, salt, and access scope must be designed together.
+
+Paging does not remove every source of memory overhead. Remaining costs include tail-block waste, different block requirements among attention layers, CUDA graph pools, workspace memory, metadata, alignment, attention-backend buffers, NCCL buffers, model weights, and actications. Capacity calculations should record these separately. It is incorrect to treat all memory covered by a setting such as gpu_memory_utilization as available KV-cache space.
+
+A unified Block Pool allows cache manager, scheduler, and attention kernel to use the same IDs. This avoids repeatedly translating among Python objects, allocator handles, and GPU addresses. It also makes memory level observable. The system can directly monitor number of free blocks, number of cached blocks, number of active references, and number of new blocks allocated during the current iteration. These values can feed admission control and monitoring.
+
+PagedAttention is not only an allocator. The attention kernel must use the block table to gather physically scattered keys and values while preserving standard causal-attention normalization.
+
+For query $\(q_i\)$, suppose the logical KV history is divided into $\(J\)$ blocks. The block-level scores are:
+
+$$
+s_j =
+\frac{q_iK_j^\top}{\sqrt d}.
+$$
+
+The output can be written as:
+
+$$
+o_i =
+\operatorname{softmax}
+\left(
+[s_1,\ldots,s_J]
+\right)
+[V_1;\ldots;V_J].
+$$
+
+The mathematics still attends to every permitted historical token. Only the physical source addresses of $\(K_j\)$ and $\(V_j\)$ come from the block table.
+
+The kernel should not independently apply softmax to each block. It must preserve normalization across all blocks. A numerically stable implementation keeps, for each partition:
+
+- A local maximum mj
+- A local exponential sum ℓj
+
+These are rescaled and merged using the global maximum. This prevents block-wise normalization from changing the result. The kernel also avoids materializing the entire attention-score matrix.
+
+A single-query decode kernel often maps a combination such as one sequence, one attention head, and one partition to a thread block. The query is small and reused across many KV tokens, so it is suitable for registers and shared memory. K reads can be divided among thread groups to enable vectorized loading and coalesced access. V has a different layout and reduction direction, so threads may read contiguous elements to support accumulation. The block table introduces one level of address indirection, but accesses inside each block remain regular.
+
+PagedAttention describes a KV-addressing abstraction. It does not imply one fixed CUDA implementation forever. Depending on GPU, data type, head size, model structure, and enabled features, vLLM may choose different attention backends, such as FlashAttention-style backends, decode-specific kernels, quantized-KV kernels, and backends compatible with hybrid KV managers. When analyzing performance, first confirm the actual backend in use. The name “PagedAttention” alone does not prove that a particular historical kernel is active.
+
+Very small blocks may cause more block-ID reads, more softmax partition merges, and more metadata work. Very large blocks may cause more waste on short sequences and low thread utilization when the last block is sparsely filled. Other factors affecting effective block-byte width include head size, number of KV heads, and tensor-parallel sharding. Tuning should inspect memory throughput, occupancy, kernel-launch count, actual batch shape, and kernel time, not only cache utilization.
+
+The block table and sequence metadata must be updated consistently. A typical iteration proceeds as follows:
+
+1. Scheduler chooses tokens.
+2. KV manager ensures the required slots exist.
+3. Model Runner builds input positions, slot mappings, and attention metadata.
+4. Kernel writes new KV and reads historical KV.
+5. Sampling completes.
+6. Scheduler advances the sequence length.
+
+Any ordering mistake can cause a new token to overwrite an old slot, incorrect prefix reads, and a block to be reclaimed while still referenced. These bugs may be harder to detect than an out-of-memory error because tensor shapes may remain valid.
+
+When allocator, metadata builder, and kernel all use the same paging protocol:
+
+- A sequence can grow without relocating its existing KV.
+- Block IDs from several requests can be assembled into one batch.
+- Requests can enter or leave at iteration boundaries.
+- Existing caches do not need to be rearranged.
+
+Batch changes require metadata updates rather than moving every sequence’s contiguous KV cache. This is the foundation of iteration-level continuous batching.
+
+Paging improves allocation efficiency, memory reuse, fragmentation, and admission flexibility. It does not remove the need to read long-context KV history during decode. For a long context, one-step decode still reads an amount of KV that grows approximately with context length. It can still be limited by HBM bandwidth and interconnect bandwidth. Reducing the KV-read scale requires other techniques, such as sliding-window attention, local or global sparse patterns, KV eviction, context parallelism, and model-level state compression. These can be combined with PagedAttention, but they solve a different problem.
+
+To judge whether a paging optimization works, inspect at least number of valid KV tokens, allocated blocks, tail-block waste, cache-hit rate, prermption, and attention-kernel time. A lower memory-use figure by itself cannot determine whether block management improved, batch size became smaller, KV data type changed, and requests happened to be shorter. Static batching chooses a request set before execution and holds the batch until all sequences complete. For variable-length generation, shorter sequences remain idle while waiting for the longest sequence. Continuous batching moves the scheduling boundary to one engine iteration. At the end of every iteration, the scheduler rechecks waiting requests, running requests, finished requests, and cancelled requests. Finished requests leave immediately. New requests may enter as long as they have token budget and required KV blocks. The batch is therefore an active set reconstructed every iteration.
+
+The scheduler’s input is not a simple queue entry. Each request may contain number of computed tokens, number of generated tokens, target token count, priority or arrival time, sampling branches, encoder or multimodal requirements, and associated KV blocks. The scheduler must decide how many tokens each request computes this iteration, how many new blocks are needed, and which requests must be delayed or preempted. The Model Runner then packs the selected tokens into a flat executable batch.
+
+In steady decode, a normal request may contribute one token per iteration. If there are R running sequences, the decode workload is roughly R tokens. A single prefill request may contribute hundreds or thousands of tokens. Therefore, limiting by “number of requests” incorrectly treats prefill and decode as equally expensive. vLLM V1 emphasizes the number of scheduled tokens. The key idea of continuous batching is not only that requests can dynamically enter and leave. It is that the scheduler redoes admission every iteration using both token resources and KV resources.
+
+A queue policy must balance FCFS fairness, priority, and resource feasibility. Strict shortest-request-first may improve average latency but can starve long prompts. Strict FCFS is easier to explain, but a very long prefill can block later short requests unless it can be chunked. Production systems must also handle client disconnects. If an upstream client has cancelled but the engine does not release the request, the GPU may continue computing useless tokens. Cancellation propagation, timeout handling, and block reclamation are part of scheduler correctness.
+
+Iteration-level scheduling can:
+
+- Keep the GPU busy more consistently
+- Return completed requests’ KV blocks quickly
+- Admit new requests without waiting for a static batch to finish
+- Improve utilization for heterogeneous conversational workloads
+
+Its advantage is smaller when offline prompts are similar in length, or when a large static batch already has low scheduling overhead. Continuous batching does not guarantee fairness. It also does not guarantee bounded latency. If arrival rate remains above service rate, the waiting queue grows without bound. A serving system still needs admission control, rate limiting, and queue limits. These should generally exist before GPU-internal preemption becomes the only overload mechanism.
+
+vLLM V1 represents both prefill and decode as tokens that still need computation. Let the scheduler’s per-iteration token budget be $\(C\)$. If request $\(i\)$ receives $\(c_i\)$ scheduled tokens, then:
+
+$$
+\sum_i c_i \leq C.
+$$
+
+The budget is also constrained by:
+
+- `max_num_seqs`
+- Available KV blocks
+- Maximum supported model length
+- Encoder budget
+- Feature-specific limits
+
+Decode requests commonly receive their required tokens first. The remaining budget is then used for prefill. If a prompt’s remaining tokens exceed the available budget, only one chunk is processed. This prevents a long prefill request from occupying the entire iteration.
+
+The same resource model can represent chunked prefill, prefix caching, speculative decoding, encoder tokens, draft tokens, and recomputed tokens. The scheduler ultimately asks how many tokens must be executed this iteration, and how many new KV slots will those tokens require. This is simpler than maintaining separate and incompatible batching rules for every feature.
+
+A larger budget C may provide larger GEMMs, better prefill throughput, higher GPU utilization, and faster completion of long prompts. Its costs may include longer iteration time, higher ITL, and longer wait until the next decode iteration. A smaller budget may provide shorter iterations and better streaming responsiveness. Its costs may include batches too small for efficient GPU use and worse TTFT for long prompts. Therefore, max_num_batched_tokens is fundamentally a trade-off between per-iteration compute efficiency and scheduler response granularity. It is not a workload-independent optimum.
+
+There are several important control parameters. Typical benefit when increasing max_num_batched_tokens include prefill throughput and GPU utilization. Main costs include longer iterations and possibly worse ITL. Observe iteration time and TTFT and ITL when tuning it. Typical benefit when increasing max_num_seqs include decode concurrency and decode throughput. Main costs include KV pressure, scheduling metadata, and preemption. Obser cache usage and prermption count when tuning it. Typical benefit when increasing gpu_memory_utilization is more allocatable KV blocks. Main cost is less headroom for other buffers. Observe graph pool, workspace and OOM behavior when tuning it. For block size, typical benefit when increased include better large-block access and better metadata efficiency. Main costs are more tail waste and coarser prefix reuse. Observe valid-token ratio and kernel time. These controls are not independent. For example, increasing sequence count without enlarging the KV pool may increase preemption. Increasing token budget beyond CPU metadata-building capacity may leave the GPU idle. Quantized weights do not make the KV token budget unbounded because decode still reads more KV as context grows.
+
+The budget/latency trade-off should be tested separately on workloads such as short prompt, long output; long prompt, short output; and mixed traffic. Plot goodput against token budget. A value that is best for one fixed sequence length may perform poorly on a mixed production workload.
+
+Chunked prefill divides the uncomputed part of a long prompt into multiple pieces. Suppose:
+
+- P prompt tokens remain
+- r tokens of budget remain after decode scheduling
+
+Then the current iteration computes min(P,r) prompt tokens. The new KV values are stored, and the request continues in a later iteration. This prevents one long prompt from becoming an indivisible task. It also allows decode traffic to keep advancing between prefill chunks.
+
+Chunks cannot be processed arbitrarily. A later chunk depends on the causal KV state produced by all previous chunks. Therefore, chunks must advance in order. Already computed prefixes do not need to be recomputed. After each chunk, the following must remain consistent: Computed-token count, block table, and tail-block filled count. If prefix caching already covers H tokens, prefill resumes from the first uncached complete-block boundary. If the hit covers only part of a block, the implementation’s full-block reuse rule must still be respected.
+
+When a running request needs more blocks but the free queue cannot satisfy the allocation, the scheduler must release resources. A common V1 policy is recomputation:
+
+1. Pause selected requests.
+2. Release their KV blocks.
+3. When rescheduled, combine original prompt and already generated tokens.
+4. Re-run prefill to rebuild their KV cache.
+
+This trades additional FLOPs for memory. It may be easier to control than repeatedly moving large KV tensors between CPU and GPU, but it can create TTFT or ITL tail spikes.
+
+Preemption should not be treated as the normal throughput strategy. A small, occasional amount may come from traffic variation. Frequent preemption suggests a mismatch among:
+
+- Active-token population
+- Block size
+- Concurrency cap
+- KV-pool configuration
+
+It can create hidden waste: Many tokens are computed; Their KV state is discarded; They are later recomputed; And user-visible progress remains small.
+
+When choosing a preemption remedy, the response should depend on the underlying cause. If KV cache stays near full, possible actions include increasing KV capacity, reducing max_num_seqs, using a smaller KV data type, shortening allowed sequence length, and adding a data-parallel replica. If long prefill causes decode jitter, possible actions include lowering the token budget and separating workload classes. If rare giant requests cause sudden jumps, possible action is bucket requests by prompt length at admission. Blindly increasing GPU-memory utilization may reduce memory available for CUDA Graphs, attention workspace, and NCCL buffers, and can turn prermption into OOM.
+
+Reasonable chunking can control iteration duration while preserving correctness of long prompts. It also creates a natural interface between prefill producers of KV state and decode consumers of KV state. The SLOs for first token and streamed tokens can then be tuned separately. For example, if a 16K-token prefill monopolizes one iteration while many short decode requests are active, ITL for those short requests may spike. Splitting the prefill into chunks lets decode progress between chunks. The cost is that the long prompt takes more iterations to finish, so its TTFT may rise. The token budget should be selected using P99 measurements for both workload classes, not only total tokens per second.
+
+Behavior from older vLLM versions should not be copied directly into V1. Preemption mode can depend on version, backend, and enabled features set. Diagnosis should use actual logs such as preemption mode, number of recomputed tokens, and KV-transfer volume. If a request merely appears slower but recomputation is not measured, one may incorrectly blame model kernels for preemption overhead.
+
+Automatic Prefix Caching reuses KV cache when multiple requests have the same token prefix under the same conditions. The matching prefix must correspond to the same model, positional semantics, and relevant extra conditions. Prefix caching avoids repeating prefill work for the shared prefix. It reduces repeated prefill computation and corresponding TTFT. It does not reduce decode’s cost of reading the reused historical KV.
+
+Token text alone is not a safe cache key. The same block of tokens can appear after different earlier prefixes. In that case, its hidden state and KV values differ. Therefore, a safe chained hash should include parent block hash, current block token IDs, all extra values affecting KV, and optional salt. This can be expressed as 
+
+$$
+h_j =
+H
+\left(
+h_{j-1},
+\text{tokens}_j,
+\text{extras}_j,
+\text{salt}
+\right).
+$$
+
+Possible `extras` include LoRA adapter ID, multimodal input hash, model namespace, and cache namespace. The parent hash commits the full context from the sequence start to the current block.
+ The salt separates tenants or trust domains.
+
+During the prefix-cache hit process, on a lookup:
+
+1. The cache map finds candidate block IDs by hash.
+2. The system confirms the blocks have not been overwritten.
+3. Their reference counts are incremented.
+4. The corresponding block IDs are inserted into the request’s block table.
+5. Only the uncached suffix receives token budget.
+
+The scheduler must align cache hits with computation accounting. A hit should reduce number of prompt tokens requiring prefill and required new KV allocations.
+
+Reuse granularity is a full block chain. The reuse unit is a complete block chain from the beginning of the sequence. It is not an arbitrary matching substring. Only fully populated blocks are stable cache entries. A partially filled tail block usually continues to receive writes, so inserting it into the cache map too early would make later tokens change its contents.
+
+The Block Pool maintains several relationships.
+
+- Preallocated block metadata. A fixed metadata list for physical blocks.
+
+- LRU-ordered free-block queue. Blocks with no active reference are arranged for possible reuse or eviction.
+
+- Cache map. Maps hash to block IDs.
+
+- Active request mapping. Maps request ID to block table. When a block is reused, it is removed from the free queue, and its reference count increases. When a request releases it, the reference count falls. If it reaches zero, the block returns to the queue tail. Its hash may remain temporarily. When a new allocation truly needs the block, the system takes it from the queue head and removes the stale cache-map entry. This is delayed eviction.
+
+A hash system must balance speed, collision behavior, canonical serialization and isolation. A fast noncryptographic hash has low CPU overhead, but a collision may result in incorrect KV reuse rather than a normal cache miss. A cryptographic hash costs more but may be more appropriate for multi-tenant environments and untrusted input. Canonical serialization prevents semantically identical values from producing inconsistent hashes due to language differences, type encodings, and byte-order differences. Optimizing only CPU hash cost while ignoring collision and isolation risk hides correctness risk inside a performance optimization.
+
+A cache_salt can ensure that only requests with the same salt share a block chain. This can reduce a timing side channel in which a user infers whether another user’s prefix exists by measuring response time. However, salt does not replace authentication, authorization, GPU-memory cleanup policy, model-instance isolation, LoRA isolation, multimodal-data isolation, and logging controls. Production systems should explicitly define which requests are allowed to share cache state. The goal should not automatically be the highest global cache-hit rate.
+
+Prefix caching is especially useful when requests repeatedly share system prompts, few-shot templates, long-document prefixes, and common instructions. Its benefit decreases when prefixes diverge early because of timestamps, random IDs, different template whitespace and different tokenization. Before optimization, measure reusable-token ratio, full-block hit rate, and number of saved computed tokens, not only the number of requests that recorded a hit.
+
+The scheduler should query already computed blocks before allocating work. Cached blocks are attached to the new request’s block table and their reference counts increase. Only the uncached suffix receives token budget. When free blocks are scarce, cached-but-unreferenced blocks may be evicted. The best retention policy may differ between high-cache-hit workloads and low-cache-hit workloads. A high cache-hit rate does not mean active references may be ignored. A block still referenced by a running request cannot be evicted.
+
+vLLM can be understood as a token-and-memory operating system for LLM inference. Its main loop is:
+
+1. Receive requests.
+2. Track their complete lifecycle.
+3. Represent pending work as tokens.
+4. Allocate KV state in fixed-size physical blocks.
+5. Build a block table for every sequence.
+6. Reconstruct a runnable batch every iteration.
+7. Execute prefill and decode according to one token budget.
+8. Stream results.
+9. Reclaim or cache blocks.
+10. Repeat.
+
+Its main ideas are:
+
+- Continuous batching: rebuild the active batch every engine iteration.
+- Unified token budgeting: schedule prefill, decode, chunked prefill, and related work using one resource model.
+- PagedAttention: separate logical token order from physical KV-cache placement.
+- Chunked prefill: prevent long prompts from monopolizing an iteration.
+- Preemption: recover capacity when KV blocks are insufficient.
+- Prefix caching: reuse complete block chains for repeated prefixes.
+- Process separation: scale request handling, scheduling, and GPU execution independently.
+- SLO-aware tuning: optimize TTFT, ITL, tail latency, and goodput rather than unconstrained peak throughput.
+
+The central principle is, vLLM does not treat serving as repeatedly running a static batch. It continuously schedules token work and KV-cache blocks under changing latency, memory, and concurrency constraints.
