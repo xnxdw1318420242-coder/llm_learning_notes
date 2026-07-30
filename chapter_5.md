@@ -4892,7 +4892,7 @@ The output can be written as:
 
 $$
 o_i =
-\operatorname{softmax}
+softmax
 \left(
 [s_1,\ldots,s_J]
 \right)
