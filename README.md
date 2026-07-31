@@ -273,6 +273,14 @@
   
 ### **7. Prompt Engineering**
 
+**7.1 Zero-shot Prompting**
+
+**7.2 Few-shot Prompting**
+
+**7.3 Instruction Prompting**
+
+**7.4 CoT**
+
 ### **8. RAG**
 
 ### **9. Agent**
