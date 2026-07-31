@@ -142,6 +142,224 @@ The landscape of Large Language Model (LLM) evaluation is vast and constantly ev
 
 ## 6.2 Training Evaluation
 
+Evaluating a Large Language Model (LLM) during its training phase is fundamentally different from evaluating a finished model's downstream task performance. Training evaluation requires continuous, mathematically rigorous metrics to judge whether the optimization process is successfully advancing.
+
+During autoregressive training, the most direct indicator of progress is the negative log-likelihood on valid tokens. All subsequent aggregate metrics must stem from this fundamental definition. Autoregressive training generally minimizes token-level negative log-likelihood (NLL). For a batch of sequences, let the set of valid predicted positions be $\mathcal{M}$. The loss is defined as:
+
+$$\mathcal{L}_{\text{NLL}} = - \frac{1}{\vert{}\mathcal{M}\vert{}} \sum_{(b,t) \in \mathcal{M}} \log p_\theta(x_{b,t} \mid x_{b,<t})$$
+
+The set $\mathcal{M}$ explicitly excludes padding, prefixes used purely as conditions, and special positions that we do not wish to train on. The denominator must be the global number of valid tokens, not the batch size, maximum sequence length, or micro-batch count. A wrong denominator will change the gradient scale, and will also make the loss between different packing rates and different length batches impossible to compare.
+
+Because language models typically use the natural logarithm, the unit of NLL is a nat. If a base-2 logarithm is used, the unit is a bit. The relationship is simply a constant difference:
+
+
+
+$$\mathcal{L}_{\text{bit}} = \frac{\mathcal{L}_{\text{nat}}}{\ln 2}$$
+
+
+Training curves must state the logarithm base or explicitly state cross-entropy is used. Placing values with different bases on the same chart leads to massive apparent differences even when the model probabilities are identical.
+NLL is mathematically sound but not highly intuitive. To provide a more understandable metric, we take the exponent of the average NLL, resulting in Perplexity (PPL).
+
+$$\text{PPL} = \exp(\mathcal{L}_{\text{NLL}})$$
+
+PPL and NLL are monotonically equivalent; training and fitting usually use the more stable, additive NLL.
+
+Within a batch, sequences often have different lengths. If you average the loss per sequence first, and then average across sequences, short sequences and long sequences receive the same weight. Standard language modeling instead averages by token:
+
+$$\mathcal{L} = \frac{\sum_b \sum_t m_{b,t} \mathcal{L}_{b,t}}{\sum_b \sum_t m_{b,t}}$$
+
+(Where $m_{b,t}$ is the loss mask).
+If a product goal demands that every document be treated equally, document averaging can be used, but this explicitly changes the training or evaluation distribution. When reporting, it is best to provide both token-weighted and document-weighted results to avoid a massive number of short documents dominating the conclusion.
+
+In distributed training, every rank might have different valid token counts. The correct approach is to separately all-reduce the global loss sum and the token count, and then divide them. If you average the ranks first and then average them together, batches with more padding or incomplete sequences at the end will be overly weighted. The vocabulary parallel operation also requires cross-entropy to be calculated using the global maximum logit and global sum.
+Cross-entropy is calculated through log-sum-exp to avoid direct exponential overflow:
+
+
+$$\log \sum_j e^{z_j} = m + \log \sum_j e^{z_j - m}, \quad m = \max_j z_j$$
+
+
+Matrix multiplication can use BF16 or FP8, but the maximum value, reduction, and loss accumulation usually keep FP32. For long-duration validation sets, using FP64 accumulators or sufficient precision reduction can lower rounding error. If training loss adds z-loss, MoE balance loss, or other regularizers, pure NLL and the total objective should be recorded simultaneously. PPL can only be calculated from pure NLL.
+
+Short documents can be evaluated in one pass, but long documents must be chunked (windowed). The window overlap must provide enough context but cannot let the same token repeat its score. Assume a window length of $L$ and a stride of $S$. The first window can score all positions except the BOS. Subsequent windows only score the newly added $S$ positions, with the overlapping prefix acting purely as condition. If the overlapping area enters the loss calculation again, the same token will be scored repeatedly, and the denser the window, the greater the weight of the tokens near the middle of the document. Continuous text streaming evaluation allows a document to read the previous document's context, usually slightly lowering PPL, but the condition doesn't match natural semantics. Document-level evaluation resets KV Cache at the start of each document and inserts BOS/EOS consistent with training. For packing training, it also needs to be clear whether block-diagonal masking is used. If the training and evaluation boundary rules are inconsistent, PPL differences might come from protocol agreement, not model capability. Once the window protocol is unified, comparisons are constrained by the tokenization method. The number of tokens a string is cut into will directly alter token-level PPL.
+
+Different tokenizers cut the exact same string into a different number of tokens. When the vocabulary and chunking granularity change, the amount of information carried by a single token changes. Token-level PPL might rise or fall, but the numeric direction itself doesn't indicate better language prediction. Therefore, directly comparing PPL across tokenizers is usually meaningless. PPL is only a clean relative indicator under the same model family, the same tokenizer, and the same data preprocessing. To compare across tokenizers, you can normalize the NLL down to the original UTF-8 bytes to find the Bits Per Byte (BPB):
+
+
+$$\text{BPB} = \frac{\text{NLL}_{\text{nat}}}{N_{\text{byte}} \ln 2}$$
+
+
+Bits per character can also be used, but Unicode character definitions and normalization methods must be fixed. BPB maps different token cuts to the same byte unit, making it more suitable for cross-vocabulary comparison; but it still suffers from text normalization, whitespace, and encoding effects, so the evaluation pipeline must be based on the exact same original byte sequence.
+
+Relying solely on overall average loss hides regressions in small, specific domains. The data recipe and continued pretraining need domain, position, and frequency loss breakdowns. Overall validation loss is an average weighted by tokens. A massive web domain easily masks degradation in code, math, or low-resource languages. Maintain stable validation sets for each data domain and report NLL, PPL, token counts, and confidence intervals. When the data mixture changes, overall loss might drop while target domain loss rises; Domain breakdown curves can directly show where the training budget has been sent.
+
+Segmenting tokens by relative position or context length buckets reveals issues at sequence starts, long-distance dependencies, and truncation boundaries. Higher loss at the sequence start context is normal; a sudden spike in loss after exceeding the training length suggests the positional encoding extrapolation has failed. If the tail is abnormally low, check for boilerplate tail repetition, repeated EOS, or answer leakage.
+Segmenting by tokenizer frequency, numbers, code symbols, entities, whitespace, and special tokens locates hidden average differences. High-frequency punctuation contributes massively to tokens, so low-frequency entities have little impact on total loss. Numbers and random identifiers are naturally hard to predict, so they shouldn't just be considered dirty data; combining content source and downstream value judgment is needed. These slices explain differences between single checkpoints, while time curves judge if training continues to yield returns. Inflection points on the curve must align with learning rate and data events.
+
+Training loss is affected by current batch difficulty, learning rate, data domain, and dropout, causing it to fluctuate within a short window. Validation loss using fixed data and closed dropout is more suitable for checkpoint comparison. Curves should display raw values, moving averages, and data/scheduling events simultaneously. Over-smoothing might hide spikes, while too short a window makes trends hard to see.
+Scaling analysis often focuses on how much the loss drops for every unit increase in tokens or FLOPs. You can look at the local slope on a log-token axis:
+
+
+$$\Delta \mathcal{L} / \Delta \log D$$
+
+
+If the slope flattens out, it might mean the model is approaching the upper limit of the current recipe, or it could be learning rate over-decay, data repetition, or validation set noise. Only by combining learning rate, independent tokens, and domain loss can one determine to continue training, switch data, or enter a decay phase. Whether the curve is trustworthy depends on if the validation set is independent and stable. Web mirrors, code forks, and time leakage will all make validation loss overly optimistic.
+
+Validation sets should be isolated from training candidates at the document level, preferably by time, site, or repository, avoiding cross-set identical web mirrors and code forks. It represents the training mixture but also needs independent slices of important domains. A validation set that is too small gets drowned in sampling noise; too large and evaluation is expensive. A high-frequency small validation set can be used for online monitoring, and a large validation set for low-frequency confirmation. Tokens are highly correlated; treating every token as an independent sample introduces massive error. A more robust method treats the document as the bootstrap unit, repeatedly resampling documents to recalculate the token-weighted NLL. Comparing two checkpoints requires paired bootstrap to offset difficulty differences in the same document. Reporting confidence intervals along with the mean is the only way to judge if a loss difference of 0.001 is statistically stable. NLL doesn't just care about the highest probability answer; it punishes both errors and overconfidence. Models with the same task accuracy might have completely different probability mass.
+
+NLL is a strict probability score that punishes both errors and overconfidence. Accuracy only looks at whether the top candidate is correct; it cannot distinguish between an error made with 0.51 confidence versus 0.99 confidence. In multiple choice or single token event computation, reliability diagrams, ECE, and Brier scores are used. Lower PPL generally improves average probability modeling, but does not guarantee all tasks' confidence are calibrated.
+NLL scores every real token, generating or searching within the model's distribution. Small NLL improvements might concentrate on punctuation and common words, having little impact on long answer correctness; yet a probability shift on a key reasoning token could alter the whole trajectory. Therefore, loss is suitable for training monitoring and scaling fitting, while capability acceptance must be supplemented by downstream task generation metrics. The more complete the protocol, the easier implementation details create path deviation. The most reliable check is manually calculating a short sequence position-by-position. Includes labels not shifted right, padding ID participating in loss, averaging twice, different ranks directly averaging, overlap windows repeatedly calculated, dropout not closed during validation, EOS rules inconsistent, using regularization items for PPL, tokenizer version drift, and data preprocessing changes. The minimum unit test should be manual calculation of a short sequence's logits and NLL, and comparison against the framework output.
+
+Here is a metric comparison summary:
+
+- NLL: Suitable for Training Curves, Scaling. Requires same protocol or uniform normalization. Limitation: Weak intuitiveness.
+
+- PPL: Suitable for same tokenizer language modeling. Requires same vocabulary, boundaries, windows. Limitation: Incomparable across tokenizers.
+
+- BPB: Suitable for cross-tokenizer text modeling. Requires same original bytes and normalization. Limitation: Does not directly indicate task capability.
+
+- Domain NLL: Suitable for data recipe and forgetting. Requires stable domain tags and validation set. Limitation: Domain weighting requires separate determination.
+
+- Task Accuracy Rate: Suitable for capability acceptance. Requires fixed prompt and decoding protocol. Limitation: Discrete, high variance.
+
+A single PPL number is only meaningful with its tokenizer, window, boundaries, and aggregation method. Reports need to fix these conditions.
+A complete PPL evaluation should write out model checkpoint, tokenizer hash, data version, text normalization, window length, stride, document boundary, BOS/EOS, loss mask, logarithm base, aggregation method, valid tokens, and document count. Results should at least include overall NLL/PPL, domain NLL, position bucketing, and bootstrap intervals. A single PPL number lacking protocol is irreproducible and unsuitable for cross-project ranking.
+Training loss is often recorded online with dropout enabled, dynamic data sampling, and gradient accumulation; validation loss disables dropout and uses a fixed corpus. Their absolute values don't have to match; what's truly meaningful is their respective trend over checkpoints. If checking for overfitting, another fixed training subset loss can be computed identically under fixed boundaries, masks, and model modes, then compared with fixed validation loss. If switching tokenizers, sequence length, or data preprocessing mid-training, new curves should be built from the cut point; previous values shouldn't be forcibly merged.
+Final candidates need cross-checking by at least two independent implementations: training framework computing fixed batch NLL, offline evaluator reading same logits or checkpoint recalculating. Token-by-token differences expose right-shifts, masks, precision, and vocabulary parallel errors. A historical checkpoint should be fixed as a sentinel; if the sentinel score changes after code upgrades, protocol differences should be explained before evaluating the new model. Correctly aggregated NLL is the most stable and sensitive continuous metric in pretraining, while PPL provides a more intuitive equivalent expression. They are still constrained by tokenizer, boundary, window, and data distribution rules; divorcing them from a unified protocol for comparison, or directly equating low PPL with reasoning ability, will lead to erroneous conclusions. Loss and PPL are suitable for comparing probability modeling processes but cannot substitute task-level capability. Base evaluations require fixed prompt, decoding, and answer judgments.
+
+Evaluating a base model (which hasn't undergone instruction alignment) requires careful protocol design. Base models lack instruction alignment; evaluation cannot assume they understand chat templates. Tasks should minimize into clear continuation or conditional probability problems. Base models only accept prefixes and predict subsequent tokens, lacking instruction alignment, nor guaranteed chat role comprehension. Evaluation protocols should approximate pretraining goals: providing clear prefixes, comparing continuation probabilities, or fixed decoding generation. Directly applying a chat model's system/user/assistant template to a base model will introduce special tokens and formats it has never seen, and a low score does not necessarily mean a lack of knowledge or reasoning ability. A single average score cannot describe a base model. At minimum, it must cover language modeling, common sense and knowledge, reading comprehension, math, code, multi-language, long context, and safety boundaries, separating probability scoring and free generation. Each task category must record data era, contamination risk, answer format, and randomness. The goal isn't finding the prettiest total score, but judging what capabilities data, scale, and training stages each brought. The same capability can be invoked through different contexts.
+
+Zero-shot only provides task instructions or questions; Few-shot places several input/output examples in the context. Base models usually rely on in-context learning for task format, making Few-shot essential to reduce formatting errors. When comparing models, example sets, order, separators, and maximum lengths must be fixed. Example order alters recency, class priors, and usable context, so models cannot individually pick best orders for horizontal comparison. When the answer space is limited, directly comparing candidate probabilities is more stable than free generation. The scoring range must only cover the answer tokens.
+
+In Multiple Choice Probability Scoring, for a question $q$ and candidate answer $a_k$, the most direct score is the conditional log-likelihood:
+
+
+$$s_k = \log p_\theta(a_k \mid q) = \sum_{t=1}^{\vert{}a_k\vert{}} \log p_\theta(a_{k,t} \mid q, a_{k,<t})$$
+
+Select the candidate with the maximum $s_k$. Inputs should clearly separate question stem and answer, scoring only the answer token. If options use letter answers, probabilities like A, B tags should be compared; if the model writes full option text, length and word frequency enter the score. When scoring full text answers, the raw log probability naturally favors short answers because every new token's log probability is negative or zero. Average Log Probability:
+
+
+$$\bar{s}_k = \frac{1}{\vert{}a_k\vert{}} \sum_t \log p_\theta(a_{k,t} \mid q, a_{k,<t})$$
+
+
+But averaging might favor longer, locally easier expressions. Whether to use raw sum or length-normalized score depends on task definition and must be fixed across models. The most stable is prioritizing single-token option tags, while verifying the tokenizer slices the tags as expected. Models might naturally favor certain option letters or common text. A Pointwise Mutual Information (PMI) style correction subtracts the prior probability of the answer (given a null context) from the conditional score:
+
+$$s_k^{\text{PMI}} = \log p(a_k \mid q) - \log p(a_k \mid q_{\text{null}})$$
+
+$q_{\text{null}}$ retains task formatting but removes question content. Correction mitigates label frequency bias, but changes the metric's definition. Original and corrected results should both be reported, not just picking the one more favorable to the current model.
+
+In Generative Tasks and Execution Validation, probability scoring avoids output format issues, but free generation tasks must map text back to determinable answers. The parser itself becomes part of the evaluation protocol. Generative evaluation maps free text to task answers. Math might output derivation, units, and final numbers; code outputs Markdown fence; Q&A might bring explanations. Parsers must be fixed pre-evaluation and unit-tested on common formats. Loosely searching for the correct string from any position might incorrectly judge outputs with contradictory or enumerated multiple answers as correct; overly strict parsing will penalize equivalent expressions. Once parsing rules are fixed, generation budget determines how many chances the model has to find the right trajectory. Greedy, sampling, and self-consistency cannot mix denominators.
+
+Greedy decoding is deterministic, suitable for comparing single-pass accuracy; sampling reveals the model's distributional solutions, requiring fixed temperature, top-p, max tokens, and sample counts. Math and code self-consistency samples multiple trajectories then votes, but computation visibly increases. When reporting scores, generation budget must be reported; otherwise, a sample of 1 cannot be directly compared against a sample of 64.
+Math problems press reasoning and final answers into discrete correctness. Format normalization can handle equivalent spelling, but cannot fix model calculation errors. Besides final correctness, invalid formats, deduction lengths, and self-consistency curves under different sample counts can be recorded. GSM8K-like questions normally use exact match. Base models need suitable few-shot examples to output stably. MMLU covers multiple disciplines, typically multiple choice probability scoring; BBH contains complex symbolic/combinatorial tasks, usually few-shot chain-of-thought generation. Average scores use task macro-averages, avoiding domination by tasks with many samples. Discipline distribution must be checked: total improvements might all come from common sense, while math or law didn't change.
+Code tasks have an extra execution validation layer compared to text answers. Model output requires running tests in isolated environments, rather than string similarity. HumanEval provides function signatures and docs, models generate bodies, run through unit tests in isolated environments. Single correctness cannot describe sampling models; usually pass@k is used: from $n$ samples, $c$ pass, estimating the probability of at least one correct:
+
+
+$$\text{pass@k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}$$
+
+
+Only when $n \ge k$ can it be estimated stably. Generating fixed temperature, stop tokens, and per-question counts, executing with CPU, memory, network, and timeout limits. Code must run in containers or sandboxes, models cannot output accessing host environment. Code questions might appear in repos, tutorials, or derivatives; tests could be too weak. High pass@k could be algorithm capability, memory, or luckily passing weak tests. Training corpus string/AST checks, newer questions, adding hidden tests, and mutation tests should be done. Model comparison must unify language versions and dependencies, else environment discrepancies cause model errors. 
+
+Knowledge and reasoning capability are jointly affected by language and tokenizer. Only translating English doesn't represent native language capability. 
+
+In Multilingual Evaluation, merely machine-translating English questions into multiple languages mixes translation quality and cultural bias. It should cover native language tasks, parallel tasks, and cross-lingual transfer. Overall score uses language macro-averages, and lists high-resource vs low-resource languages. Tokenizer efficiency must be recorded: if the same content is chopped into more tokens in a certain language, it reduces the effective few-shot count and increases truncation on long tasks. Context length evaluation dimensions progress.
+
+In Long Context Capability, evaluation is divided into Retrieval, Localization, Integration, and Generation. Needle/passkey checks finding distant strings; multi-document QA demands distinguishing relevant/distracting docs; information integration requires combining multiple pieces of evidence; long generation must maintain structural and citation consistency. Evidence should be placed at different absolute/relative positions, plotting accuracy curves regarding length and position, not just testing one point at the maximum window's end.
+Fixed validation NLL is sensitive to checkpoint micro-changes, suitable for high-frequency monitoring; benchmark accuracy is discrete/expensive, suitable for low-frequency milestones. NLL can first observe if it continues dropping, then use key token milestones to map capability suites. If NLL improves but capability stagnates long-term, check data domains, prompts, task thresholds, and contamination, rather than assuming retraining more tokens fixes it.
+
+Even when a task coverage is broad, the prompt itself brings massive fluctuation. Templates need pre-fixing, with equivalent variants estimating robustness. Wording, spacing, newlines, option order, and example order can alter results. Strict reproducibility requires fixing prompt template hashes. To estimate robustness, define multiple equivalent templates and report mean, standard deviation, and worst-case; you cannot pick the best template after seeing results. A score measured by a single template is a 'model + template' system, not the pure model capability divorced from the interface. Multiple choice models might favor specific positions. Can construct multiple option permutations for each question, keeping correct content unchanged, observing accuracy and consistency. If permuting answers drastically changes results, the model uses position priors or scoring protocols. Complete permutation is expensive; balanced latin squares can be used, making each option appear evenly at each position. Multi-template and multi-task bring more choices, making it easier to overfit the test set. Stop points should be decided by internal development sets.
+
+Frequently selecting the best checkpoint on a public benchmark turns the test set into a validation set. During pretraining, internal validation and development tasks should decide stop points, with the final benchmark running only at milestones. If multiple runs are needed, report trial counts/rules, keeping truly untouched holdout for final confirmation.
+Standard error of accuracy relates to sample count and real probability. Comparing models, paired bootstrap or McNemar's test on the same questions is more powerful than independent intervals. Generative tasks include sampling variance; should repeat with random seeds.
+
+Micro-averaging weights by sample count, dominating tasks with many samples; macro-averaging averages task scores then equally averages. Multi-disciplinary/lingual suites usually prioritize macro-averages, while providing per-item details. If business areas have clear traffic distribution, business weighting can be used, but cannot replace interpretable macro-averaging. When a model times out, outputs excessively long text, fails to parse, context overflows, or has runtime errors, it must be counted as a failure, with individual causes tallied.  Deleting failed samples from the denominator will artificially raise the score. Code tasks also distinguish compile errors, runtime errors, timeouts, and wrong answers; these distributions guide data/training improvements.
+Instruction fine-tuning alters output formats, refusal tendencies, and task adherence, commonly improving zero-shot generation significantly, but might alter base probability scoring. Pretraining quality evaluation relies primarily on base checkpoints, compared under same tokenizers/architectures; post-training uses chat templates and safety protocols. Mixing both results into one ranking prevents judging if improvements came from pretraining or alignment
+
+Even with strict statistical protocols, training data and test question overlap causes score distortion. Contamination needs separate auditing independent of capability evaluation. When models score abnormally high, it's easy to confuse data contamination, parameter memorization, and training efficiency. They require different evidence and cannot substitute each other.
+
+Data contamination is training and evaluation sets overlapping; memorization is parameters retaining specific training content; training efficiency turns hardware time into valid tokens/capabilities. The three interact: repeated data increases memory, might briefly lower loss; contamination makes evaluation scores artificially high, looking like efficiency gained.  Only by placing the data lineage, model behavior, and system metrics into the same training record can one judge whether a capability comes from generalization, memorization, or evaluation leakage.
+
+Contamination auditing starts from determinable literal overlap. 
+
+1. Exact Match: Simple hash or exact string matching after normalization. It is suitable for discovering full-text duplication, but misses partial and paraphrasing.
+
+2. Precise Contamination: The simplest check is exact matching normalized full-text hashes or substrings. Normalization typically unifies Unicode, case, whitespace, newlines, and punctuation, but must simultaneously keep raw text hashes, preventing over-normalization from merging different code/numbers. Exact matching suits complete questions, answers, and code functions, fast with low false positives, but cannot find partial copies or slight paraphrasing.
+Evaluating sample fragments of length $n$ continuous tokens or character segments, then calculating training doc coverage ratio. GPT-3 used 13-gram collision detection; PaLM used 8-gram and considered 70% ratio as contamination. LLaMA 2 considers overlap of more than 10 tokens with a maximum of 4 positional differences as contamination, layered by covered token ratio. Lower thresholds increase recall but risk flagging common templates as contamination.
+Multiple choice removes option labels, randomizes options, matches stems/answers; code strips comments, formats, parses AST; math normalizes numbers, formulas, LaTeX. Must check stems, answers, and explanations separately, as seeing stems without answers differs from full exposure. Reports should layer by overlap types, not just flattening differences with a boolean tag. n-gram covers slight editing, but translation/paraphrasing bypass literal matches.
+
+3. Semantic Contamination: Paraphrasing, translation, summarizing, and format conversion escape n-gram. Can use text vectors for KNN, then more precise Cross-Encoders or manual review; code can combine AST/control flow similarity. Semantic retrieval suits candidate generation, not direct conviction, because common sense, algorithms, and legal texts are naturally similar. High-risk samples need to have their specific overlapping content and time source reviewed. 
+Evaluation sets might not enter training originally, but their explanations, leaderboard discussions, translations, error analyses, or derivatives in tutorials have. Conversely, only the original dataset is in training, while evaluation uses slightly modified versions, also counting as derivative overlap. Data cleaning maintains exclusion lists of benchmark names, aliases, repos, mirrors, and common solution sites, running on both ends of crawling and final corpus.
+
+4. Time Slicing: Using evaluation release dates or model data cutoff dates limits subsequent web leakage. Stronger design uses new, unreleased questions created after training cutoff. Time slicing isn't sufficient: old questions might be released later, web time can be unreliable, Common Crawl fetches aren't equal to creation time. Thus, time is a single evidence piece, requiring content matching.
+During training, screening benchmarks on candidate pools has the lowest cost; filtering, deduplication, and reshuffling on data must be re-checked at the final shard, as joining flows might reintroduce samples. Post-training, running high-variance anomaly retrieval and comparing contaminated vs clean subsets. If only checking original URL lists before release, cannot cover compression packs, mirrors, and composite data leaks.
+Data sources replaced with teacher models don't erase the contamination chain. Teachers can repeat questions/answers seen in their training.
+
+5. Synthetic Data Contamination: Training data generated by teacher models might replicate benchmarks they saw. Even if student models' raw corpus lacks test questions, the synthetic chain brings in answers. Pre-generation checks prompt sources, post-generation matches questions, answers, explanations again, recording teacher models, prompts, and sampling parameters. "Content generated by model != content independent of evaluation."
+Detection results cannot be compressed into a boolean value. Stem, answer, explanation, and general template risks are completely different.
+
+6. Contamination Layered Reporting: Can group samples into no match, general terms only, stem overlap, stem+option overlap, answer/explanation overlap, near-overlap. Separately report sample counts/scores, giving results excluding high-risk samples. Contamination samples scoring higher than clean samples is a warning, but no difference doesn't negate the memory.
+
+Data contains overlaps, only meaning the model had a chance to touch it; whether parameters retain it requires observing model behavior. Conversely, models might remember non-evaluation training text.
+
+Memorization is not Contamination: Models can memorize ordinary training text while it doesn't appear in evaluation; evaluations can be contaminated, but lacking capacity/training count means no memory. Memory must be tested via model behavior; contamination measures data source. The two intersect to explain scores, cannot "find overlap" to replace "model extraction testing".
+Parameters contain segment info, not always extractable. Extractability demands a prompt and decoding strategy yielding training samples; verbatim replication demands output matching training content strictly. Stronger models, more repetition, and more certain prefixes usually increase extractability. Temperature, candidate number, and prompt length alter success rates, so tests must fix attack budgets.
+The most direct way to measure memory is giving training text prefixes and checking if suffixes are extracted verbatim. Unseen similar text acts as a control.
+
+Prefix Continuation Testing is, given training document prefixes, demand model writes suffixes, computing exact match, longest common substring, or token overlap. Must set untrained similar text as control, bucketing by document repetition, length, rarity, and time. High overlap on common short phrases doesn't prove memory; long, rare, verbatim suffixes are stronger evidence.
+Real corpus occurrence counts are uncontrollable.
+
+Canary and Exposure means, inserting random, low-probability canary strings into controlled training, measuring their rank given by the model. If canary rank $r$ in candidate space size $|R|$, exposure is:
+
+$$ \text{exposure} = \log_2 |R| - \log_2 r $$
+
+High exposure means model ranks canary abnormally high. Canaries must be synthetic and lack personal info, insertion frequency controlled. Suits comparing memory tendencies of different recipes, doesn't mean real web sensitive info has identical risks.
+Membership inference attempts judging if a sample participated in training. Simple methods use train sample loss being lower, but hard examples/distribution differences cause false positives. Using neighbor text, compression ratios, or reference model calibration has difficulty. Membership inference gives statistical risks, cannot definitively assert training set presence for a single low-loss sample.
+The more a document appears, the steeper the gradient repeatedly points to the same sequence, increasing verbatim memory probability. Deduplication not only lifts valid tokens but lowers privacy/copyright risks. Must record precise, near, template, and intra-epoch repetition; overall repetition might be low, yet few sensitive docs repeated hundreds of times.
+Larger parameter counts accommodate more details; more tokens offer more exposure. Memory isn't just in large models; small models also firmly remember high-repetition sparse strings. Comparison requires fixing data/training counts, or clearly different compute-optimal recipes. Checking final extraction quantities must control attack sampling budgets, as larger budgets naturally find more samples.
+Memory risks are severest involving personal/credential info. Governance must start before corpus entry.
+
+Emails, phones, addresses, IDs, medical records, and credentials must be detected, deleted, or anonymized before corpus entry. Logs keep anomaly patterns recording hashes/source IDs, avoiding monitoring systems replicating sensitive full texts. Pre-release prefix extraction, sensitive pattern scanning, and red-teaming; discovering high-risk outputs traces data sources, evaluating deletion, retraining, or targeted forgetting.
+Deduplication, PII filtering, lowering repetition/differential privacy lower memory. Strict differential privacy gives formal bounds, but increases noise/compute on large LLMs, potentially lowering capacity. Output filtering only stops known patterns, cannot delete parameter content. You cannot treat refusing to answer on the inference side as a substitute for training data governance.
+
+Whether contamination/memory answers capability is trustworthy, efficiency metrics answer how many resources these capabilities cost. Most basic system caliber is valid tokens processed per second.
+
+- Throughput: System's most direct speed metric is tokens/s:
+  
+$$ \text{throughput} = \frac{\text{global effective tokens}}{\text{wall-clock seconds}} $$
+
+Numerator must be valid tokens participating in loss, padding, masked prefixes, and overlap regions must be reported separately. Throughput must annotate GPU count, model, precision, sequence length distribution, and parallel config. Just saying cluster total tokens/s cannot judge single-card efficiency or scaling loss.
+Defining the ratio of valid to input tokens:
+
+$$ u_{\text{token}} = \frac{N_{\text{loss}}}{N_{\text{input}}} $$
+
+Packing increases this ratio; prefix-LM or span tasks might intentionally mask parts. High token utilization doesn't guarantee data quality; repeated/template tokens might fill sequences. Should simultaneously report independent documents, deduplicated tokens, and per-domain repetition epochs.
+Tokens/s relies on hardware/sequence distribution, cross-config needs algorithmic computation. Dense models can use parameter/token counts for first-order estimation.
+
+- Algorithmic FLOPs: Dense Decoder training computation roughly estimated as $6ND$, $N$ non-Embedding parameters, $D$ tokens. More precise calculation layers QKV, attention, FFN, vocab projection, backward, adding activation recomputation. Long context attention quadratic terms are significant; MoE uses activated expert per token, not total expert parameters.
+Combining theoretical computation and real throughput gives model FLOPs utilization. It reflects communication, data wait, and system bubbles into end-to-end results.
+
+- MFU (Model FLOPs Utilization): Compares theoretical model FLOPs to hardware peak:
+  
+$$ \text{MFU} = \frac{C_{\text{model/token}} \times \text{tokens/s}}{N_{\text{GPU}} \times F_{\text{peak/GPU}}} $$
+
+Peak $F_{\text{peak}}$ must correspond to actual precision and allowed sparsity. MFU includes communication, data wait, kernel bubbles, checkpoint losses, suiting end-to-end efficiency. Different projects have different FLOP formulas; MFU shouldn't be directly compared horizontally.
+Hardware FLOPs Utilization tallies actual equipment FLOPs, including activation recomputation/extra computation. If turning on recomputation, HFU can be high while GPUs compute; MFU drops because same model forward repeats. MFU is closer to how much hardware capability was translated into target model computation, while HFU is closer to equipment how busy. Reporting both separates idle running vs necessary VRAM trade-offs.
+Single-machine utilization being high doesn't mean expanding to clusters remains efficient. Parallelism adds communication, bubbles, and slow-node waits.
+
+- Scalability Efficiency: Expanding GPU count from $G_1$ to $G_2$, strong scaling efficiency:
+  
+$$ \eta = \frac{T(G_2)}{T(G_1)} \frac{G_1}{G_2} $$
+
+$T(G)$ is total throughput. Expanding data parallelism increases all-reduce, tensor parallel adds intra-layer communication, pipeline introduces bubbles, expert parallel introduces all-to-all. Parallel choices must balance VRAM/communication, cannot just pursue max GPUs.
+Each step tears into data wait, forward, backward, gradient communication, optimizer, pipeline bubble, checkpoint. If total time rises, break down to judge length distribution, network, storage, or kernel. Record P50, P95, slow ranks, not just averages; few stragglers make all devices wait synchronously.
+Algorithmic FLOPs describe target work, GPU hours describe actual resources. Faults, validation, rollbacks enter this caliber.
+
+- GPU Hours and Failure Recalculation: Actual training cost is allocated GPUs multiplied by wall-clock time, including warmup, validation, checkpoints, failure wait, rollback. Algorithmic FLOPs describe target computation, GPU hours describe real resources. The gap is system/operations cost. Publishing budgets must state if it includes failed runs, wind tunnels, data processing, else cost calibers mismatch.
+Synchronous saves pause training, asynchronous requires host memory/network, both affect throughput. Record fast size, duration, blocking time, compression/upload time, and frequency/recovery windows upon failure. Preserving less frequent short snapshots drops MFU. Optimal interval depends on failure rate/save performance.
+GPU hours aren't directly equivalent to energy; devices, power limits, cooling, utilization differ. More complete reports include training device power integral, datacenter PUE, carbon intensity. Lacking precise metering, estimating via equipment/range, cannot use device TDP times time pretending it's precise.
+
+- Capability Cost & Unified Reporting: Systems running fast is intermediate; ultimately must compare time/resources reaching same loss/capability threshold.  Speed ultimately lands on capabilities. Can plot benchmark/validation loss against accumulated FLOPs, GPU hours, training tokens. A recipe with higher tokens/s might need more tokens for same loss; time-to-quality might be worse. The most valuable efficiency metric is the wall-clock time and total resources required to reach a predetermined capability threshold, not just the peak step throughput. Contamination, memory, efficiency measured separately need aligning to same checkpoint and token milestone. Only then judge where score growth came from. Data side records screening, filtering, deduplication, final independent tokens, contamination versions, high-risk samples; Model side records validation NLL, layered contamination scores, prefix extraction, canary exposure; System side records FLOPs caliber, effective tokens/s, MFU/HFU, GPU hours, failure recalculation, checkpoints, energy. Three tables using same checkpoint/token milestones build causal chains.
+Contamination audits protect evaluation credibility, memory tests reveal specific training retention, unified efficiency calibers explain real resources spent. Only deduplicating strings, reporting peak tokens/s, or attributing high benchmark scores directly to generalization, cannot support reliable pretraining conclusions.
+
 ### 6.2.1 Probabilistic Probe
 
 When training and evaluating Large Language Models (LLMs), standard automated benchmarks might not always capture the nuanced, specific capabilities or facts we want the model to learn. To address this, engineers utilize a highly targeted technique known as the Probabilistic Probe. The fundamental motivation behind a Probabilistic Probe is precision. Sometimes we want to "precisely observe whether a model has learned a certain fact or how much probability it assigns to a specific sentence". It is a highly specialized tool designed to observe a very specific capability of the model. The underlying logic is incredibly simple: observe whether the probability of a specific token or sentence increases over time. However, this precision comes with a major engineering trade-off: these probe test sets cannot be easily generated in bulk. They typically require trainers to construct them manually, item by item, to ensure they exactly measure the intended metric. Conducting a Probabilistic Probe involves a strict, manual two-step process:
