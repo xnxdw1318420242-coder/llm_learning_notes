@@ -5082,4 +5082,379 @@ Its main ideas are:
 - Process separation: scale request handling, scheduling, and GPU execution independently.
 - SLO-aware tuning: optimize TTFT, ITL, tail latency, and goodput rather than unconstrained peak throughput.
 
+
 The central principle is, vLLM does not treat serving as repeatedly running a static batch. It continuously schedules token work and KV-cache blocks under changing latency, memory, and concurrency constraints.
+
+The earlier sections explained how vLLM manages requests, token budgets, KV-cache blocks, scheduling, chunked prefill, preemption, and prefix caching. The remaining pieces describe how vLLM handles multiple candidates that share one prompt, speculative decoding, multi-GPU and multi-replica serving, disaggregated prefill and decode, and production tuning, benchmarking, and observability. A single prompt may generate several candidate sequences. Examples include parallel sampling, beam search, and best-of-n generation. Before the candidates diverge, they have exactly the same token history and therefore exactly the same KV cache. A naive implementation would copy the entire prompt KV cache once for every candidate. If there are many candidates, memory use would grow approximately linearly with the candidate count. PagedAttention avoids this by allowing several logical block tables to point to the same physical KV blocks. Each physical block maintains a reference count indicating how many sequences currently use it.
+
+Suppose several candidate sequences share a common prefix. Their logical block tables can all reference the same physical blocks. As long as those blocks are read-only, no copying is required. The system only needs to create a private copy when one candidate attempts to modify a shared block. This is copy-on-write, or COW.
+
+Let physical block $\(p\)$ have reference count $\(r_p\)$. When a branch wants to write into $\(p\)$:
+
+- $\(r_p > 1\)$. The block is shared. The system:
+
+1. Allocates a new physical block $\(p'\)$.
+2. Copies the valid slots from $\(p\)$ into $\(p'\)$.
+3. Changes that branch’s block-table entry from $\(p\)$ to $\(p'\)$.
+4. Decrements the old block’s reference count:
+
+$$
+r_p \leftarrow r_p - 1.
+$$
+
+5. Writes the new token into $\(p'\)$.
+
+- $\(r_p = 1\)$. The branch is the only owner. It can write into the block in place. The copy is limited to one KV block, not the entire sequence prefix.
+
+Copy-on-write transforms “sharing until divergence” into block-table updates, reference-count updates, and at most one block copy at the divergence point. The memory cost of a sampling tree is therefore closer to one copy of the shared prefix blocks plus private blocks after branches diverge. It is not one complete prompt cache per candidate. This resembles operating-system fork, where several processes initially share physical pages and copy a page only when one process modifies it. In vLLM, however, the copy unit is a KV block.
+
+Beam search repeatedly expands candidate sequences, keeps the best candidates, and prunes less promising candidates. Copy-on-write helps at each step. When a candidate is pruned, its private blocks can be released immediately. Shared blocks only have their reference counts decremented. When a new candidate is created from an existing branch, it inherits the parent’s block table. Reference counts on inherited blocks increase. Only the final shared block may need copying when the child writes a different token. Therefore, beam candidates can share most of their history even while the beam structure changes over time.
+
+Copy-on-write is most beneficial when the prompt is long, many candidates are generated, candidate outputs share a long prefix before diverging, and beam search retains related branches for several steps. Its benefits are smaller when candidates diverge almost immediately, the block size is large relative to the shared region, every output is very short, and the number of candidates is small. Copy-on-write only reduces memory duplication. It does not eliminate the model computation required to decode a different next token for each candidate. Parallel sampling still requires model execution for every active candidate.
+
+Reference counts are not merely a memory optimization. They define whether a block may be modified in place, copied, released, or reassigned. Several errors are dangerous. 
+
+- Releasing too early. If a reference count reaches zero while another branch still uses the block, that block may be reallocated and overwritten.
+
+- Leaking a reference. If a finished branch does not decrement its references, blocks remain permanently unavailable.
+
+- Incorrect tail metadata. If the tail block’s filled count or COW order is wrong, one branch may overwrite another branch’s data.
+
+- Asynchronous execution hazards. A block cannot be reclaimed merely because the Python request object says the branch has ended. The system must wait until the GPU has finished all reads involving that block.
+
+Autoregressive decoding usually requires one serial target-model step for each generated token. Speculative decoding tries to reduce the number of target-model serial steps. The idea is:
+
+1. A proposal mechanism suggests several candidate tokens.
+
+2. The target model verifies those candidates in one parallel forward pass.
+
+3. The system accepts the longest valid prefix.
+
+4. At the first rejected position, generation resumes according to the corrected target distribution.
+
+The acceleration comes from accepting several tokens during one target-model verification step. It does not come from skipping target-model verification. Speculative decoding can remain lossless if the acceptance rule is correct, rejection sampling is correctly implemented, or continuation after rejection follows the target distribution. Therefore, a correct speculative decoder can preserve the output distribution of ordinary target-model sampling. The speculative model proposes. The target model remains the authority.
+
+Suppose:
+
+- The proposer suggests $\(k\)$ tokens per round.
+- An average of $\(a\)$ proposal tokens are accepted.
+- Drafting takes time $\(T_d\)$.
+- Target verification takes time $\(T_v\)$.
+
+A rough efficiency indicator is:
+
+$$
+\eta \approx \frac{a+1}{T_d+T_v}.
+$$
+
+The extra $\(1\)$ represents the token produced by the target model after:
+
+- A rejection boundary, or
+- Acceptance of the entire proposal
+
+depending on the exact protocol. This is only a rough indicator because implementations differ.
+
+Increasing k, the number of proposed tokens, may increase the number of tokens accepted per verification step. However, a larger k also increases draft cost, verification-batch size, wasted work when acceptance is low, and temporary token and KV requirements. Therefore, a larger proposal length is not automatically better. The correct value depends on acceptance probability, draft latency, verification efficiency, memory overhead, and request concurrency. Acceptance is often lower when the target model is difficult to predict, sampling temperature is high, sampling constraints are complex, or when the proposer differs substantially from the target model. Low acceptance can turn proposal generation into pure overhead. A system should not enable speculative decoding merely because the feature exists.
+
+Several speculative strategies are possible.
+
+- Draft model. A smaller auxiliary model proposes tokens. Extra states include additional model weights, draft KV cache, or draft scheduling state. The draft model must be substantially faster than the target while remaining highly aligned with it. Drafting cost may cancel the benefit from accepted tokens. The main benefit condition is the target architecture supports the method and acceptance is high. The main risk is that compatibility and deployment complexity.
+
+- EAGLE, MTP, or related auxiliary modules. These methods use auxiliary heads, additional prediction modules, and architecture-specific multi-token prediction. Extra state is a specialized head or auxiliary model component. Main
+
+- N-gram or suffix matching. This method proposes tokens from repeated text patterns without loading a full draft model. The extra state is token-matching structures. The main benefit condition is that the workload contains repeated content, such as source code, long documents, and repeated templates. The main risk is that it cannot predict genuinely new content, so benefits are limited when repetition is low.
+
+When choosing a speculative method, the following should be considered:
+
+- Acceptance rate
+- Draft latency
+- Additional GPU memory
+- Additional KV state
+- Target verification efficiency
+- Architecture compatibility
+- Sampling support
+- Workload repetition
+
+A more accurate proposer may still be slower overall if its own cost is high. A very cheap proposer may still be useless if acceptance is too low.
+
+The vLLM scheduler must budget for both proposal work and verification work. It must also ensure that:
+
+- Accepted tokens are committed to the target sequence’s KV cache.
+- Rejected proposals do not contaminate valid target KV blocks.
+- Multi-token acceptance across a block boundary updates the tail-block filled count correctly.
+- Temporary proposal state is reclaimed safely.
+
+When speculative decoding is combined with prefix caching, LoRA, structured output, tensor parallelism, and sampling constraints, the compatibility matrix becomes more complex than ordinary greedy decoding.
+
+Three important optimizations in vLLM target different bottlenecks. Speculative decoding reduces serial target-model decode depth. PagedAttention improves KV address management and capacity utilization. Prefix caching avoids repeated prefill work. They can be enabled together, but their benefits do not multiply automatically. For example, if the target model is already saturated by a large decode batch, verification may add more work per iteration without increasing overall throughput. Speculative decoding is often more useful for reducing single-request latency at low or moderate concurrency.
+
+A complete evaluation should report:
+
+- Average accepted length
+- Acceptance-rate distribution
+- Number of target-model steps
+- Draft time
+- Verification time
+- ITL percentiles
+- Total goodput
+- Additional memory use
+
+This distinguishes a real reduction in serial target steps from a lucky cache or short-example result. Do not assume speculative decoding is always faster. Low acceptance, high concurrency, unsupported sampling behavior, or limited memory can make proposal generation pure overhead. A production A/B test should preserve:
+
+- Input distribution
+- Output-length distribution
+- Stop conditions
+- logprobs
+- Random-seed semantics
+- Sampling configuration
+
+When one GPU cannot hold the model, the model must first be distributed using model parallelism. When one replica already satisfies latency requirements but lacks aggregate throughput, more independent data-parallel replicas can be added. The three primary parallelism dimensions are tensor parallelism, pipeline parallelism, and data parallelism. Tensor parallelism divides each layer’s weights and matrix operations across several GPUs. Attention and MLP boundaries usually require collective communication. Therefore, collective latency enters the critical path of each generated token. Tensor parallelism is useful when a model cannot fit on one GPU, when multiple GPUs have high-speed interconnects, or when the reduction in per-GPU model state justifies the communication. Excessive tensor parallelism can increase single-request latency because every layer invokes distributed communication. Pipeline parallelism divides model layers into stages. Activations move from one stage to the next through point-to-point communication. It can be useful when a model must span several nodes, when tensor parallel groups should remain within high-bandwidth domains, or when the model is too deep or large for one tensor-parallel group. Its major online-serving drawback is pipeline bubbles, especially with small or irregular batches. Pipeline stages should be balanced using more than layer count. Balance should account for compute per layer, KV-cache occupancy, special modules, communication, or memory use. Data parallelism creates complete executable replicas. Each replica handles different requests independently. Its primary purpose in serving is to increase aggregate request throughput. Unlike training data parallelism, there is no per-step gradient synchronization; Replicas do not need AllReduce for model updates; and the main problem is request routing and load balancing. Data parallelism is therefore outside the critical path of one request, while tensor and pipeline parallelism are inside it. Let:
+
+- $\(G\)$ be the total GPU count.
+- $\(D\)$ be the data-parallel degree.
+- $\(TP\)$ be the tensor-parallel degree.
+- $\(PP\)$ be the pipeline-parallel degree.
+
+A common dense deployment satisfies:
+
+$$
+G = D \times TP \times PP.
+$$
+
+A useful planning procedure is:
+
+1. Choose the smallest $\(TP \times PP\)$ that can hold:
+
+   - Model weights
+   - KV cache
+   - Required workspace
+
+2. Use the remaining GPUs to increase $\(D\)$.
+
+This is not an absolute rule. Other model types may require:
+
+- Context parallelism
+- Expert parallelism
+- Data-parallel attention
+
+But it prevents a common mistake: Increasing tensor parallelism merely to occupy more GPUs, even though the model already fits, can place unnecessary collectives in every token’s latency path.
+
+Tensor-parallel groups should ideally remain inside a high-bandwidth domain such as NVLink and NVSwitch. Cross-node scaling may be more suitable for pipeline parallelism and data parallelism. For mixture-of-experts models, attention and routed experts may use different parallel mappings. For example:
+
+- Attention may be data-parallel.
+- Experts may use expert or tensor parallelism.
+- Token dispatch and combination may require All-to-All communication.
+
+In such systems, rank placement and network topology directly affect tail latency. Serving expansion should distinguish:
+
+- Enlarging one request’s execution domain. Tensor and pipeline parallelism do this. They allow one request to use several GPUs. Their communication lies on the request’s critical path.
+
+- Adding independent request execution domains. Data parallelism does this. It creates more replicas that can process different requests concurrently. A router assigns requests to replicas. When one GPU can already hold the model, low-latency serving often prefers smaller model-parallel degree or larger data-parallel degree. When the model cannot fit on one GPU, use only the model-parallel degree necessary to make it executable.
+
+An internal data-parallel load balancer may inspect running-request count, waiting-request count, or rank health. However, a short queue does not necessarily mean more free KV capacity, better prefix-cache locality, or less expensive requests. A simple external round-robin policy may distribute identical prefixes across several replicas and reduce cache locality. More advanced production routing may consider request length, model or LoRA identity, prefix affinity, KV-cache water level, or replica health. But increasingly complex routing requires more state synchronization, failure handling, and operational complexity.
+
+A useful production design treats each data-parallel replica as a clear capacity unit, failure domain, and scaling unit. This allows replicas to be scaled independently, drained independently, upgraded gradually, and dedicated to long or short workloads. Admission control can then limit active tokens per rank. API-server processes may also scale independently to handle more HTTP connections, tokenization work, or streaming sessions. The multiprocess V1 architecture helps separate these scaling dimensions.
+
+Parameters such as max_num_seqs commonly apply per data-parallel rank, not to the deployment as a whole. Treating a per-rank limit as a global limit can make total capacity grow unexpectedly with D. For example, if each of D ranks allows S active sequences, deployment-wide capacity may approach D×S. That affects KV demand, CPU load, API connections, and queueing. Capacity documentation should explicitly distinguish per rank, per replica, and deployment-wide limits.
+
+In a mixed deployment, prefill and decode use the same GPUs. This simplifies scheduling and avoids cross-instance KV transfer. However, the two phases compete for different resources:
+
+- Prefill favors large GEMMs and compute throughput
+- Decode favors predictable iteration time, high concurrency, and memory bandwidth
+
+Disaggregated prefill places these phases in different vLLM instances. A typical workflow is:
+
+1. A request is sent to a prefill instance.
+2. The prefill instance processes the prompt.
+3. It generates prompt KV cache and potentially the first token
+4. KV block metadata and KV data are transferred to a decode instance.
+5. The decode instance maps transferred blocks into its local block table.
+6. Decode continues from the already computed token position.
+
+The proxy or orchestration layer must preserve request ID, sampling parameters, streaming connection, cancellation state, and retry state.
+
+The essential handoff is not merely forwarding text. It is transferring multi-layer key/value blocks. After prefill, a connector exposes the KV data through a channel discoverable by the decode side. The decode instance uses a lookup key to locate the corresponding blocks, acquires the KV data, maps it into its local block table, and resumes generation after the already computed positions. The transport abstraction may involve components such as connector, lookup buffer, and pipe. The physical implementation may use GPU RDMA, host memory, shared cache, and external KV systems.
+
+Let:
+
+- $\(T_p\)$ be the prefill computation time.
+- $\(T_x\)$ be the KV-transfer time.
+- $\(T_d\)$ be the first-token preparation time on the decode side.
+- $\(T_{\text{queue},p}\)$ be the prefill-side queueing time.
+- $\(T_{\text{queue},d}\)$ be the decode-side queueing time.
+
+Then first-token latency is approximately:
+
+$$
+T_{\text{TTFT}}
+\approx
+T_{\text{queue},p}
++
+T_p
++
+T_x
++
+T_{\text{queue},d}
++
+T_d.
+$$
+
+Disaggregation is useful only when the benefits from:
+
+- Resource isolation
+- Better queueing behavior
+- Better phase-specific tuning
+
+are greater than:
+
+- KV-transfer cost
+- Two-queue overhead
+- Additional failure-handling overhead
+
+Long prompts increase both prefill computation and KV-transfer volume. Therefore, high-speed interconnects and batched transfer matter. Prefix-cache locality also becomes important. If transferred KV first lands in CPU memory or remote storage, transfer latency may eliminate the benefit of separating the phases.
+
+The primary goal is not automatically higher total throughput. It is to control different resource curves independently prefill pool for TTFT and compute-heavy prompt processing and decode pool for ITL and steady streaming. The prefill pool can be tuned for large GEMMs, long prompts, and large token budgets. The decode pool can be tuned for high sequence concurrency, stable iteration duration, and low ITL. The pools can also scale independently as traffic composition changes.
+
+A production disaggregated system must handle transfer not completed, missing KV blocks, decode-instance failure, client cancellation, timeout, duplicate request IDs, partial transfer, retries, instance restart, and version mismatch. A fallback may recompute prefill on the decode side, but this changes SLO behavior, cost, and load distribution. The system must define whether repeated requests are retried, recomputed, failed, and routed elsewhere. Disaggregation may help when:
+
+- Occasional long prefill requests disrupt decode ITL.
+- Prefill and decode require different GPU types.
+- They need different parallel configurations.
+- The prefill side benefits from concentrated prefix caching or KV offload.
+- The decode side needs stable high-concurrency operation.
+
+It can turn one mixed resource curve into two more explicit capacity pools. Disaggregation may not improve performance when:
+
+- KV transfer is slow.
+- Both pools are lightly loaded.
+- The mixed scheduler already satisfies the SLO.
+- Transfer failures or orchestration overhead dominate.
+- Prefix locality is lost.
+- The additional queueing exceeds the isolation benefit.
+
+It should not be presented as guaranteed throughput improvement because it adds one additional KV movement. Disaggregated prefill may remain experimental depending on:
+
+- vLLM version
+- Connector implementation
+- Backend
+- Feature combination
+
+Before production deployment, validate:
+
+- KV checksum or length
+- Timeout cleanup
+- Duplicate request IDs
+- Partial transfer handling
+- Instance restart behavior
+- Cross-version compatibility
+- Tenant isolation
+- Failure semantics
+
+A successful normal-path benchmark is not sufficient.
+
+Let:
+
+- $\(\lambda_p\)$ be incoming prompt tokens per second.
+- $\(\lambda_o\)$ be incoming output tokens per second.
+
+The prefill and decode pools should be sized according to the effective token rate each can sustain while satisfying its own SLO. They should not simply be assigned GPUs in proportion to request count. Different workloads may produce very different ratios:
+
+- Reasoning workloads may have
+
+$$
+\lambda_o \gg \lambda_p.
+$$
+
+- RAG workloads with long documents may have
+
+$$
+\lambda_p \gg \lambda_o.
+$$
+
+The optimal pool ratio can therefore change by product or workload.
+
+Production tuning should begin with a stable baseline. Change variables in layers.
+
+1. Layer 1: fix model semantics. Keep these constant: Model revision, tokenizer, data type, quantization, maximum model length, sampling behavior, and structured-output behavior.
+
+2. Layer 2: fix workload. Keep these constant: Input-length distribution, output-length distribution, arrival process, concurrency, warm/cold prefix mix, and multimodal ratio.
+
+3. Layer 3: tune the serving system. Then adjust scheduler, KV-pool size, attention backend, CUDA Graph, parallel degrees, and replica count. Otherwise, one speed change may simultaneously come from shorter outputs, higher cache-hit rate, different model behavior, different engine configuration and cannot be attributed correctly.
+
+A useful observability model separates API layer, scheduler, model runner, GPU kernel, KV manager and network and distributed runtime. API layer observes request queue, tokenization time, streaming backpressure; Scheduler observes waiting requests, running requests, scheduled tokens, and preemption; GPU execution observes iteration time, prefill-token count, decode-token count, kernel time, SM utilization and memory utilization; KV manager observes cache usage, allocated blocks, free blocks, cached blocks, prefix-cache hits, and KV transfers; Distributed layer observes collective time, ZMQ queues, data-parallel imbalance, and network retransmission. Only by connecting internal token/block metrics to user-visible SLOs can one explain why a service is slow. “GPU is busy” is not enough.
+
+Symptom-based diagnosis:
+
+1. High TTFT tail. First inspect waiting time, number of prefill tokens, and API CPU load. Possible actoins include chunk long prompts, add prefill capacity, add data-parallel replicas, and apply entry-layer rate limiting. Do not assume that increasing decode concurrency will help.
+
+2. ITL jitter. First inspect engine iteration time, preemption, and prefill interference. Possible actions include lower the token budget, separate workload pools, and increase KV headroom. Average TPOT may still look normal while P99 ITL is poor.
+
+3. Low GPU utilization. First inspect CPU bottlenecks, tokens per batch, kernel-launch overhead, and network behavior. Possible actions include form larger useful batches, use CUDA Graph, and fix entry-layer bottlenecks. High memory usage does not imply high compute utilization.
+
+4. High throughput but low goodput. First inspect P99 latency, timeouts, cancellations, and recomputation count. Possible actions include reducing admission and separating requests by length. Peak tokens per second do not equal serving capacity.
+
+5. Frequent out-of-memory errors. First inspect separate peaks for KV cache, CUDA Graph pools, workspace, and other buffers. Possible actions include leaving more headroom, reducing concurrency, and changing KV data type. Do not simply increase gpu_memory_utilization.
+
+CUDA Graph can reduce CPU launch overhead for repeated execution shapes. Its costs include graph memory pools, captured-shape management, and fallback handling for dynamic shapes. torch.compile and fused kernels may reduce framework overhead. Their costs may include first-run compilation, cache complexity, and more difficult debugging. These optimizations must be tested using the actual request-shape distribution.
+
+Weight quantization may reduce model-weight memory and weight bandwidth. KV quantization directly affects bytes per cached token and active-token capacity. However, every combination must be tested independently for accuracy, backend support, sequentization cost and kernel efficiency. Features such as LoRA, multimodal encoders, and structured output may change which requests can be batched together. A baseline measured without these features may not remain valid after they are enabled.
+
+The most effective tuning often comes from removing structural mismatch. Examples include:
+
+- Separating short requests from extremely long requests
+- Keeping tensor parallelism inside high-speed interconnect domains
+- Using prefix caching for stable templates
+- Adding data-parallel replicas when decode is overloaded
+- Avoiding one mixed instance for fundamentally different workloads
+
+This is usually more effective than endlessly increasing unrelated parameters on one mixed deployment. 
+
+A disciplined benchmark can proceed in four stages.
+
+1. Stage 1: single-request baselines. Measure combinations of short and long prefill, and short and long decode. This identifies model and kernel lower bounds.
+
+2. Stage 2: fixed-concurrency sweep. Find batch-efficiency gains and KV-capacity limits.
+
+3. Stage 3: arrival-rate sweep. Increase arrival rate until the SLO first fails. This identifies the saturation point.
+
+4. Stage 4: realistic production behavior. Add real prefix distribution, sampling, cancellations, failures, and timeouts. At every stage, record request throughput, token throughput, TTFT percentiles, ITL percentiles, cache usage, prermption, and error rate.
+
+A warm benchmark is not equivalent to cold-start capacity. Warm execution may benefit from model already loaded, CUDA Graph already captured, compilation already complete, prefix cache prewarmed, and file cache populated. Real traffic may also have long-tailed sequence lengths, cancellations, timeouts, and different cache-hit behavior. Capacity commitments should therefore include stable-period measurements for both cold path and warm path. Do not use synthetic equal-length requests as the only production-capacity estimate.
+
+Correctness is part of production evaluation. Serving optimization must preserve semantics. Validate behavior for:
+
+- Greedy generation
+- Sampling
+- Stop tokens
+- logprobs
+- Random seeds
+- Prefix caching enabled and disabled
+- Speculative decoding enabled and disabled
+- Single-GPU and multi-GPU execution
+- Preemption and recovery
+- Connector fallback
+
+A speed improvement that changes the intended output distribution is not acceptable. The final requirement is to preserve model semantics within the service-level objective. Throughput, latency, memory, and feature compatibility must all be evaluated around this condition.
+
+A usable production recipe should specify resource topology, per-rank parameters, input- and output-length boundaries, request-arrival assumptions, expected TTFT and ITL, alert thresholds, overload behavior, rollback conditions, and version pinning. It should also distinguish per-rank capacity, per-replica capacity, and deployment-wide capacity. This makes the configuration a verifiable engineering contract rather than a disconnected collection of startup flags.
+
+vLLM evolves quickly. The following may change across versions: 
+
+- Attention backend
+- Scheduler behavior
+- Feature combinations
+- Default parameter values
+- Preemption policy
+- Connector behavior
+
+An upgrade should be treated as a combined performance change and correctness change. A safe rollout process should:
+
+1. Replay shadow traffic.
+2. Compare user-visible output semantics.
+3. Compare cloud metrics and latency distributions.
+4. Compare memory peaks.
+5. Increase replica traffic gradually.
+
+It is not enough to confirm that the new process starts successfully.
+
+#### 5.2.3.3 TGI
