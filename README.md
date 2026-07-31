@@ -263,16 +263,14 @@
 
 **6.1 Datasets**
 
-**6.2 Needle In A Haystack**
+**6.2 Training Evaluation**
+* **6.2.1 Probabilistic Probe**
 
-**6.3 Probabilistic Probe**
+**6.3 SFT Evaluation**
+* **6.3.1 LLM-as-Judge**
 
-**6.4 LLM-as-Judge**
-
-**6.5 Training Evaluation**
-
-**6.6 SFT Evaluation**
-
+**6.4 Needle In A Haystack**
+  
 ### **7. Prompt Engineering**
 
 ### **8. RAG**
