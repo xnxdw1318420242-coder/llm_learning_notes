@@ -90,7 +90,7 @@ There are two major philosophical and technical crises in model evaluation.
 
 - Goodhart's Law. This famous economic law perfectly applies to AI evaluation: When a measure becomes a target, it ceases to be a good measure. If developers train a model specifically to get a high score on MMLU, the MMLU score no longer reflects the model's actual general intelligence. The solution is to rely on comprehensive evaluation across multiple benchmarks.
 
-# 6.1 Datasets
+## 6.1 Datasets
 
 The landscape of Large Language Model (LLM) evaluation is vast and constantly evolving. Because different models are designed for different tasks, the industry categorizes evaluation benchmarks based on downstream applications. This document outlines the complete panorama of LLM evaluation datasets, categorized by their specific use cases: General Knowledge, Math, Code, Long Context, and Agent Abilities etc.
 
@@ -138,25 +138,11 @@ The landscape of Large Language Model (LLM) evaluation is vast and constantly ev
 
 - LM Arena (formerly Chatbot Arena): Developed by LMSYS. This is completely different from static datasets; it is an open evaluation platform utilizing an Elo scoring system. Users submit prompts, and models generate anonymous answers. Human users then blindly vote on which answer is better. By 2025-2026, it expanded to include coding, long-text, multi-modal, and Agent leaderboards. It is widely considered the most credible open evaluation because it best measures the actual user experience.
 
-# 6.2 Needle In A Haystack
 
-The Needle In A Haystack test is a critical evaluation benchmark designed specifically for modern Large Language Models (LLMs) that handle massive amounts of text. The Needle In A Haystack test focuses on examining the model's information extraction and understanding capabilities within ultra-long contexts. It works by taking a massive block of text and randomly inserting specific "key information" into it to form a prompt for the LLM. The test observes whether the model can successfully dig through the noise to extract those specific key details. Ultimately, this reflects the LLM's foundational capacity to comprehend and process long-form text. Conducting this test involves a strict two-step process:
 
-1. Constructing the Haystack: First, prepare a relatively long text, typically consisting of thousands of words or more. This text acts as the "haystack" because it is filled with various redundant or completely irrelevant information. Inside this massive block, key details (the "needles") are randomly inserted.
+## 6.2 Training Evaluation
 
-2. Retrieval: Next, ask the model to answer one or more questions. The catch is that these questions can only be answered by relying on the key parts hidden deep within the text.
-
-As models have advanced, the basic test has evolved into four distinct, progressively difficult variants:
-
-- Single Information Retrieval Task. Only one key piece of information is hidden in the long article; see if the model can accurately find it. This evaluates the LLM's ability to extract a single, isolated fact. It tests the model's precise recall of specific details buried within a broad narrative. This specific setup corresponds exactly to the original Needle In A Haystack test.
-
-- Multiple Information Retrieval Task. Multiple scattered key pieces of information are buried in the article, requiring synthesis to answer. This variant explores the LLM's ability to retrieve multiple related pieces of information from a long text simultaneously. It is designed to simulate complex, real-world scenarios where a user queries a comprehensive document and requires answers drawn from various sections.
-
-- Multiple Information Reasoning Task. After retrieving multiple key pieces of information, further reasoning and integration are required to get the result. This pushes the model beyond simple extraction. It evaluates long-context ability by requiring the model to extract multiple key information fragments and then comprehensively understand and logically combine those fragments to deduce the correct answer.
-
-- Ancestor Tracing Challenge / ATC. Similar to complex genealogy/bloodline/kinship reasoning, requiring multi-layered logical connections. By designing a "kinship needle," this tests the LLM's capacity to handle multi-layered logical challenges in realistic long texts. Through a series of logical reasoning questions, it tests the model's memory and its ability to analyze every single detail. Notably, in this ATC task, the standard "irrelevant text" (the Haystack) is completely removed. Instead, all the text provided is designed as key information. The LLM must comprehensively apply all the content within the long text and actively reason through it to answer accurately.
- 
-# 6.3 Probabilistic Probe
+### 6.2.1 Probabilistic Probe
 
 When training and evaluating Large Language Models (LLMs), standard automated benchmarks might not always capture the nuanced, specific capabilities or facts we want the model to learn. To address this, engineers utilize a highly targeted technique known as the Probabilistic Probe. The fundamental motivation behind a Probabilistic Probe is precision. Sometimes we want to "precisely observe whether a model has learned a certain fact or how much probability it assigns to a specific sentence". It is a highly specialized tool designed to observe a very specific capability of the model. The underlying logic is incredibly simple: observe whether the probability of a specific token or sentence increases over time. However, this precision comes with a major engineering trade-off: these probe test sets cannot be easily generated in bulk. They typically require trainers to construct them manually, item by item, to ensure they exactly measure the intended metric. Conducting a Probabilistic Probe involves a strict, manual two-step process:
 
@@ -174,7 +160,47 @@ There are three vital rules for effectively using Probabilistic Probes in a real
 
 Do not worry if the absolute probability score is low (e.g., $0.05$); what matters is whether that score grows to $0.10$, $0.20$, etc., as training progresses, indicating that the model is actively learning the targeted concept.
 
-# 6.4 LLM-as-Judge
+
+## 6.3 SFT Evaluation
+
+Evaluating a model after Supervised Fine-Tuning (SFT) is a vastly different process than evaluating a foundational pre-trained model. While pre-training evaluation focuses purely on broad knowledge capacity, SFT evaluation focuses on usability, alignment, and specific task execution. The foundation of SFT evaluation is a high-quality evaluation dataset. The tasks in this test set must explicitly match the task types present in the SFT training data. A model's performance on this specific test set determines whether it is ready for production. Unlike pre-training, SFT evaluation traditionally aligns with the classic 3H Principles:
+
+- Helpfulness: Does the model actually assist the user?
+
+- Honesty: Is the model factually accurate?
+
+- Harmlessness: Is the model safe to use?
+
+However, in real-world engineering, companies rarely stick to just these three abstract principles. Instead, they define specific, practical metrics based on their product needs, such as:
+
+- Instruction Following 
+
+- System Prompt Penetration 
+
+- Content Accuracy
+
+- Hallucination Generation
+
+- Safety
+
+During evaluation, each of these specific dimensions receives an independent score. These scores are then combined using a customized weighting formula to determine the overall usability of the response.  If a model fails a test case, engineers can immediately see which specific dimension dropped, allowing for targeted case analysis against the training data.
+
+When evaluating, you must understand the entire LLM system. If your company has a strict front-end safety filter, it is meaningless to heavily penalize the raw model for safety issues. If you have a powerful RAG (Retrieval-Augmented Generation) system, overly focusing on the raw model's hallucinations might be misguided. You must evaluate the specific capabilities that the LLM cannot rely on external systems to catch or fix.
+
+Currently, the industry relies on two main methods to conduct these evaluations: Machine Evaluation and Human Evaluation. Machine Evaluation involves using a powerful model (like GPT-4) as the Judge. The most critical aspect here is prompt design, because LLMs have severe inherent biases. When comparing Answer A and Answer B, the Judge model naturally leans toward picking A. The Judge model naturally prefers longer answers.  If you ask a model to score the exact same perfect answer three times, it might output 3, 4, and 5 randomly. The mitigation is to use highly standardized prompts. Furthermore, providing the Judge model with a Standard Reference Answer significantly stabilizes the scoring, as the Judge can calculate similarity between the candidate and the "gold answer." Contrary to popular belief, manual human evaluation remains the mainstream strategy for LLM companies. It is not as expensive or cumbersome as assumed (often cheaper than massive API calls to OpenAI's o1). Humans have long-term memory. The most time-consuming part of SFT evaluation isn't reading the answer, it's understanding the prompt. If evaluators are very familiar with the prompt, they immediately know what mistakes the model's answer is likely to make and what the focus should be, making efficiency extremely high. As long as the test set doesn't change daily, human evaluators quickly memorize the prompts. After one or two rounds, their evaluation speed easily matches or exceeds Machine Evaluation.
+
+SFT evaluation must be comparative evaluation; looking directly at the model's performance on the test set provides no guidance. You must always compare the current version (SFT v2) against the previous baseline (SFT v1). If SFT v2 shows a significant drop in a specific capability (e.g., Capability 'A') compared to SFT v1, engineers must trace back to the training data. There are four potential root causes:
+
+- Data Degradation: The training data for Capability A was updated, but the new quality is worse than the previous version. Engineers must manually review the new data.
+
+- Data Imbalance: The overall volume of training data increased, causing the relative proportion of Capability A data to shrink, leading to slight underfitting.
+
+- Hyperparameter Issues: Specific training parameters for this run were set incorrectly.
+
+- Statistical Fluctuation: The drop might just be random variance. The solution is to isolate a specific bad case from SFT v2. Force both SFT v2 and SFT v1 to predict that same prompt multiple times and analyze the sampling variance.
+
+ 
+### 6.3.1 LLM-as-Judge
 
 The traditional methods of evaluating language models (like static datasets or human annotation) face significant bottlenecks in cost, speed, and scalability. To solve this, the industry has embraced the "LLM-as-Judge" paradigm, an evaluation method that uses powerful language models to assess the outputs of other models. Below is the basic workflow:
 
@@ -229,45 +255,22 @@ When building an LLM-as-Judge pipeline, engineers should study these three indus
 - Arena Hard: Contains 500 highly discriminative, difficult prompts.
 
 - Chatbot Arena: The gold standard for Elo rating rankings based on human/judge preference.
-
-# 6.5 Training Evaluation
-
-# 6.6 SFT Evaluation
-
-Evaluating a model after Supervised Fine-Tuning (SFT) is a vastly different process than evaluating a foundational pre-trained model. While pre-training evaluation focuses purely on broad knowledge capacity, SFT evaluation focuses on usability, alignment, and specific task execution. The foundation of SFT evaluation is a high-quality evaluation dataset. The tasks in this test set must explicitly match the task types present in the SFT training data. A model's performance on this specific test set determines whether it is ready for production. Unlike pre-training, SFT evaluation traditionally aligns with the classic 3H Principles:
-
-- Helpfulness: Does the model actually assist the user?
-
-- Honesty: Is the model factually accurate?
-
-- Harmlessness: Is the model safe to use?
-
-However, in real-world engineering, companies rarely stick to just these three abstract principles. Instead, they define specific, practical metrics based on their product needs, such as:
-
-- Instruction Following 
-
-- System Prompt Penetration 
-
-- Content Accuracy
-
-- Hallucination Generation
-
-- Safety
-
-During evaluation, each of these specific dimensions receives an independent score. These scores are then combined using a customized weighting formula to determine the overall usability of the response.  If a model fails a test case, engineers can immediately see which specific dimension dropped, allowing for targeted case analysis against the training data.
-
-When evaluating, you must understand the entire LLM system. If your company has a strict front-end safety filter, it is meaningless to heavily penalize the raw model for safety issues. If you have a powerful RAG (Retrieval-Augmented Generation) system, overly focusing on the raw model's hallucinations might be misguided. You must evaluate the specific capabilities that the LLM cannot rely on external systems to catch or fix.
-
-Currently, the industry relies on two main methods to conduct these evaluations: Machine Evaluation and Human Evaluation. Machine Evaluation involves using a powerful model (like GPT-4) as the Judge. The most critical aspect here is prompt design, because LLMs have severe inherent biases. When comparing Answer A and Answer B, the Judge model naturally leans toward picking A. The Judge model naturally prefers longer answers.  If you ask a model to score the exact same perfect answer three times, it might output 3, 4, and 5 randomly. The mitigation is to use highly standardized prompts. Furthermore, providing the Judge model with a Standard Reference Answer significantly stabilizes the scoring, as the Judge can calculate similarity between the candidate and the "gold answer." Contrary to popular belief, manual human evaluation remains the mainstream strategy for LLM companies. It is not as expensive or cumbersome as assumed (often cheaper than massive API calls to OpenAI's o1). Humans have long-term memory. The most time-consuming part of SFT evaluation isn't reading the answer, it's understanding the prompt. If evaluators are very familiar with the prompt, they immediately know what mistakes the model's answer is likely to make and what the focus should be, making efficiency extremely high. As long as the test set doesn't change daily, human evaluators quickly memorize the prompts. After one or two rounds, their evaluation speed easily matches or exceeds Machine Evaluation.
-
-SFT evaluation must be comparative evaluation; looking directly at the model's performance on the test set provides no guidance. You must always compare the current version (SFT v2) against the previous baseline (SFT v1). If SFT v2 shows a significant drop in a specific capability (e.g., Capability 'A') compared to SFT v1, engineers must trace back to the training data. There are four potential root causes:
-
-- Data Degradation: The training data for Capability A was updated, but the new quality is worse than the previous version. Engineers must manually review the new data.
-
-- Data Imbalance: The overall volume of training data increased, causing the relative proportion of Capability A data to shrink, leading to slight underfitting.
-
-- Hyperparameter Issues: Specific training parameters for this run were set incorrectly.
-
-- Statistical Fluctuation: The drop might just be random variance. The solution is to isolate a specific bad case from SFT v2. Force both SFT v2 and SFT v1 to predict that same prompt multiple times and analyze the sampling variance.
-
 The SFT process is a continuous loop. Cases where the score improves become our good experience for cleaning data; cases where the score worsens become the target for the next version's optimization. Repeated iteration is all that is required.
+
+## 6.4 Needle In A Haystack
+
+The Needle In A Haystack test is a critical evaluation benchmark designed specifically for modern Large Language Models (LLMs) that handle massive amounts of text. The Needle In A Haystack test focuses on examining the model's information extraction and understanding capabilities within ultra-long contexts. It works by taking a massive block of text and randomly inserting specific "key information" into it to form a prompt for the LLM. The test observes whether the model can successfully dig through the noise to extract those specific key details. Ultimately, this reflects the LLM's foundational capacity to comprehend and process long-form text. Conducting this test involves a strict two-step process:
+
+1. Constructing the Haystack: First, prepare a relatively long text, typically consisting of thousands of words or more. This text acts as the "haystack" because it is filled with various redundant or completely irrelevant information. Inside this massive block, key details (the "needles") are randomly inserted.
+
+2. Retrieval: Next, ask the model to answer one or more questions. The catch is that these questions can only be answered by relying on the key parts hidden deep within the text.
+
+As models have advanced, the basic test has evolved into four distinct, progressively difficult variants:
+
+- Single Information Retrieval Task. Only one key piece of information is hidden in the long article; see if the model can accurately find it. This evaluates the LLM's ability to extract a single, isolated fact. It tests the model's precise recall of specific details buried within a broad narrative. This specific setup corresponds exactly to the original Needle In A Haystack test.
+
+- Multiple Information Retrieval Task. Multiple scattered key pieces of information are buried in the article, requiring synthesis to answer. This variant explores the LLM's ability to retrieve multiple related pieces of information from a long text simultaneously. It is designed to simulate complex, real-world scenarios where a user queries a comprehensive document and requires answers drawn from various sections.
+
+- Multiple Information Reasoning Task. After retrieving multiple key pieces of information, further reasoning and integration are required to get the result. This pushes the model beyond simple extraction. It evaluates long-context ability by requiring the model to extract multiple key information fragments and then comprehensively understand and logically combine those fragments to deduce the correct answer.
+
+- Ancestor Tracing Challenge / ATC. Similar to complex genealogy/bloodline/kinship reasoning, requiring multi-layered logical connections. By designing a "kinship needle," this tests the LLM's capacity to handle multi-layered logical challenges in realistic long texts. Through a series of logical reasoning questions, it tests the model's memory and its ability to analyze every single detail. Notably, in this ATC task, the standard "irrelevant text" (the Haystack) is completely removed. Instead, all the text provided is designed as key information. The LLM must comprehensively apply all the content within the long text and actively reason through it to answer accurately.
