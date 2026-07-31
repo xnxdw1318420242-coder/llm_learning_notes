@@ -5458,3 +5458,77 @@ An upgrade should be treated as a combined performance change and correctness ch
 It is not enough to confirm that the new process starts successfully.
 
 #### 5.2.3.3 TGI
+
+TGI (Text Generation Inference) is a specialized, high-performance inference framework developed by HuggingFace (HF). It is specifically designed as the primary deployment mode for the online inference of models hosted on the HuggingFace platform. The architecture is split into request handling and parallel model execution:
+
+- The Web Server (Request Handling). The system features a Web Server that acts as the entry point. It receives multiple, simultaneous user requests, denoted by the /generate endpoints.To ensure hardware is used efficiently, TGI does not process these requests one by one. Instead, the incoming /generate requests are collected in a Buffer. They are then passed to a Batcher, which groups the requests together to be processed simultaneously, maximizing throughput.
+
+- Distributed Execution (Model Shards). Once the requests are batched, they are transmitted via gRPC (a high-performance Remote Procedure Call framework) to the actual model processing units.  The LLM is divided into multiple Model Shards (represented by the green boxes featuring Python and Rust logos). This means the massive neural network is split across different processing units to handle the heavy computation. To work together, these separated Model Shards must constantly communicate. They do this using NCCL (or rccl, etc.), which are standard communication libraries designed to synchronize data rapidly across multiple GPUs.
+
+- Hardware Compatibility. TGI is versatile and supports a wide variety of hardware accelerators for these Model Shards, including NVIDIA GPUs, AMD GPUs, Inferentia2, and Gaudi2.
+
+TGI is built for seamless deployment. All dependencies are installed within a Docker container. This means developers do not have to worry about complex local environment setups or conflicting libraries; the entire framework can be spun up reliably anywhere Docker is supported. To handle massive LLMs that cannot fit on a single GPU, TGI natively uses Tensor Parallelism. This technique splits the model's massive mathematical computations (tensors) across multiple devices. This is what enables the fast, distributed execution of huge models. Because TGI is developed directly by HuggingFace, it offers the absolute best compatibility for models published on the HF platform. If a model is hosted on HuggingFace, TGI is the most optimized and stable deployment mode for running it online.
+
+#### 5.2.3.4 Ray Serve
+
+Ray Serve is a powerful and flexible deployment tool designed specifically for machine learning models. Its most significant architectural advantage is that "Serve is framework-agnostic". This means it is not locked into a specific ecosystem like TensorFlow or PyTorch. As a result, developers can use this single toolkit to serve all aspects of their deep learning models, regardless of how those models were originally built. It supports Dynamic Batching. his feature is crucial when the cost of using the model is very high (e.g., massive Large Language Models). To ensure that the expensive hardware (like GPUs) is utilized to its maximum potential, Ray Serve can adopt this strategy. Instead of processing incoming user requests one by one, it dynamically groups them together into batches on the fly, dramatically increasing throughput. Ray Serve benefits directly from the underlying elastic nature of the broader Ray ecosystem. Users can utilize the Ray Dashboard to gain full visibility and obtain the real-time status of both the overall Ray cluster and the specific Ray Serve applications running on it. To handle sudden spikes or drops in user traffic, Ray Serve features intelligent auto-scaling. It does this by constantly "observing the queue size" of incoming requests. Based on this real-time data, it automatically makes scaling decisions to either add new replicas (to handle traffic spikes) or remove unneeded replicas (to save resources when traffic drops).
+
+### 5.2.4 Repetitiveness
+
+During the inference phase of Large Language Models (LLMs) like GPT-4, a common and frustrating issue is the generation of repetitive text. This repetitiveness not only degrades the overall quality of the output but also significantly lowers the user experience. There are four primary categories that cause a model to loop into repetitive patterns.
+
+1. Language models learn by analyzing patterns in training data to generate a probability distribution for the next possible word. However, this statistical approach has inherent flaws:
+
+- High-Frequency Vocabulary Over-weighting: Models tend to assign disproportionately high weights to extremely common words. Because their baseline probability is so high, they are prone to appearing repeatedly during generation.
+- Local Dependency Problems: Models tend to generate words based heavily on the immediate local context. If the current local context already contains repetitive information that is assigned a high weight, the model is highly likely to continue that repetitive trend.
+- Lack of Long-Range Planning: Because generation is done token-by-token without a holistic structural plan for the entire text, the model can easily fall into generating similar, looping content when focusing only on local text chunks.
+
+2. The Impact of Decoding Strategies. How we ask the model to pick the next word drastically affects repetitiveness:
+
+- Greedy Search: This strategy always picks the single word with the absolute highest probability at every step. This forces the model to constantly choose the "safest" and most common words, inevitably leading to repetitive loops.
+- Beam Search: While Beam Search tracks multiple candidate sequences simultaneously to find the best overall path, if it lacks a diversity penalty mechanism, the multiple paths tend to converge, leading to the repeated generation of similar sentences.
+- Lack of Entropy Regularization: Without entropy regularization, the model's output probability distribution can become too sharp (concentrated on just a few high-probability words), leading directly to repetition.
+
+3. Training Data Issues. A model is only as good as its data.
+
+- Presence of Repetitive Samples: If the training data contains massive amounts of repetitive sentences or fragments, the model will learn that repetition is a valid and correct language structure.
+- Corpus Imbalance: If certain topics or specific language structures represent too high a proportion of the dataset, the model will be heavily biased toward generating those specific patterns.
+- Low-Quality Data Impact: Training data containing noise or artificial/spam repetition will actively mislead the model during generation.
+
+4. Model's Local Optima. During generation, the model can get trapped in a mathematical local optimum.
+
+- High-Probability Path Trap: Once a specific generation path forms a familiar pattern, the model might endlessly repeat it because it cannot mathematically "see" a better, global path to switch to.
+- Lack of Diversity Incentives: If the generation process does not actively reward diversity, the model will naturally default to safe, repetitive choices.
+
+To break these repetitive loops, engineers use several dynamic tuning and algorithmic penalties during the decoding phase.
+
+1. Adjusting the Temperature Parameter. The Temperature parameter ($T$) controls the smoothness of the model's generation probability distribution. High Temperature smooths out the probability distribution, artificially increasing the chances of picking less common words, thereby boosting diversity. (e.g., At $T=1.2$, the model generates more uncertain but interesting content). Caution: Setting the temperature too high will result in incoherent text. Low Temperature ($T < 1$) sharpens the distribution, making the text highly deterministic but extremely prone to repetition. Low temperature is suitable for task-based generation like Q&A, not open-ended generation. For strict tasks (like translation), set $T = 0.7$. For creative tasks (like story generation), try $T = 1.2$.
+
+2. Employing Sampling Strategies. Instead of always picking the top word (Greedy Search), we sample from a pool of likely words. Top-$k$ Sampling and Nucleus Sampling / Top-$p$ Sampling work. In Top-$p$ Sampling, the common range is $p = 0.8 \sim 0.95$. It is recommended to prioritize Nucleus Sampling when generating long paragraphs.
+
+3. Algorithmic Penalties.
+
+- Repetition Penalty. Dynamically lowers the probability of words or phrases that have already been generated. This dynamically controls already-generated high-frequency words (like repeated n-grams), avoiding text verbosity. Define a penalty coefficient $\alpha$ (where $\alpha > 1$). The adjusted probability is calculated as:
+
+$$P_{\text{adjusted}}(w) = \frac{P(w)}{\alpha}$$
+
+- n-gram Blocking. Record all generated n-gram sequences to prevent the model from generating them again. Usually, $n$ is set to $3$ or $4$. Before generating a new word, the system checks if it will create an n-gram that already exists in the output. If a repetition is detected, the system skips that word and chooses the one with the next highest probability.
+
+- Introducing Diversity in Beam Search. Add diversity penalty mechanisms to Beam Search to encourage the generation of different sequences. Add a diversity reward to each beam path to suppress similarity between paths within the same beam. The formula is:
+
+$$P_{\text{adjusted}}(w) = P(w) - \lambda \cdot \text{similarity}(w)$$
+
+(Where $\lambda$ is the weight controlling diversity).
+
+In practical engineering:
+
+- Tune Decoding Parameters: Select appropriate Temperature, Top-$k$, and Top-$p$ parameters based on the specific task. (Example: For summary generation, set $T=0.8, k=50, p=0.9$).
+
+- Use Advanced Decoding Strategies: Prioritize the use of repetition penalties and n-gram blocking.
+
+- Optimize Training Data: Ensure linguistic diversity and strictly reduce artificial repetition through data cleaning (removing highly repetitive sentences and balancing corpus topics).
+
+- Model Fine-Tuning: Fine-tune the model for specific tasks to enhance its generation logic and semantic fluency.
+
+- Introduce Post-Processing: After generation is complete, apply text post-processing algorithms to physically detect and remove repetitive content before showing it to the user.
+
