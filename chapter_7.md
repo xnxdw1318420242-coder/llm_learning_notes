@@ -1,4 +1,6 @@
-# 7. Prompt Engineering 
+# 7. LLM Application
+
+## 7.1 LLM Application
 
 When working with Large Language Models (LLMs), the quality of the model's output is directly dictated by the quality of the instructions it receives. At its most basic level, a Prompt is the initial text input that a model receives. It acts as the steering wheel for the AI. As the text states, we give the AI a set of Prompt inputs to guide the model to generate a response to execute a task. A prompt is incredibly flexible. It can be a simple question, a lengthy description, a set of keywords, or any other form of text. The ultimate goal is to guide the model to produce a response that closely matches the user's specific requirements (e.g., asking ChatGPT to answer a question, generate an essay, or write code).
 
@@ -8,11 +10,11 @@ Prompt Engineering, also referred to as "in-context prompting," elevates prompt 
 
 - Structured Input and Output. For highly complex, multi-step logic, natural language paragraphs become messy and confusing for the model. Often, tasks involve branching logic. When workflows have these if-else branches and jumps, it is best to use programming languages or Mermaid to express this workflow, which can increase the model's understanding of the process. To make the prompt perfectly clear, the text suggests using structural markers like triple quotes ("""), XML tags (<step>), or section headers to separate different parts of the prompt structure. Similarly, you should instruct the model to use structural markers when generating its output.
 
-## 7.1 Zero-shot Prompting
+### 7.1.1 Zero-shot Prompting
 
 Zero-shot prompting means asking an AI model to perform a task without giving it any examples of how the task should be done. You provide only the instruction and the input to process. A zero-shot prompt works best when the instruction is clear and specifies the expected output.
 
-## 7.2 Few-shot Prompting
+### 7.1.2 Few-shot Prompting
 
 Few-shot prompting means giving a language model a small number of high-quality examples before asking it to complete a new task. Each example usually contains an example input and the expected output. The model observes these demonstrations and uses them to infer the task, the desired response format, and the standard for a correct answer. Few-shot prompting is often described as a form of in-context learning. The model does not update its parameters or undergo additional training. Instead, it temporarily learns how to perform the task from the examples and instructions included in the current prompt. The examples can serve two related purposes:
 
@@ -61,7 +63,7 @@ Again, return only valid JSON.
 
 However, repetition should be used carefully. Too much repetition wastes tokens and can make the prompt noisy. 
 
-## 7.3 Instruction Prompting
+### 7.1.3 Instruction Prompting
 
 Instruction prompting means directly telling a language model what task to perform and how to perform it. Instead of teaching through examples, you describe the desired behavior using natural-language instructions. Instruction prompting and zero-shot prompting are closely related, but they describe slightly different things. Instruction prompting focuses on giving the model explicit directions. Zero-shot prompting means asking the model to perform a task without providing examples. Instruction prompting can also be combined with few-shot prompting.
 
@@ -79,7 +81,7 @@ A strong instruction prompt usually contains several parts.
 
 Language models have learned many patterns for following natural-language directions. A clear instruction narrows the set of possible responses and tells the model what kind of output is useful.
 
-## 7.4 CoT
+### 7.1.4 CoT
 
 Chain-of-Thought prompting, usually abbreviated as CoT prompting, is a prompting method that encourages a language model to solve a problem through a sequence of intermediate reasoning steps rather than jumping directly from the input to the final answer. CoT prompting is especially useful for tasks that require multiple reasoning steps, such as arithmetic, symbolic reasoning, logic, and some common-sense problems.
 
