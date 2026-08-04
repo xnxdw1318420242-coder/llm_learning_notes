@@ -275,10 +275,10 @@
 
 **7.1 Prompt Engineering**
 
-* **7.1 Zero-shot Prompting**
-* **7.2 Few-shot Prompting**
-* **7.3 Instruction Prompting**
-* **7.4 CoT**
+* **7.1.1 Zero-shot Prompting**
+* **7.1.2 Few-shot Prompting**
+* **7.1.3 Instruction Prompting**
+* **7.1.4 CoT**
   
 **7.2 RAG**
 
