@@ -1,6 +1,6 @@
 # 7. LLM Application
 
-## 7.1 LLM Application
+## 7.1 Prompt Engineering
 
 When working with Large Language Models (LLMs), the quality of the model's output is directly dictated by the quality of the instructions it receives. At its most basic level, a Prompt is the initial text input that a model receives. It acts as the steering wheel for the AI. As the text states, we give the AI a set of Prompt inputs to guide the model to generate a response to execute a task. A prompt is incredibly flexible. It can be a simple question, a lengthy description, a set of keywords, or any other form of text. The ultimate goal is to guide the model to produce a response that closely matches the user's specific requirements (e.g., asking ChatGPT to answer a question, generate an essay, or write code).
 
@@ -178,3 +178,53 @@ Each node represents a possible intermediate thought or subproblem. The system c
 - ToT actively expands, evaluates, and prunes multiple branches during problem solving.
 
 ToT is more suitable for problems that may require exploring alternative strategies, backtracking, or searching a large solution space.
+
+## 7.2 RAG
+
+Retrieval-Augmented Generation, or RAG, is a method that provides a large language model with information retrieved from an external data source. For a user question, RAG first uses information-retrieval techniques to find relevant content from an external database. It then places the retrieved information into the prompt and sends the complete prompt to the LLM. The LLM generates its answer by combining the user’s original question and the retrieved external information. RAG retrieves relevant knowledge first, then asks the LLM to answer using that knowledge.
+
+An LLM mainly depends on the data used during pretraining. Because of this, it may not have access to the latest or dynamically changing information. RAG addresses this information gap by retrieving relevant knowledge from external databases at inference time. Without RAG, an LLM may be unable to answer questions about recent events because the required information is not included in its pretrained knowledge. With RAG, relevant recent documents can be retrieved and included in the prompt, allowing the LLM to generate a more informed answer. The basic process can be summarized as:
+
+1. User query. 
+
+2. Retrieve relevant information from an external database. 
+
+3. Combine the query and retrieved information into a prompt.
+
+4. Send the complete prompt to the LLM.
+
+5. Generate a response.
+
+The original question is sent in two directions:
+
+- It is used to search the external data source.
+
+- It is also provided to the LLM as part of the final prompt.
+
+The retrieved documents provide additional context for generation.
+
+Main stages of a RAG system include the following:
+
+1. User query. The process begins when the user asks a question. The query represents the information need that the system must answer.
+
+2. External data source. RAG connects the query to an external datastore containing documents or other knowledge. This datastore provides information beyond what is already stored in the model’s pretrained parameters.
+
+3. Indexing. Before retrieval, documents are processed and indexed. Documents are divided into chunks and represented in a form that supports retrieval.
+
+4. The system uses the user’s query to search the indexed data and identify relevant documents or chunks. The retrieved results should contain information related to the user’s question.
+
+5. The retrieved documents are combined with the original question. This produces a more complete prompt containing both the task and the supporting context.
+
+6. Generation. The combined prompt is sent to the LLM. The model then generates an answer using the retrieved information together with the original question.
+
+Traditional search engines such as Google or Bing mainly retrieve information. They have retrieval ability, but they do not directly generate a complete answer in the same way as an LLM. A pretrained LLM stores large amounts of knowledge in its model parameters. This gives the model memory, but it is limited to the information learned during training. RAG combines retrieval with the LLM’s generation ability. From this perspective, RAG sits between traditional search and a memory-based language model. The retrieved information is loaded into the LLM’s working memory. In this setting, working memory refers to the model’s context window: the maximum amount of text that the model can receive during one generation process. The context window may contain the user’s question, the retrieved documents, prompt instructions, and other relevant context. The model uses all of this information together when generating the answer.
+
+RAG relies on prompt construction. The system does not simply retrieve documents and return them directly. Instead, it places the relevant documents into a prompt together with the user’s question. Therefore, the generation stage is based on a prompt containing external knowledge. This allows the LLM to generate an answer based on more complete information.
+
+The development of RAG is described in three stages.
+
+1. Early stage. The emergence of RAG was closely connected to the rise of the Transformer architecture. The main goal was to introduce external knowledge into pretrained models in order to enhance language models. Early research focused on foundational improvements to pretraining methods.
+
+2. Shift after ChatGPT. The appearance of ChatGPT became an important turning point. Large language models demonstrated strong in-context learning abilities. As a result, RAG research increasingly focused on supplying better information to LLMs during inference. This was especially useful for more complex and knowledge-intensive tasks.
+
+3. Later development. As research continued, RAG optimization was no longer limited to the inference stage. Researchers also began combining RAG with LLM fine-tuning techniques.
