@@ -271,16 +271,15 @@
 
 **6.4 Needle In A Haystack**
   
-### **7. Prompt Engineering**
+### **7. LLM Application**
 
-**7.1 Zero-shot Prompting**
+**7.1 Prompt Engineering**
 
-**7.2 Few-shot Prompting**
+* **7.1 Zero-shot Prompting**
+* **7.2 Few-shot Prompting**
+* **7.3 Instruction Prompting**
+* **7.4 CoT**
+  
+**7.2 RAG**
 
-**7.3 Instruction Prompting**
-
-**7.4 CoT**
-
-### **8. RAG**
-
-### **9. Agent**
+**7.3 Agent**
