@@ -336,3 +336,139 @@ Beyond how the retriever augments the generator, RAG methods can be broadly divi
 
 #### 7.2.2.1 Training-Free Methods
 
+Training-free Retrieval-Augmented Generation (RAG) offers a lightweight, compute-efficient alternative to model fine-tuning by dynamically pulling external knowledge during inference without updating internal weights. While modern large language models (LLMs) demonstrate impressive downstream performance, continuously fine-tuning them to keep their parametric knowledge up-to-date is computationally prohibitive and slow. Training-free RAG bridges this gap for knowledge-intensive applications like open-domain question answering by decoupling factual updates from weight optimization. Depending on where external knowledge enters the inference pipeline, training-free methods divide into two core paradigms:
+
+1. Prompt Engineering-Based Methods (knowledge injected into the input prompt). Because an LLM's output is fundamentally conditioned on its input query, prompt-based RAG optimizes the original query by prepending or framing it with relevant retrieved passages. This context acts as an immediate grounding anchor for the model’s generation.
+
+- In-Context RALM (Retrieval-Augmented Language Model): The purest form of prompt-level RAG. It freezes the model entirely and directly prepends retrieved external documents to the user's prompt, letting the model synthesize the answer in-context.
+
+- IRCoT (Interleaving Retrieval with Chain-of-Thought): Instead of a one-and-done search before generation begins, IRCoT alternates between Chain-of-Thought reasoning steps and retrieval calls. Each intermediate reasoning step generates a more targeted query for subsequent searches, outperforming standard retrieval based only on the raw user question.
+
+- GENREAD (Generate then Read): Rather than querying an external corpus, GENREAD prompts the LLM itself to generate synthetic background passages relevant to the query. The model then reads its own generated context alongside the original question to produce the final answer.
+
+- SKR (Self-Knowledge Guided Retrieval): Addresses retrieval redundancy by instructing the LLM to assess its own parametric certainty before deciding whether to search. External retrieval is triggered selectively, efficiently balancing internal parametric knowledge with external data access.
+
+- TOC (Tree of Clarifications): Designed for ambiguous or open-ended prompts. It retrieves relevant context and recursively breaks the ambiguity down into a tree of concrete sub-questions, resolving each branch before aggregating everything into a comprehensive long-form response.
+
+2. Retrieval-Based Token Generation Methods (knowledge injected into the decoding step to steer output tokens). Rather than packing retrieved context into the prompt window, this approach leverages external non-parametric datastores to adjust probability distributions at the decoding level, steering token output directly.
+
+- KNN-KMs: For a given context, this technique retrieves the $k$-nearest neighbors from an external key-value datastore and calculates a neighbor probability distribution based on vector distance. It then interpolates this neighbor distribution directly with the base language model's output distribution to calibrate next-token probabilities.
+
+- Rest (Retrieval-Based Speculative Decoding): Accelerates speculative decoding without relying on a smaller, parametric draft model. Instead, it uses a non-parametric retrieval datastore to fetch candidate token sequences based on the current context, validating them in parallel with the main model for high-throughput inference.
+
+#### 7.2.2.2 Independent Training (Decoupled Optimization)
+
+In an independent training regime, the retriever and the language model are trained as completely separate modules with zero interaction during their learning phases. This setup bridges the gap between raw document search and fluent language modeling, typically training the LLM via standard negative log-likelihood (NLL) loss to generate target outputs based on input contexts. Retrievers in this setup fall into two foundational categories:
+
+1. Sparse Retrievers: Rely on lexical matching and term-frequency statistics to represent documents as sparse vectors. Relevance is scored using classic information retrieval formulas such as TF-IDF and BM25.
+
+2. Dense Retrievers: Map queries and text into continuous semantic vector spaces using deep neural encoders, scoring relevance through vector inner products. DPR (Dense Passage Retrieval) trains dual BERT-based encoders (one for queries, one for candidate passages) using contrastive learning to align matching pairs in embedding space. CoG (Contextual Generation) employs a trained prefix encoder and phrase encoder to retrieve phrases dynamically, framing generation as an iterative "copy-and-paste" operation sourced directly from external text collections.
+
+#### 7.2.2.3 Sequential Training (Staged Synergistic Optimization)
+
+While independent components can be slotted in off the shelf, they lack mutual coordination. Sequential training establishes synergy by training one component under the guidance of the other. Typically, one module is pre-trained (or pulled off the shelf as a frozen backbone, such as BERT, CLIP, or T5) while the remaining module is trained to complement it. This creates two distinct workflows based on training order:
+
+1. Train the Retriever First. The retrieval module is trained and frozen; the LLM is subsequently fine-tuned to condition its generation on the retrieved passages.
+
+- RETRO (Retrieval-Enhanced Transformer): Freezes an independently pre-trained BERT model as the document retriever, then trains an encoder-decoder network from scratch to weave retrieved chunks directly into next-token predictions.
+
+- RALMs (Retrieval-Augmented Language Models): Hooks commercial web search (Google Search) or open-source neural search (COLBERTV2) directly into the pipeline as fixed retrievers, fine-tuning the LLM specifically to ingest and exploit the retrieved passages.
+
+- ITERRTGEN: Employs a pre-trained S-BERT alongside an adaptive hybrid search strategy to pull relevant in-context exemplars, followed by fine-tuning a T5 generator on concatenated inputs of original prompts and retrieved demonstrations.
+
+- SMALLCAP: Designed for multi-modal captioning. It uses CLIP to project image features and candidate text into a shared vector space, retrieves relevant captions via cosine similarity, and trains a lightweight cross-attention layer to guide a frozen GPT-2 decoder.
+
+2. Train the LLM First. A high-performing or fine-tuned LLM acts as an expert supervisor, generating training signals and pseudo-labels to guide the optimization of the downstream retriever.
+
+- DKRR: Leverages the insight that internal attention scores in sequence-to-sequence reader models mirror document relevance. It converts these reader attention distributions into synthetic supervision labels to train the retriever.
+
+- AAR (Augmentation-Adapted Retriever): Uses a compact language model to generate supervision signals tailored for retriever fine-tuning. Once trained, the specialized retriever can be plugged directly into black-box, closed-source LLMs to enhance output accuracy.
+
+- RA-DIT (Retrieval-Augmented Dual Instruction Tuning): A two-way sequential framework. It first instruction-tunes the LLM to better comprehend retrieved context, then tunes the retriever so its vector representations align directly with the LLM's operational preferences.
+
+- UPRISE: Introduces a lightweight prompt-retrieval mechanism to bolster zero-shot generalization across unseen tasks. It uses a frozen LLM to supervise the prompt retriever during tuning; during inference, the retriever fetches task-specific prompt exemplars compatible across diverse target LLMs.
+
+#### 7.2.2.4 Joint Training (End-to-End Co-Optimization)
+
+Joint training abandons staged pipelines in favor of a unified end-to-end objective. Both the retriever and the language generator update their weights simultaneously. This ensures that the retriever learns precisely what textual evidence benefits the generator, while the generator learns to extract maximum utility from the retriever's candidates. REALM (Retrieval-Augmented Language Model Pre-Training): Integrates document retrieval directly into masked language model pre-training. Candidates are ranked via Maximum Inner Product Search (MIPS) across a vector database. Re-indexing millions of candidate documents after every parameter update is computationally impossible. REALM resolves this by employing asynchronous index updates, refreshing the underlying MIPS vector index every few hundred training steps while maintaining stable end-to-end backpropagation.
+
+
+### 7.2.3 Optimization
+
+In production Retrieval-Augmented Generation (RAG) systems, generation quality hinges directly on the relevance and fidelity of the context retrieved. Optimizing a RAG pipeline requires addressing every stage of the retrieval workflow—from user input preprocessing to embedding selection, index traversal, and post-retrieval transformation.
+
+#### 7.2.3.1 Input Optimization
+
+The raw user query is the primary entry point to the retriever, exerting outsized influence on final document retrieval. Input enhancement generally splits into two tactical avenues: Query Transformation and Data Augmentation.
+
+- Query Transformation. Raw queries are often ambiguous, under-specified, or semantically misaligned with document indexes. Query transformation rewrites or decomposes the input before it reaches the retriever. Query2doc & HyDE uses the raw prompt to generate hypothetical pseudo-documents via an LLM. These hallucinated yet semantically dense passages serve as the search vector, capturing richer contextual cues to fetch more accurate reference texts than sparse keyword searches. TOC (Tree of Clarifications) uses initial retrieval feedback to recursively break down ambiguous queries into multiple explicit sub-queries, passing them to the generator to synthesize a unified final output. RQ-RAG targets complex or multi-intent inputs by decomposing them into fine-grained sub-queries, executing granular searches, and merging the intermediate responses into a coherent global answer.
+
+- Data Augmentation. Data augmentation enriches, cleans, and structures knowledge prior to indexing, eliminating ambiguities, stripping irrelevant noise, updating obsolete records, and synthesizing missing data. Make-An-Audio alleviates data sparsity in non-speech audio retrieval by generating captions via audio-text alignment models and injecting random conceptual audio elements to augment training representations. LESS evaluates gradient information to optimize training data selection for downstream tasks, boosting the model's responsiveness to instruction prompts. ReACC applies code-level data augmentation—such as variable renaming and dead code insertion—to pre-train code retrieval models against syntax perturbations. Telco-RAG enhances telecommunications domain retrieval by introducing standardized 3GPP specification terminology and utilizing a specialized router to map colloquial user queries to authoritative vocabularies.
+
+#### 7.2.3.2 Retrieval Optimization
+
+Feeding low-quality or irrelevant context into an LLM elevates hallucination rates and degrades reasoning performance. Structuring how information is fetched and windowed minimizes these failures.
+
+Rather than relying on a static, single-hop lookup, recursive retrieval executes multi-step searches to gather deeper evidence:
+
+- ReACT: Interleaves CoT (Chain-of-Thought) reasoning steps with dynamic search queries, recursively refining information gathering as reasoning progresses.
+- RATP: Leverages Monte Carlo Tree Search (MCTS) simulations to identify optimal context trajectories, formatting the best paths into structured templates for the generator.
+
+Chunk sizing governs the trade-off between embedding precision and contextual completeness. 
+
+- LlamaIndex: Employs the Small-to-Big paradigm, decoupling the text representation used for matching from the text passed to the LLM. For instance, Sentence-Window Retrieval indexes fine-grained, individual sentences for precise vector hits but expands surrounding sentence windows when constructing the generator's context window.
+- RAPTOR: Resolves context fragmentation across long documents by recursively embedding, clustering, and summarizing text chunks into a hierarchical tree. This lets the system retrieve broad thematic summaries alongside specific leaf chunks.
+- Prompt-RAG: Pre-generates a document table of contents, allowing the language model to autonomously navigate and select specific chapters or sections relevant to the query.
+
+Standard, off-the-shelf embedding models often struggle with specialized technical nomenclature or unique relational tasks. Adapting embedding models on domain-specific corpora aligns vector spaces with downstream generative requirements:
+
+- REPLUG: Treats the generator LLM as a frozen black box and updates retriever weights by supervising them directly on the language model's output perplexity.
+- APICoder: Fine-tunes the retriever on Python code artifacts—specifically API names, function signatures, and docstrings—to optimize API recommendation retrieval.
+- EDITSUM: Fine-tunes the retriever with an objective aimed at reducing the Jaccard distance between post-retrieval summaries.
+- SYNCHROMESH: Enhances code generation retrieval by integrating Abstract Syntax Tree (AST) tree-distance metrics into the loss function and optimizing the retriever with TST (Target Similarity Tuning).
+- R-ConvED: Employs the identical dialogue datasets used by the conversational generator to fine-tune its retriever, aligning conversational context with knowledge retrieval.
+
+Choosing an embedding model requires balancing strict infrastructure boundaries against downstream task performance.
+
+1. Establish Hardware & Scenario Constraints. Begin by establishing hard filtering boundaries based on available infrastructure and performance SLAs. Modern high-performing embeddings increasingly derive from decoder LLMs (such as the GTE-Qwen series), frequently scaling to 7B+ parameters. These models demand substantial GPU memory and introduce notable inference latency, making them impractical for edge deployments or low-latency production pipelines. Next, verify whether document chunk sizes require extended context embeddings (e.g., 8k to 32k tokens) or if standard 512-token windows suffice. Larger token windows scale compute requirements quadratically, directly impacting end-to-end latency.
+
+2. Evaluate Top-Performing Candidates. Reference the MTEB (Massive Text Embedding Benchmark) Leaderboard. Updated to MTEB v2 in 2025, the benchmark evaluates over 250 languages across 500+ standardized tasks, incorporating modern challenges like instruction-following, long-document search, and code retrieval while utilizing downsampling to preserve evaluation efficiency. Rather than relying solely on global composite scores, sort the leaderboard by your specific operational use case—such as Retrieval, Reranking, Summarization, STS (Semantic Textual Similarity), Classification, or Clustering. Be aware that several top-ranked entries (such as Seed1.5-Embedding) may remain proprietary or closed-source, whereas open-weight LLM backbones like GTE-Qwen regularly demonstrate top-tier benchmark results. However, Benchmark metrics don't always capture real-world edge cases, tokenization quirks, or deployment stability. Validate choices by inspecting Hugging Face model hub trends.
+
+We introduce the Qwen3-Embedding model here. Modern Retrieval-Augmented Generation (RAG) and information retrieval systems increasingly rely on unified language model architectures for both representation and scoring. The core philosophy behind the Qwen3 Embedding and Qwen3 Reranker series is task-aware relevance evaluation. Given an input query $q$ and a candidate document $d$, relevance is assessed strictly under the semantic guidance of a task-specific instruction $I$. To instill this task-conditioned reasoning, training pipelines format data into structured tuples $\{I_i, q_i, d_i^+, d_{i,1}^-, \dots, d_{i,n}^-\}$, where $d_i^+$ represents the positive ground-truth document and $d_{i,j}^-$ represents negative candidate documents. Training across diverse paired corpora enables robust zero-shot generalization across major downstream tasks, including retrieval, semantic textual similarity (STS), text classification, and clustering. 
+
+Both the embedding and reranking models are initialized directly from Qwen3 Dense base foundations to inherit strong contextual representation and natural instruction-following capabilities. They are offered in three compute-flexible scales: 0.6B, 4B, and 8B parameters. Key design highlights across the suite include:
+
+- Native 32K Context Windows: All variants support long-context processing up to 32,768 tokens without chunk truncation.
+- Matryoshka Representation Learning (MRL): The embedding models natively support MRL, allowing practitioners to truncate output vector dimensions (e.g., from 4096 down to smaller sizes) to save vector database memory and compute with minimal accuracy loss.
+- Universal Instruction Awareness: Both embedding and reranking variants dynamically alter vector trajectories or relevance scores based on user-supplied instructions.
+
+Embedding Pipeline (Bi-Encoder):
+Query:    [Instruction] + [Query] + [EOS]  ──>  LLM (Causal Attention)  ──>  Last Layer [EOS] Hidden State  ──> Vector
+Doc:                      [Doc]   + [EOS]  ──>  LLM (Causal Attention)  ──>  Last Layer [EOS] Hidden State  ──> Vector
+
+Reranking Pipeline (Cross-Encoder / Pointwise):
+Joint Context:  [Instruction] + [Query] + [Doc]  ──>  LLM  ──>  LM Head Softmax on "yes" vs "no"  ──> Relevance Score
+
+Hybrid architectures for RAG combine multiple retrieval engines or diverse modalities to overcome individual search limitations:
+
+- RAP-Gen, BlendedRAG, & ReACC: Concurrently deploy dense semantic retrievers alongside sparse lexical retrievers (e.g., BM25) to capture both high-level semantic intent and exact keyword matches.
+- Rencos: Uses sparse retrieval for syntactic pattern matching in code snippets, paired with dense embeddings to evaluate semantic intent.
+- BASHEXPLAINER: Executes dense retrieval first to isolate semantic boundaries, followed by sparse retrieval to verify exact command-line keywords.
+- RetDream: Implements cross-modal retrieval by querying textual descriptions first, followed by visual image embedding retrieval.
+- CRAG (Corrective RAG): Deploys a dedicated retrieval evaluator to score query-document relevance, triggering three conditional pathways: direct knowledge refinement when confidence is high, fallback web search when retrieval is incorrect, and hybrid search when results are ambiguous.
+- UniMSRAG: Introduces a dedicated Acting Token into the model's vocabulary, allowing the system to dynamically determine which external source to query.
+
+Raw retrieved candidate lists often contain vector collision artifacts, redundancy, or excessive padding. Post-processing ensures the context window remains information-dense. Reranking reorders candidate chunks to maximize diversity, penalize redundancy, and position the most salient facts favorably:
+
+- Re2G: Deploys a cross-encoder reranker downstream of initial vector search, recovering critical signals lost during vector embedding compression.
+- AceCoder: Utilizes a selection mechanism to rerank candidate code snippets, filtering out structural redundancies to present varied implementation patterns.
+- XRICL: Employs an exemplar reranker trained via knowledge distillation to select high-performing in-context demonstrations.
+- Rangan: Calculates a Quantized Influence Measure (QIM) to assess statistical discrepancies between queries and references, ranking data subsets based on true model influence.
+- UDAPDR: Employs LLM-synthesized queries to train domain-specific rerankers, applying multi-teacher distillation to build robust domain adapters.
+- LLM-R: Iteratively refines retrieval rankings by leveraging static LLM document evaluations, reward modeling, and progressive knowledge distillation cycles.
+
+Rather than passing raw passages directly into prompts, retrieval transformation compresses and cleans the context:
+
+- FILCO: Filters out uninformative sentences, isolating only the essential supporting context to reduce generator cognitive load and eliminate distractors.
+- FiD-Light: Encodes candidate documents into intermediate vector representations and compresses them, cutting cross-attention compute and inference latency.
+- RRR (Retrieve, Re-rank, Rewrite): Fuses queries and the top-$k$ retrieved documents via structured templates, using a pre-trained LLM to rewrite the context into a clean, concise prompt. 
