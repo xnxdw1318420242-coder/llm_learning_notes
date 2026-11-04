@@ -577,4 +577,347 @@ Instead of a single "retrieve-then-generate" pass, complex problem-solving requi
 - ITER-RETGEN: Alternates between retrieval and generation. It uses the model's draft outputs to identify remaining knowledge gaps, fetching missing evidence to enrich each subsequent revision cycle.
 - RAT (Retrieval-Augmented Thinking): Combines zero-shot Chain-of-Thought prompting with targeted external search. The LLM first drafts an initial reasoning trajectory, then executes focused searches step-by-step to verify and correct each intermediate deduction before finalizing the answer.
 
-### 7.2.4 Advanced RAG
+### 7.2.4 Future RAG
+
+#### 7.2.4.1 Naive RAG
+
+Naive RAG represents the foundational paradigm widely adopted following the release of ChatGPT. It operates as a linear, three-stage sequential pipeline: Indexing, Retrieval, and Generation. 
+
+1. Indexing: Raw multi-format documents (PDF, HTML, Word, and Markdown) are extracted, cleaned, and standardized into plain text. To accommodate language model context windows, text is split into smaller, manageable chunks. These chunks are encoded into dense vectors using an Embedding model and indexed inside a vector database for similarity search.
+
+2. Retrieval: Upon receiving a user prompt, the system encodes the query using the identical Embedding model utilized during indexing. Vector similarity scores are computed between the query embedding and chunk representations across the corpus, surfacing the top-K most relevant passages to serve as expanded prompt context.
+
+3. Generation: The user query and retrieved passages are synthesized into a coherent prompt for a frozen LLM. The model generates an answer conditioned on its internal parametric knowledge, the external context, or multi-turn conversational history.
+
+Naive RAG suffers from low precision and recall, often retrieving irrelevant or mismatched chunks while missing critical evidence. Single-pass retrieval on raw queries fails on ambiguous or complex multi-step questions. It is also prone to hallucinations when context fails to support the output, alongside risks of toxicity, irrelevance, or bias. Models frequently over-rely on augmented context, parroting retrieved text rather than synthesizing insights. Context injection often causes fragmented, disjointed outputs. Redundant chunks from multiple sources create repetitive responses, while balancing paragraph importance and stylistic consistency remains difficult.
+
+#### 7.2.4.2 Advanced RAG
+
+To overcome the fragility of Naive RAG, Advanced RAG introduces targeted interventions before and after the core retrieval step. 
+
+- Pre-Retrieval Optimization focuses on refining the index structure and the raw user prompt before vector execution. Index Structure Optimization enhances chunk granularity using sliding window techniques, hierarchical chunking, embedding alignment, and structured metadata filtering. It frequently integrates hybrid search (combining sparse lexical matching with dense semantic vectors) to capture both exact keywords and conceptual intent. Query Optimization transforms raw user queries into search-optimized representations via techniques like query rewriting, query transformation, and query expansion.
+
+- Post-Retrieval Refinement resolves context clutter, ordering bias, and token waste before passing documents to the LLM. Reranking dynamically re-scores candidate chunks with cross-encoders to place the most relevant evidence in prime attention positions within the prompt (a pattern standardized in frameworks like LlamaIndex and LangChain). Besides, directly feeding all candidate documents into an LLM causes information overload and attention dilution. Context compression extracts salient sentences, eliminates noise, and trims prompt length to preserve focus on key details.
+
+#### 7.2.4.3 Modular RAG
+
+Modular RAG departs from fixed linear pipelines by treating RAG as an adaptable ecosystem of swappable components, supporting flexible execution paths and end-to-end training. 
+
+- Search Module: Dynamically queries heterogeneous data backends (search engines, SQL/NoSQL databases, and knowledge graphs) using LLM-generated code or domain query languages
+
+- Fusion Module: Employs multi-query expansion to inspect questions from multiple perspectives, pairing parallel vector retrieval with intelligent reranking to uncover latent knowledge.
+
+- Memory Module: Leverages LLM parametric memory to guide search, creating an unbounded, iterative memory pool that adapts dynamically to domain data distributions.
+
+- Routing Module: Dynamically directs queries along optimal pathways—deciding whether to pull summaries, search specialized databases, or merge parallel streams.
+
+- Predict Module: Instructs the LLM to generate synthetic context directly, minimizing retrieval noise and redundancy.
+
+- Adapter Module: Tunes RAG to downstream tasks by automating prompt retrieval for zero-shot inputs and constructing specialized retrievers via few-shot exemplar generation.
+
+Modular architectures enable dynamic interaction loops beyond standard lookup:
+
+- Rewrite-Retrieve-Read: Uses LLM feedback to iteratively refine search queries before fetching documents.
+- Generate-Read: Replaces external retrieval entirely by generating context directly from LLM parametric memory.
+- Recite-Read: Probes internal weights to reconstruct relevant domain facts for knowledge-intensive generation.
+- Sub-queries & HyDE: Employs query decomposition and hypothetical document embeddings to align semantic vectors between generated drafts and ground-truth documents.
+- Adaptive Routing & Collaborative Tuning: The pipeline evaluates whether retrieval is needed at all, allowing seamless integration with reinforcement learning, retriever fine-tuning, generator adaptation, or joint co-tuning.
+
+#### 7.2.4.4 GraphRAG
+
+While vector databases excel at local semantic matching, they struggle with global thematic summaries and multi-hop questions where answers depend on dispersed relational paths. To resolve this, Microsoft Research introduced GraphRAG, enhancing retrieval and generation through structured Knowledge Graphs.
+
+1. Text Unit Chunking: Documents are segmented into text chunks. Choosing chunk length balances cost and performance: larger chunks minimize LLM API calls, but risk lowering recall on entities positioned near chunk boundaries[cite: 30]. Structured prompts extract all entities (names, types, descriptions) and explicit relational edges (source, target, relationship description) as delimited tuples.
+
+2. Entity, Relationship, and Claim Extraction: Prompts extract structured entities and interactions (e.g., NeoChip as a public semiconductor firm, Quantum Systems as its prior owner, and their relational acquisition history). Domain-tailored few-shot prompting adapts this extraction to specialized fields like law, medicine, or finance. Concurrently, the pipeline extracts verifiable claims—structured records of events, dates, and entity interactions.
+
+3. Hierarchical Clustering: Extracted entities, relationships, and claims are consolidated into graph nodes and weighted edges (where edge weight reflects co-occurrence frequency). Identical entities are reconciled using string matching or fine-tuned entity resolvers. The graph is partitioned into densely connected clusters using the Leiden community detection algorithm. This runs recursively to produce a hierarchical tree of communities—from Root communities at level 0 down to granular Sub-communities at level 1 and leaf nodes.
+
+4. Community Summaries: Generates standalone concept summaries for each community cluster, enabling dataset comprehension even without a user query. Summaries roll up hierarchically. Leaf communities prioritizes element summaries by node degree sum (topological importance) and append entity, relation, and claim descriptions up to context limits. For high-level communities, if all sub-elements fit the token limit, they are processed directly; otherwise, longer sub-community descriptions are iteratively substituted with compact sub-summaries until they fit the prompt window.
+
+GraphRAG executes multi-stage Map-Reduce reasoning over hierarchical summaries:
+
+1. Prepare Community Summaries: Shuffles community summaries randomly into pre-allocated token windows to disperse related information and prevent window-concentration bias.
+2. Map Community Answers: Generates intermediate candidate answers in parallel. The LLM assigns a helpfulness score between 0 and 100 to each intermediate candidate; responses scoring 0 are discarded.
+3. Reduce to Global Answer: Sorts filtered intermediate answers in descending order by helpfulness score, fills a new context window up to the token limit, and synthesizes the final comprehensive response.
+
+GraphRAG has dual query modes. Global Search uses high-level community summaries to address broad, corpus-wide thematic questions that require summarizing entire document collections. Local Search traverses local neighborhoods around specific entities and related claims to deliver precise, context-rich answers to entity-centric queries.
+
+Global search is designed for open-ended, macro-level prompts that require synthesizing broad themes across an entire document archive. It operates over pre-computed community summaries via a Map-Reduce pipeline.
+
+1. User Query & Conversation History: The model combines the raw user prompt with conversational history to retain session context.
+
+2. Community Report Batching: Context is drawn from node community reports generated by an LLM at a specified level of the graph hierarchy. To prevent prompt concentration bias and token overflow, these reports are shuffled and split into discrete batches: Shuffled Community Report Batch 1, Batch 2, ..., Batch N.
+
+3. Rated Intermediate Responses (RIR): Each community batch is segmented into pre-allocated text blocks to generate an intermediate answer in parallel. Each response generates structured key points, with each point assigned a numerical importance score. These candidate outputs form Rated Intermediate Response: Response 1, Response 2, ..., Response N.
+
+4. Ranking and Filtering: The orchestrator ranks and filters all intermediate points across batches based on their numerical scores, pruning unhelpful responses to isolate the most salient evidence into an Aggregated Intermediate Response.
+
+5. Final Answer Generation: The aggregated, high-confidence points are synthesized in the final LLM context window to produce the comprehensive response.
+
+Local search resolves queries centered on a specific Entity—such as a named person, geographical location, or organization. It anchors on the target entity within the graph and extracts its immediate relational neighborhood:
+
+1. Query Ingestion: Receives the user prompt (ranging from simple lookups to complex multi-hop questions).
+
+2. Similar Entity Search: Identifies a seed set of semantically relevant entities from the knowledge graph using a dedicated vector database (such as Milvus) as the entry point into the graph topology.
+
+3. Entity-Text Unit Mapping: Maps seed entities back to their raw source text segments, surfacing original contextual evidence while pruning irrelevant text.
+
+4. Entity-Relationship Extraction: Traverses adjacent graph edges to pull explicit relationships and interaction metadata connecting candidate entities.
+
+5. Entity-Covariate Mapping: Maps entities to their external covariates, integrating associated attributes, timestamps, or statistical data.
+
+6. Entity-Community Report Mapping: Incorporates community reports containing the seed entities to provide high-level background context.
+
+7. Conversational Context Integration: Fuses multi-turn history to resolve ambiguous pronouns or references.
+
+8. Final Answer Synthesis: Ranks, filters, and passes all extracted text units, relations, covariates, and community summaries to the LLM to generate the final response.
+
+GraphRAG is not a drop-in replacement for traditional RAG; it is a structural extension. It resolves multi-hop reasoning failures that vector databases miss. Based on symbolic graph structures, it make entity links and reasoning paths directly auditable by humans and easily parsed by downstream algorithms. Graph schemas enforce deterministic entity boundaries, minimizing hallucinations and turning disconnected unstructured data into queryable enterprise assets.
+
+GraphRAG builds both a domain graph modeling real-world domain knowledge and a lexical graph reflecting linguistic dependencies and structures. If traditional vector RAG already meets production requirements, migrating directly to GraphRAG introduces unnecessary overhead. The architecture requires significant compute for initial graph extraction, presents latency challenges on massive graphs, and demands deep domain expertise to design effective extraction prompts.
+
+#### 7.2.4.5 Agentic RAG
+
+Traditional RAG systems follow rigid, deterministic pipelines. In contrast, Agentic RAG incorporates autonomous agents that evaluate query intent, select appropriate tools dynamically, verify context validity, and execute multi-step corrections.
+
+A single-agent architecture relies on a centralized decision-making agent that manages retrieval, tool routing, and answer synthesis within a unified control loop.
+
+1. Query Submission & Evaluation: The coordinator receives the query and determines the optimal information path.
+
+2. Knowledge Source Selection: Routes requests based on query characteristics. Structured Databases converts tabular queries via Text-to-SQL to interface directly with PostgreSQL or MySQL. Semantic Search dispatches vector search across unstructured documents (PDFs, literature, internal corporate records). Web Search leverages live web search engines for breaking public data or broad information. Recommendation Systems queries personalization engines for contextual or user-preference-driven tasks.
+
+3. Data Integration & LLM Synthesis: Pulls candidate outputs from tools into the LLM context, unifying them into a coherent answer.
+
+4. Output Generation: Delivers a concise, actionable answer complete with citations.
+
+System Characteristics:
+
+- Centralized Simplicity: Low architectural overhead; straightforward to build, monitor, and maintain.
+
+- Resource Efficiency: Low compute requirements with single-pass inference paths.
+
+- Dynamic Routing & Tool Versatility: Dynamically handles diverse APIs across structured and unstructured data.
+
+- Best Fit: Ideal for well-scoped systems with bounded tool requirements (e.g., combining simple document search with SQL lookup).
+
+When systems handle diverse enterprise tools simultaneously, a single agent's reasoning window can easily become overloaded. Multi-Agent RAG decomposes the pipeline into specialized domain agents operating in parallel.
+
+1. Query Submission: A master retrieval coordinator ingests the prompt and delegates sub-queries to specialized agents.
+
+2. Specialized Retrieval Agents: Multiple domain-specific workers run concurrently.
+
+3. Tool Access & Parallel Retrieval: Sub-agents concurrently query their respective tools—Vector Search, Text-to-SQL, Web Search, and proprietary APIs.
+
+4. Data Integration & Synthesis: The primary LLM unifies disparate, multi-format payloads into a coherent context.
+
+5. Output Generation: Surfaces an integrated, user-ready answer.
+
+**Advantages**
+
+- High modularity.
+- Horizontal scalability via parallel retrieval.
+- Higher accuracy through task specialization.
+- Operational efficiency that mitigates single-agent bottlenecks; broad cross-domain versatility.
+
+**Disadvantages**
+
+- High coordination complexity across inter-agent communications.
+- Increased token and GPU computational overhead.
+- High difficulty in data integration when synthesizing conflicting or heterogeneous outputs.
+
+Hierarchical Agentic RAG structures agents vertically across strategic leadership and tactical execution tiers. High-level supervisory agents orchestrate and review the work of specialized subordinate workers.
+
+1. Query Reception: The top-level master agent receives the query and performs initial scope evaluation.
+
+2. Strategic Decision-Making: Evaluates query complexity and prioritizes which underlying data sources or agents are most authoritative for the given context.
+
+3. Delegation to Subordinates: Routes sub-tasks to specialized lower-tier agents (e.g., executing specific SQL procedures or web scraping).
+
+4. Aggregation & Synthesis: The supervisory agent collects intermediate outputs, resolves inconsistencies, and synthesizes a structured answer.
+
+5. Response Delivery: Delivers a thoroughly cross-verified final response.
+
+**Advantages**
+
+- Strategic prioritization ensures reliable knowledge sources take precedence.
+- Strong scalability for multi-faceted tasks.
+- Supervisory oversight leads to enhanced decision-making and improved answer coherence.
+
+**Disadvantages**
+
+- Significant coordination complexity across multi-tier agent communication.
+- Challenging resource allocation to balance latency and prevent system bottlenecks.
+
+Self-Corrective Agentic RAG integrates validation loops directly into the retrieval pipeline. Instead of blindly passing retrieved documents to the generator, the system audits context relevance and triggers corrective paths when evidence is lacking.
+
+1. Document Relevance Assessment: An evaluation agent scores retrieved document relevance against the user's intent. Context falling below confidence thresholds triggers automated correction.
+
+2. Query Optimization and Enhancement: If candidate context is insufficient or noisy, a refinement agent reformulates search terms using semantic query rewriting.
+
+3. Dynamic Retrieval from External Sources: When internal indexes lack sufficient coverage, a search agent triggers live web searches or fallback databases to supplement context.
+
+4. Answer Synthesis: The synthesis agent fuses validated, filtered documents and supplemental web context to produce an accurate, hallucination-resistant answer.
+
+**Advantages**
+
+- Iterative Correction: Actively isolates and rectifies retrieval failures rather than propagating incorrect context downstream, ensuring high answer accuracy.
+- Dynamic Adaptability: Combines real-time web search fallback with semantic query rewrites to boost context precision across ambiguous tasks.
+- Agent Modularity: Decoupling responsibilities across dedicated single-purpose agents yields a resilient, maintainable, and easily scalable architecture.
+- Factuality Guarantee: Enforcing strict pre-generation verification across all candidate evidence minimizes hallucination and factual inconsistency.
+
+Standard RAG pipelines route all user queries through the exact same retrieval machinery, wasting compute on trivial facts and under-serving complicated queries. Adaptive Agentic RAG introduces dynamic complexity triage: a lightweight routing agent evaluates the prompt first, routing simple lookups to zero-shot generation and reserving multi-hop retrieval for complex reasoning.
+
+1. Direct Query: Targets static or common-sense factual questions where the base model's internal parametric memory is completely sufficient. The system bypasses external retrieval entirely, eliminating latency and avoiding unnecessary compute costs.
+
+2. Simple Query: Targets queries requiring minimal, highly focused context updates. The system executes a single-step retrieval pass to pull the missing data point.
+
+3. Complex Query: Targets multi-layered, analytical inquiries requiring deep exploratory reasoning. The system initiates multi-step, iterative retrieval to progressively gather evidence, resolve sub-questions, and refine intermediate findings.
+
+There are three core functional pillars:
+
+1. A compact, fine-tuned language model evaluates incoming queries to predict task complexity. This classifier is trained on automated datasets labeled from historical model execution logs and query feature profiles.
+
+2. Dynamic Strategy Selection decouples query execution paths into zero-retrieval direct generation, single-step lookups, or multi-step iterative loops based on the classifier's assessment.
+
+3. The primary generator synthesizes the retrieved evidence into a coherent answer while engaging in an iterative interaction loop with the classifier to continually refine multi-step complex tasks.
+
+During execution, the underlying agentic flow validates context and intermediate steps before committing to an output:
+
+1. The query initiates retrieval, traversing candidate document graphs.
+
+2. A relevance gate assesses candidate passages; if irrelevant, the query branch is adjusted.
+
+3. Candidate responses pass through a Hallucination detection filter. If hallucinations are detected, control loops back to the retrieval phase for fresh grounding.
+
+4. An Answer Questions audit verifies that the generated text directly answers the original prompt before emitting the final response.
+
+**Advantages**
+
+- Dynamic Adaptability: Matches the retrieval depth directly to the problem's complexity, optimizing throughput and response fidelity.
+
+- Resource Efficiency: Prunes unnecessary vector search overhead on trivial queries while allocating computational budget to deep, complex tasks.
+
+- Enhanced Accuracy: Multi-step iterative refinement resolves complex multi-hop queries with significantly higher precision.
+
+- Flexibility: Easily scales to include additional specialized routing branches, such as external domain APIs or code execution engines.
+
+### 7.2.5 LangChain
+
+LangChain functions as an orchestration framework engineered specifically for developing large language model (LLM) applications. Rather than writing custom glue code, developers leverage its comprehensive suite of abstractions and modular tools to simplify connecting LLMs with external knowledge bases. This architectural backbone empowers systems to become truly context-aware and capable of executing complex, multi-step reasoning workflows.
+
+Real-world AI systems require continuous access to enterprise and third-party data ecosystems. LangChain provides standardized interfaces and connectors designed to interact smoothly with diverse external sources:
+
+- Databases: Connects directly to relational and structured data stores via specialized query wrappers and execution engines.
+
+- APIs: Interfaces LLM workflows with live web services, REST endpoints, and proprietary programmatic tools.
+
+- File Systems: Ingests unstructured documents, local directories, and cloud-hosted file repositories into the runtime pipeline.
+
+By handling the underlying protocol plumbing, the framework allows developers to assemble sophisticated data pipelines with minimal boilerplate.
+
+Building production-ready Retrieval-Augmented Generation (RAG) systems requires tightly orchestrated data transformations. LangChain delivers clear architectural advantages over bespoke implementations:
+
+- Modular Lifecycle Coverage: Offers decoupled, swappable components covering every discrete stage of the RAG lifecycle—including data loading, retrieval, generation, and post-processing.
+
+- Development Velocity & Maintainability: Standardized interfaces allow engineers to rapidly prototype, benchmark, and swap out vector databases or embedding models without breaking downstream orchestration logic.
+
+Constructing an end-to-end baseline RAG pipeline in LangChain involves wiring together three core architectural modules:
+
+1. Data Loaders: Parse, clean, and chunk raw documents sourced from external repositories.
+
+2. Retrievers: Accept user queries, traverse vector stores or keyword indexes, and fetch the most semantically relevant text fragments.
+
+3. Generators: Synthesize the retrieved context alongside the user's prompt to guide the LLM toward grounded, hallucination-free generation. 
+
+LangChain’s unified pipeline abstractions connect these three layers into a single execution stream.
+
+Modern enterprise RAG pipelines must reason across formats beyond plain text. LangChain provides native tools and interfaces to ingest, parse, and coordinate diverse modalities:
+
+1. Text: Ingests structured and unstructured documentation.
+
+2. Images: Processes visual assets, diagrams, charts, and image embeddings.
+
+3. Audio: Incorporates sound files, voice transcripts, and audio data streams.
+
+These multi-modal primitives enable teams to architect cross-modal RAG applications capable of retrieving and answering questions from blended multimedia corpora.
+
+LangChain continuously expands its ecosystem to address enterprise engineering standards:
+
+- LangChain Expression Language: A declarative syntax for defining and composing runtime chains. LCEL provides out-of-the-box streaming, asynchronous processing, and parallel execution, drastically simplifying how complex pipelines transition from development to production.
+
+- Integrated Evaluation & Testing: Features native integration with testing suites such as Pytest (Python) and Vitest (TypeScript/JavaScript). This allows teams to implement continuous automated evaluation, unit testing, and regression benchmarking across retrieval and generation steps.
+
+## 7.3 Agent
+
+An LLM-powered agent is an autonomous artificial intelligence entity built on top of a Large Language Model (LLM) foundation. Moving beyond passive text generation, an agent is endowed with environmental perception, autonomous comprehension, decision-making, and action execution capabilities. By simulating independent reasoning processes and flexibly invoking external tools, an agent autonomously navigates dynamic environments to achieve predefined objectives step-by-step.
+
+To bridge the gap between abstract reasoning and concrete execution, an agent architecture relies on four foundational modules:
+
+- Planning: Acts as the strategic engine of the agent. It handles goal setting, decomposes complex macro-objectives into manageable sub-tasks, and formulates step-by-step execution trajectories.
+
+- Memory: Serves as the agent's contextual knowledge base. It stores state across interactions and encompasses both short-term memory (in-context working memory, prompt history, and immediate scratchpads) and long-term memory (persistent retrieval-augmented databases, historical interaction logs, and retained knowledge).
+
+- Tools: Extends the model's capabilities beyond its frozen parametric weights. It enables the agent to interface with and invoke external utilities, calculators, APIs, search engines, and enterprise data backends to accomplish domain-specific tasks.
+
+- Action: Translates planned strategies into tangible impact. It executes specific operations, makes concrete runtime decisions, calls APIs, and returns final responses to the user or external system.
+
+## 7.4 LLM for Search
+
+Applying Large Language Models to modern information retrieval and search systems (LLM4Search) fundamentally resolves to a text ranking problem. Given a user query $q$, a candidate pool of retrieved passages $[p_1, \dots, p_N]$, and their ground-truth relevance labels $[y_1, \dots, y_N]$, the objective is to leverage an LLM to score and re-order the passages in descending order of a target objective $y$ (such as semantic relevance, click-through rate [CTR], or conversion rate).  
+
+In practice, operationalizing LLMs for ranking splits into three foundational paradigms: Pointwise, Pairwise, and Listwise ranking.
+
+The pointwise approach frames ranking as an independent, passage-by-passage relevance prediction task (modeled via regression or classification). The model scores each candidate passage $p_i$ in total isolation, and the final search result is generated by sorting these individual scalar scores. The model estimates the posterior probability of relevance for a single passage:
+
+$$P(y_i \mid q, p_i)$$
+
+Functional Behavior: Let the model output $f_{\text{point}}(q, p_i) \in [0, 1]$ represent the relevance probability:  
+
+- For irrelevant passages ($y_i = 0$): $f_{\text{point}}(q, p_i) \to 0$.
+
+- For relevant passages ($y_i = 1$): $f_{\text{point}}(q, p_i) \to 1$.
+
+- Multi-Grade Relevance: For graded relevance schemes, the objective encourages $f_{\text{point}}(q, p_i)$ to converge toward the corresponding discrete grade level or its monotonic transformation.
+
+Rather than evaluating passages in a vacuum, pairwise reranking frames the problem as preference learning under a shared query context. The model directly compares two candidate passages ($p_i$ vs. $p_j$) to determine which is more relevant, with optimization centered on learning a distinct, separable margin between items. A global ranking is subsequently synthesized through tournament sorting or voting graphs built from these binary comparisons.   
+
+- Prediction Objective: The model predicts the probability that passage $p_i$ is strictly more relevant than passage $p_j$:
+
+$$P(y_i > y_j \mid q, p_i, p_j)$$
+
+- Score-Difference Modeling: Commonly formulated via the difference of latent scores passed through a sigmoid function:
+
+$$\sigma(f(q, p_i) - f(q, p_j))$$
+
+- Functional Behavior: Let the scoring function be $f_{\text{pair}}(q, p)$, where higher values denote greater relevance. When passage $p_i$ is superior ($y_i > y_j$): The margin diverges positively:
+
+$$f_{\text{pair}}(q, p_i) - f_{\text{pair}}(q, p_j) \to +\infty$$
+
+When passage $p_j$ is superior ($y_i < y_j$): The margin diverges negatively:
+
+$$f_{\text{pair}}(q, p_i) - f_{\text{pair}}(q, p_j) \to -\infty$$
+
+When passages have identical relevance ($y_i = y_j$): The score difference closes to zero:
+
+$$f_{\text{pair}}(q, p_i) - f_{\text{pair}}(q, p_j) \to 0$$
+
+Listwise ranking treats the candidate pool as an interdependent whole, learning an optimal permutation $\pi$ over the entire candidate list $[p_1, \dots, p_N]$ in a single conversational turn. This structure eliminates cross-passage isolation and aligns training objectives directly with standard ranking metrics, such as NDCG (Normalized Discounted Cumulative Gain).   
+
+- Prediction Objective: Given query $q$ and candidate collection $\mathbf{P} = [p_1, \dots, p_N]$, the LLM predicts the probability of an ordered permutation $\pi$ (e.g., $[3] > [1] > \dots$):
+
+$$P(\pi \mid q, [p_1, \dots, p_N])$$
+
+- Functional Behavior: Let the model assign a contextual score $s_i = f_{\text{list}}(q, p_i)$ to each passage within the list context, inducing a permutation $\pi(\mathbf{s})$. When passage $p_i$ is strictly better than $p_j$ ($y_i > y_j$): The probability of $p_i$ preceding $p_j$ in the ranking approaches $1$, which equates to driving the score gap to infinity:
+
+$$s_i - s_j \to +\infty$$
+
+Optimal Permutation Alignment: If there exists an ideal ranking $\pi^*$ induced by the ground-truth relevance vector $\mathbf{y}$, the generative likelihood of that sequence approaches unity:
+
+$$P(\pi^* \mid q, \mathbf{P}) \to 1$$
+
+Metric Convergence: The permutation induced by predicted scores maximizes ranking quality over the candidate list:
+
+$$\text{NDCG}(\pi(\mathbf{s}), \mathbf{y}) \to 1$$
+
+By passing all candidate passage IDs into the prompt simultaneously, listwise models allow the LLM's self-attention layers to directly model inter-document cross-attention and relative utility, producing the final ranking list in a single generation step.
