@@ -449,7 +449,67 @@ Doc:                      [Doc]   + [EOS]  ──>  LLM (Causal Attention)  ─�
 Reranking Pipeline (Cross-Encoder / Pointwise):
 Joint Context:  [Instruction] + [Query] + [Doc]  ──>  LLM  ──>  LM Head Softmax on "yes" vs "no"  ──> Relevance Score
 
-Hybrid architectures for RAG combine multiple retrieval engines or diverse modalities to overcome individual search limitations:
+- Qwen3 Embedding Execution: Because decoder LLMs use causal attention (each token only attends to previous tokens), an [EOS] token is appended at the very end of the sequence. The final dense embedding vector is extracted directly from the hidden state of the last layer at the [EOS] token position, ensuring full-sequence contextual awareness. To avoid polluting candidate document representations with task instructions, instructions are only applied to the query side. The document is ingested in its raw form, while queries are formatted as:
+
+$$\{ \text{Instruction} \} \ \{ \text{Query} \} \text{<\vert{}endoftext\vert{}>}$$
+
+The embedding models train on batches of $N$ samples using an enhanced InfoNCE objective with cosine similarity $s(\cdot, \cdot)$ and temperature hyperparameter $\tau$:  
+
+$$\mathcal{L}_{\text{embedding}} = - \frac{1}{N} \sum_{i=1}^N \log \frac{e^{s(q_i, d_i^+) / \tau}}{Z_i}$$
+
+The denominator $Z_i$ aggregates positive pairs alongside a comprehensive pool of negative pairs across the mini-batch: 
+
+$$Z_i = e^{s(q_i, d_i^+) / \tau} + \sum_{k=1}^K m_{ik} e^{s(q_i, d_{i,k}^-) / \tau} + \sum_{j \neq i} m_{ij} e^{s(q_i, q_j) / \tau} + \sum_{j \neq i} m_{ij} e^{s(d_i^+, d_j) / \tau} + \sum_{j \neq i} m_{ij} e^{s(q_i, d_j) / \tau}$$
+
+This denominator accounts for:
+
+1. The positive document pair $(q_i, d_i^+)$.
+2. $K$ mined hard negative documents $d_{i,k}^-$.
+3. Cross-query in-batch negatives $(q_i, q_j)$.
+4. Cross-document in-batch negatives $(d_i^+, d_j)$.
+5. Standard in-batch cross pairs $(q_i, d_j)$.
+
+False-Negative Masking Factor ($m_{ij}$): In large web-scale batches, unlabeled passages frequently represent valid alternate answers (false negatives). To prevent penalizing correct semantic overlaps, a dynamic masking filter strips out false negatives:
+
+$$m_{ij} = \begin{cases} 0, & \text{if } s_{ij} > s(q_i, d_i^+) + 0.1 \ \text{ or } \ d_j = d_i^+ \\ 1, & \text{otherwise} \end{cases}$$
+
+If any candidate's similarity score $s_{ij}$ exceeds the positive ground-truth score by a threshold margin of $0.1$ (or matches the ground truth document), its gradient penalty is completely masked ($m_{ij} = 0$). 
+
+- Qwen3 Reranking Execution. Reranking processes query, document, and instruction jointly in a single context window using the model's standard chat template. Instead of outputting scalar regression values, relevance evaluation is framed as predicting the next token probability between yes and no. 
+
+$$\text{score}(q, d) = \frac{e^{P(\text{yes} \mid I, q, d)}}{e^{P(\text{yes} \mid I, q, d)} + e^{P(\text{no} \mid I, q, d)}}$$
+
+The reranker directly optimizes standard cross-entropy loss over the target binary token $l \in \{\text{yes}, \text{no}\}$: 
+
+$$\mathcal{L}_{\text{reranking}} = - \log p(l \mid P(q, d))$$
+
+The target label $l$ is supervised as yes for ground-truth positive pairs and no for negative candidate pairs, sharpening the discriminative decision boundary.  
+
+The Qwen3 training framework combines large-scale synthetic generation with multi-checkpoint interpolation across three progressive stages:
+
+[ Base Qwen3 Foundation ]
+         │
+         ├─── (Embedding Only) ───> [ Stage 1: Weakly Supervised Pre-Training ]
+         │                          (Large-scale synthetic paired data)
+         │                                        │
+         ▼                                        ▼
+[ Stage 2: Supervised Fine-Tuning (SFT) ] <───────┘
+  (Curated labeled benchmarks + High-quality synthetic data)
+         │
+         ▼
+[ Stage 3: Model Merging (SLERP) ]
+  (Interpolation of diverse checkpoints sampled from Stage 2)
+         │
+         ├───> Qwen3-Embedding (0.6B / 4B / 8B)
+         └───> Qwen3-Reranker  (0.6B / 4B / 8B)
+
+The Reranking model bypasses Stage 1 weak supervision entirely, initializing directly from the Qwen3 base model into Stage 2 SFT. 
+
+- Base models possess strong internal text generation and reasoning capabilities. Rather than scraping noisy, uncurated web corpora, Qwen3 utilizes LLM-synthesized data pairs. Prompts explicitly specify and modulate dimensions such as task category, target language, passage length, and difficulty level, delivering controlled data diversity even in low-resource language environments.
+- Leveraging Qwen3's generative fidelity, high-precision synthetic reasoning examples are selectively blended into curated human-labeled datasets, expanding edge-case coverage and fine-tuning convergence.
+- Following supervised fine-tuning, multiple intermediate checkpoints saved across different training stages and data distributions are merged using spherical linear interpolation (SLERP). Merging weights across diverse trajectories smooths the loss landscape, significantly improving generalization and preventing overfitting across unseen downstream evaluation domains.
+  
+Now beyond Qwen3, hybrid architectures for RAG combine multiple retrieval engines or diverse modalities to overcome individual search limitations:
 
 - RAP-Gen, BlendedRAG, & ReACC: Concurrently deploy dense semantic retrievers alongside sparse lexical retrievers (e.g., BM25) to capture both high-level semantic intent and exact keyword matches.
 - Rencos: Uses sparse retrieval for syntactic pattern matching in code snippets, paired with dense embeddings to evaluate semantic intent.
@@ -472,3 +532,66 @@ Rather than passing raw passages directly into prompts, retrieval transformation
 - FILCO: Filters out uninformative sentences, isolating only the essential supporting context to reduce generator cognitive load and eliminate distractors.
 - FiD-Light: Encodes candidate documents into intermediate vector representations and compresses them, cutting cross-attention compute and inference latency.
 - RRR (Retrieve, Re-rank, Rewrite): Fuses queries and the top-$k$ retrieved documents via structured templates, using a pre-trained LLM to rewrite the context into a clean, concise prompt. 
+
+#### 7.2.3.3 Generator Optimization
+
+The generation model sets the performance ceiling for the entire RAG system. Enhancing the generator focuses on three technical tiers: Prompt Engineering, Decoding Tuning, and Generator Fine-Tuning.
+
+1. Prompt Engineering. Advanced prompting paradigms allow frozen foundation models to handle noisy or long retrieved passages more effectively:
+
+- Core Prompting Paradigms: Strategies such as Prompt Compression, Stepback Prompt, Active Prompt, and Chain of Thought Prompt (CoT) adapt seamlessly to LLM generators within RAG pipelines to boost output quality.
+- LLMLingua: Uses a compact language model to prune tokens and compress the input query and context. This speeds up inference, reduces distracting noise, and mitigates the classic "lost-in-the-middle" phenomenon in long context windows.
+- ReMoDiffuse: Uses ChatGPT to decompose complex multi-faceted prompts into structured, anatomical text scripts for motion diffusion.
+- ASAP: Formulates in-context exemplars as structured tuples—combining input code, function definitions, static analysis results, and docstrings—to ground code generation tasks.
+- CEDAR: Structures code prompts using specialized templates that systematically organize code demonstrations, search queries, and natural language instructions.
+- XRICL: Employs Chain-of-Thought prompting by injecting translation pairs as intermediate reasoning steps to improve cross-lingual semantic parsing.
+- ACTIVERAG: Implements a cognitive leash mechanism to anchor the LLM’s intrinsic knowledge, pairing it with Chain-of-Thought reasoning during generation.
+- Make-An-Audio: Ingests complementary modalities alongside text, supplying richer multi-modal context for downstream audio synthesis.
+
+2. Decoding Tuning. Rather than altering model weights, decoding tuning adjusts generation hyperparameters and token sampling directly at inference time:
+
+- InferFix: Dynamically tunes decoding temperature parameters to balance output diversity against syntactic correctness in automated program repair.
+- SYNCHROMESH: Enforces constrained decoding via a completion engine that prunes the candidate token vocabulary at each step, eliminating syntax errors in domain-specific languages and code generation.
+  
+3. Generator Fine-Tuning. When frozen models hit capability ceilings, fine-tuning aligns the generator’s weights with the retriever’s latent space or domain-specific data:
+
+- RETRO (Retrieval-Enhanced Transformer): Freezes the retriever and equips the generator with a chunked cross-attention mechanism to integrate retrieved passages directly into intermediate hidden layers.
+- APICoder: Fine-tunes a CODEGEN-MONO 350M base model on code files augmented with shuffled contexts, API specifications, and code snippets.
+- CARE: Pre-trains multi-modal encoders across image-, audio-, and video-text datasets, then fine-tunes the generative decoder to minimize caption and concept detection losses while holding the encoders and retriever frozen.
+- Animate-AStory: Leverages static images to optimize video synthesis, fine-tuning a LoRA adapter to preserve visual appearance details across character sequences.
+- RetDream: Fine-tunes a LoRA adapter on rendered 3D image pairs to enhance cross-modal synthesis fidelity.
+
+ #### 7.2.3.4 Result Optimization
+
+ When raw model outputs deviate from the target schema or introduce minor factual inconsistencies, post-generation result enhancement techniques calibrate and clean the output. 
+
+ - SARGAM: Tailored for software engineering pipelines, SARGAM uses a specialized Transformer equipped with deletion, placeholder, and insertion classifiers to rewrite generated code, aligning it cleanly with the local codebase context.
+ - Ring: Reranks candidate generations based on the average token-level log-probability produced by the generator, surfacing more diverse and statistically confident answers.
+ - CBRKBQA: Corrects generated relation triples by aligning them directly against the local relational neighborhood of query entities in a knowledge graph.
+
+ #### 7.2.3.5 Pipeline and Workflow Optimization
+
+ Standard RAG architectures assume every query requires search. In production, indiscriminate retrieval wastes GPU compute, adds latency, and injects unnecessary noise when the model’s internal parametric knowledge is already sufficient. Dynamic pipeline optimization addresses this via Adaptive Retrieval and Iterative RAG.
+
+Adaptive routing mechanisms decide whether and when to search. These split into two core paradigms:
+
+1. Rule-Based Routing: Leverages statistical properties, output token probabilities, or predefined heuristic thresholds to trigger retrieval. This approach is fast, lightweight, and fully transparent:
+
+- FLARE (Forward-Looking Active REtrieval): Monitors token generation confidence in real time. If the generation probability of upcoming tokens drops below a confidence threshold, FLARE pauses generation, formulates a query, and triggers search.
+- Efficient-KNNLM: Combines the output generation probabilities of KNN-LM and NPM using an interpolation hyperparameter $\mathbf{\lambda}$ to dynamically balance parametric generation against retrieval.
+
+2. Model-Based Routing: Employs fine-tuned models or the LLM's own metacognitive abilities to evaluate retrieval necessity. While computationally heavier, it offers superior contextual judgment:
+
+- Self-RAG: Trains the generator to output specialized reflection tokens (e.g., [Retrieve], [IsRel], [IsSup]), allowing the model to autonomously trigger retrieval and critique its own citations on the fly.
+- SKR (Self-Knowledge Guided Retrieval): Prompts the LLM to inspect its internal parametric confidence first. If the model knows the answer, it skips retrieval entirely.
+- Rowen: Translates the query across multiple languages and measures semantic consistency among zero-shot outputs. If answers diverge, the system flags factual ambiguity and triggers retrieval.
+- AdaptiveRAG: Uses a smaller, dedicated language model classifier to gauge query complexity, routing simple prompts to direct generation and complex multi-hop queries to the retrieval engine.
+
+Instead of a single "retrieve-then-generate" pass, complex problem-solving requires continuous feedback loops where intermediate answers inform subsequent retrieval steps:
+
+- RepoCoder: Designed for repository-level code completion. It runs iterative retrieve-and-generate cycles, using previously generated code snippets to formulate refined search queries across scattered source files.
+- ITER-RETGEN: Alternates between retrieval and generation. It uses the model's draft outputs to identify remaining knowledge gaps, fetching missing evidence to enrich each subsequent revision cycle.
+- SelfMemory: Loops a retrieval-augmented generator to build a persistent memory pool of candidate outputs, using a memory selector to pull relevant prior thoughts into the next generation turn.
+- RAT (Retrieval-Augmented Thinking): Combines zero-shot Chain-of-Thought prompting with targeted external search. The LLM first drafts an initial reasoning trajectory, then executes focused searches step-by-step to verify and correct each intermediate deduction before finalizing the answer.
+
+### 7.2.4 Advanced RAG
