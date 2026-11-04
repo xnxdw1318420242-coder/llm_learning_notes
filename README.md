@@ -282,4 +282,28 @@
   
 **7.2 RAG**
 
+* **7.2.1 RAG Components**
+    * **7.2.1.1 Retrieval Module**
+    * **7.2.1.2 Generation Module**
+* **7.2.2 Training**
+    * **7.2.2.1 Training-Free Methods**
+    * **7.2.2.2 Independent Training**
+    * **7.2.2.3 Sequential Training**
+    * **7.2.2.4 Joint Training**
+* **7.2.3 Optimization**
+    * **7.2.3.1 Input Optimization**
+    * **7.2.3.2 Retrieval Optimization**
+    * **7.2.3.3 Generator Optimization**
+    * **7.2.3.4 Result Optimization**
+    * **7.2.3.5 Pipeline and Workflow Optimization**
+* **7.2.4 Future RAG**
+    * **7.2.4.1 Naive RAG**
+    * **7.2.4.2 Advanced RAG**
+    * **7.2.4.3 Modular RAG**
+    * **7.2.4.4 Graph RAG**
+    * **7.2.4.5 Agentic RAG**
+* **7.2.5 LangChain**
+
 **7.3 Agent**
+
+**7.4 LLM for Search**
