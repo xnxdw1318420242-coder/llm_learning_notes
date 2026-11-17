@@ -47,7 +47,9 @@ If you hit an Out of Memory (OOM) error, here are the actionable strategies to f
 
 ### 5.1.2 Model Compression
 
-Model Compression is a crucial sub-field of Training Optimization. As neural networks grow larger, model compression techniques are essential to reduce their memory footprint, lower deployment costs, and speed up inference without heavily sacrificing performance.
+Model Compression is a crucial sub-field of Training Optimization. AQuantization is not simply casting a high-precision tensor (like FP16) to an integer type. It defines a discrete mathematical mapping grid. Without storing the proper scale and zero-point parameters, integers cannot be mapped back to their intended physical value ranges.s neural networks grow larger, model compression techniques are essential to reduce their memory footprint, lower deployment costs, and speed up inference without heavily sacrificing performance.
+
+#### 5.1.2.1 Quantization
 
 **Quantization** is the process of reducing the mathematical precision of the model's weights and activations (e.g., converting 32-bit floating-point numbers into 8-bit integers). This drastically shrinks the model's physical size and speeds up computation.
 
@@ -57,6 +59,142 @@ Model Compression is a crucial sub-field of Training Optimization. As neural net
 
 Classic algorithms include QAT (Quantization-Aware Training), PTQ (Post-Training Quantization), and DoReFa-Net (A specific network architecture designed to train with low bitwidth weights and activations).
 
+Quantization primarily decreases model memory footprint across VRAM and host RAM. When inference performance is bounded by weight memory transfer (memory-bound) or executed on hardware with high-throughput, low-precision matrix multiplication kernels, quantization can also reduce latency and boost throughput. However, a smaller quantized checkpoint does not automatically guarantee a proportional inference speedup. End-to-end execution speed is determined collectively by the underlying data layout, dequantization overhead, scale reading frequency, operator fusion efficiency, and target hardware capabilities. Quantization is not simply casting a high-precision tensor (like FP16) to an integer type. It defines a discrete mathematical mapping grid. Without storing the proper scale and zero-point parameters, integers cannot be mapped back to their intended physical value ranges. The transformation maps a continuous floating-point value $x$ to an integer $q$ within a target bit-width $b$, and reconstructs an approximate real value $\hat{x}$:
+
+$$q = \text{clip}\left(\text{round}\left(\frac{x}{s}\right) + z,\; q_{\min},\; q_{\max}\right)$$
+
+$$\hat{x} = s \cdot (q - z)$$
+
+- $s$ (Scale Factor): A positive real number determining the grid spacing between consecutive quantization levels.
+
+- $z$ (Zero-Point): An integer offset that maps the real value $0.0$ onto the integer grid, ensuring that zero-padding operations do not introduce numerical bias.
+
+- $q$: The stored quantized integer.
+
+- $\hat{x}$: The dequantized floating-point approximation used in downstream compute steps.
+
+<p align="center">
+<img width="473" height="320" alt="image" src="https://github.com/user-attachments/assets/f73ff717-e585-4c9b-9e73-f4a274439f4c" />
+</p>
+
+- Symmetric Signed ($s \cdot X_{\text{int8}}$): Constrains $z = 0$, mapping real numbers symmetrically across zero into $[-128, 127]$.
+
+- Symmetric Unsigned ($s \cdot X_{\text{uint8}}$): Constrains $z = 0$ over a non-negative range $[0, 255]$.
+
+- Asymmetric Quantization ($s(X_{\text{uint8}} - z)$): Shifts the integer grid using a non-zero zero-point $z$, fitting distributions that are skewed toward positive or negative values.
+
+Symmetric quantization eliminates zero-point correction arithmetic, leading to simpler compute graphs that map efficiently onto high-throughput integer GEMM engines. Conversely, asymmetric quantization better utilizes available integer levels for skewed activations, though at the expense of additional runtime zero-point compensation. Determining optimal quantization parameters requires balancing two competing errors:   
+
+- Larger scale ($s$): Broadens the dynamic range so extreme values avoid truncation, but wider step sizes between levels increase overall rounding error.
+- Smaller scale ($s$): Provides finer resolution for typical values, but pushes values at the tail ends into saturation, resulting in clipping error.
+
+Quantization calibration must balance task-specific clipping and rounding errors rather than mechanically covering the observed minimum and maximum values.
+
+Low-precision floating-point and integer fixed-point representations serve fundamentally different architectural roles in model execution. FP8 maintains an exponent field, making it well-suited for activations with wide dynamic ranges. Meanwhile, INT4 offers fewer discrete levels, but compresses weight footprints to one-quarter of FP16, making it optimal for token-by-token decoding bound by memory bandwidth.
+
+| Format | Bit-Width per Element | Common Use Cases | Key Characteristics & Trade-offs |
+| :--- | :--- | :--- | :--- |
+| **FP16** | **16 bit** | Training, baseline inference | Offers higher mantissa precision, but its exponent range is smaller than BF16. |
+| **BF16** | **16 bit** | Training, standard inference | Maintains the same wide exponent range as FP32 to prevent training overflow, but features lower mantissa precision than FP16. |
+| **FP8** | 8 bit | Training, W8A8 inference | Retains floating-point exponents (e.g., E4M3 for precision, E5M2 for dynamic range); requires specialized hardware instructions and scaling strategies. |
+| **INT8** | 8 bit | W8A8, Weight-Only serving | Backed by mature integer GEMM acceleration; offers consistent numerical stability. |
+| **INT4** | 4 bit | W4A16, W4A8 serving | Delivers substantial weight compression; highly sensitive to grouping granularity and calibration strategies. |
+| **2–3 bit** | 2–3 bit | Extreme low-bit weight quantization | Often requires codebooks, Hadamard/rotation transforms, outlier retention, or quantization-aware retraining to preserve accuracy. |
+
+Quantization granularity specifies how many parameters or activation elements share an identical scale factor. Finer grouping confines numerical variance to smaller subsets, reducing quantization error. However, smaller groups increase scale metadata overhead and can disrupt regular memory access patterns in GEMM kernels.
+
+| Granularity | Sharing Scope | Architectural Advantage | Engineering Cost & Disadvantages |
+| :--- | :--- | :--- | :--- |
+| **Per-Tensor** | Entire tensor shares a single scale | Minimal metadata storage; simple, streamlined kernel implementation | Outlier values inflate the dynamic range, degrading resolution across the tensor |
+| **Per-Channel** | Each individual input or output channel has its own scale | Adapts to inter-channel variance across weight matrices | Harder to fuse when applied along the inner contraction dimension of activation tensors |
+| **Per-Token** | Dedicated scale parameters per token | Flexibly adapts to dynamic activation swings across tokens | Requires online scale reduction passes at runtime |
+| **Per-Group** | Slices of contiguous weights (e.g., 32, 64, or 128) share a scale | Standard for INT4; allows a tunable balance between precision and overhead | Smaller group sizes increase scale metadata overhead |
+
+LLM inference pipelines target weights, activations, and runtime caches with different execution strategies.
+
+For Weight-Only Quantization (e.g., W4A16), weights are stored in 4-bit, while activations remain in FP16 or BF16. Custom kernels unpack and dequantize weights into registers/SRAM on-the-fly during weight loading before performing floating-point matrix multiplication. This directly reduces memory read volume, providing significant speedups in memory-bound regimes like small-batch, token-by-token decoding. During the prompt prefill phase, larger matrix dimensions shift the bottleneck toward compute intensity, meaning weight-only compression does not deliver speedups proportional to its compression ratio.
+
+For Weight-Activation Quantization (W8A8, W4A8), both weights and activations are quantized to low-precision formats, enabling direct execution on INT8 Tensor Cores or CPU SIMD integer instructions. This effectively accelerates compute-bound prefill workloads. Activations must be quantized online at runtime, which is complicated by activation outlier channels in LLMs. Modern pipelines increasingly adopt W4A8 configurations to minimize weight bandwidth during token decoding while utilizing 8-bit activations to maintain throughput during prefill.
+
+For KV Cache Quantization, the KV cache represents dynamic runtime state that grows alongside batch size and context length, rather than static model parameters. Under long contexts and high concurrency, KV cache memory footprint can exceed the model weights. KV cache quantization must occur online as each new token is generated, requiring careful balancing between cache compression, bandwidth, and quantization overhead.
+
+Quantization workflows fall into two primary paradigms based on retraining requirements and calibration strategies. 
+
+Post-Training Quantization (PTQ) operates directly on pretrained floating-point checkpoints without full retraining.
+
+- Approaches range from basic round-to-nearest methods to advanced schemes that use calibration samples to collect activations and optimize scale factors, rounding direction, or layer-wise reconstruction error.
+
+- PTQ requires minimal compute, making it the preferred path for deploying open-source LLMs.
+
+- When bit-widths drop below 4 bits, simple PTQ errors compound rapidly, particularly in smaller models and sensitive layers.
+
+Quantization-Aware Training (QAT) introduces "fake quantization" nodes into the forward pass during fine-tuning or pretraining, exposing the model to quantization noise.
+
+- Backpropagation bypasses the non-differentiable rounding step using the Straight-Through Estimator (STE).
+
+- The model adjusts its weight distributions to fit the target discrete grid, yielding higher numerical stability at ultra-low bit-widths than PTQ.
+
+- However, QAT requires training datasets, optimizer state tracking, and significant computational overhead.
+
+Static Quantization derives activation quantization parameters offline from calibration data. It simplifies the runtime inference graph, but requires calibration data to accurately reflect production inputs. Dynamic Quantization computes scale factors dynamically per token or tensor at runtime. It is more resilient to input distribution shifts, but introduces extra reduction operations, synchronization points, and kernel fusion constraints.
+
+Scaling LLMs introduces systematic activation outliers that complicate low-bit integer quantization. Research from LLM.int8() identified that once models surpass certain parameter thresholds, systematic high-magnitude activation spikes appear in a small number of hidden dimensions. While sparse, these features carry critical semantic and attention-routing information. If an entire tensor shares a single scale, these outliers dominate the integer grid, forcing normal values into a narrow set of quantization bins and destroying representational capacity. SmoothQuant demonstrated that activation outliers can be roughly two orders of magnitude (~100x) larger than normal values, while remaining concentrated in fixed channels. Directly clipping these outliers impairs model performance, while scaling to accommodate them causes normal values to lose effective precision. This trade-off represents the central challenge in LLM activation quantization.
+
+In Mixed-Precision Layer Allocation, different model layers exhibit varying sensitivity to quantization error:
+
+- Embeddings, the LM head, and the initial/final transformer layers often require higher precision to avoid accuracy loss.
+
+- Non-linear and normalization operations—such as LayerNorm, Softmax, and RoPE—are typically kept in floating-point formats.
+
+- Production systems use mixed precision, focusing low-bit integer quantization primarily on the high-compute Linear/GEMM operations.
+
+A common misconception is that reducing model file size yields an equivalent improvement in inference speed. The theoretical minimum weight storage is calculated as:
+
+$$M_{\text{weight}} = \frac{N \cdot b}{8} \text{ bytes}$$
+
+In practice, total VRAM usage always exceeds this theoretical floor. Deployments must allocate memory for quantization scale factors, zero-point tables, unquantized floating-point layers, memory alignment padding, the dynamic KV cache, intermediate activations, and runtime execution workspaces.
+
+<p align="center">
+<img width="613" height="191" alt="image" src="https://github.com/user-attachments/assets/b0701c99-6b8a-40ce-a417-c10ad1b46f9b" />
+</p>
+
+Furthermore, if the model checkpoint is compressed but the underlying runtime kernel lacks optimized low-precision instructions, the engine must unpack integers back to floating-point formats in memory. This unpacking overhead can make inference slower than running the original unquantized model.
+
+To systematically validate quantized models and prevent unexpected performance regressions, teams should adopt a structured four-stage evaluation pipeline.
+
+[1. Fix Execution Graph] ──> [2. Numerically Rich Calibration] ──> [3. Layer-Wise Diagnostics] ──> [4. Decoupled Acceptance]
+
+1. Fix the Execution Graph First. Before evaluating bit-widths, lock down the execution environment:
+
+- Standardize the model commit hash, tokenizer versions, sequence lengths, batch sizes, generation parameters, and runtime backends. Comparing only checkpoint sizes conflates algorithmic gains with framework differences.
+- In W4A16 configurations, verify whether the backend preserves packed 4-bit weights in memory or unpacks them to FP16 at load time. Unpacking to FP16 reduces storage size, but fails to alleviate memory bandwidth limits during GEMM execution. Use a profiler to inspect active kernel calls, weight packing formats, and intermediate tensor data types.
+
+  
+2. Calibrate for Numerical Distributions, Not Just Semantic Topics. Calibration data must capture dynamic numerical behavior rather than broad conversational variety:
+
+- Calibration sets should expose activation ranges, outlier channels, and input-dependent curvature across layers under realistic inputs.
+- Include short prompts, long documents, programming code, structured tables, multiple languages, and varied token frequencies, matching production truncation and padding configurations.
+- Using too few calibration samples risks overfitting scales to random extremes; conversely, using large datasets with uniform distributions can miss production outliers.
+- Plot per-layer errors, maximum absolute activation values, and clipping ratios rather than relying solely on global perplexity.
+
+3. Layer-by-Layer Diagnostics Over Heuristic Mixed Precision. Avoid relying on rules of thumb, such as arbitrarily retaining only the first and last layers in high precision.
+
+- Sequentially substitute individual Linear layers with their quantized versions, recording output cosine similarity, relative mean squared error (MSE), and downstream evaluation impact to generate a layer sensitivity curve.
+- For sensitive layers, test smaller group sizes, higher bit-widths, isolated outlier handling, or unquantized execution.
+- Allocating high-precision budgets to the layers most sensitive to loss delivers better performance than generic heuristics, while helping distinguish quantizer design issues from kernel bugs.
+
+4. Decouple Quality and Performance Acceptance. Evaluate model accuracy and runtime performance against independent criteria:
+
+- Model Quality: Track perplexity, domain and reasoning benchmarks, long-context retrieval, and generation consistency. Relying exclusively on aggregate benchmark averages can conceal sharp performance drops in specific capabilities.
+- Inference Performance: Measure prefill Time to First Token (TTFT), decoding Time Per Output Token (TPOT), concurrency scaling, peak memory usage, and energy draw. Ensure warmups, compilation caches, CUDA Graphs, continuous batching, and KV cache settings remain identical across baselines. Reporting only single-request throughput obscures request scheduling overhead in high-concurrency environments.
+
+Model quantization requires co-designing representation error, metadata storage overhead, and hardware execution efficiency. INT8 remains the most reliable drop-in format; INT4 serves as the standard for weight-only serving; and ultra-low 2–3 bit regimes require aggressive compensation techniques. Meanwhile, native 1-bit and 1.58-bit models alter parameter representations during pretraining, representing a distinct architectural approach rather than post-training compression.
+
+##### 5.1.2.1.1 LLM.int8()
+
+
+#### 5.1.2.2 Pruning
+
 **Pruning** works on the premise that not all parts of a neural network are equally useful. It involves physically deleting the least important connections (weights) or entire neurons to make the model smaller and faster.
 
 - Structured Pruning vs. Unstructured Pruning: Unstructured Pruning deletes individual weights scattered randomly throughout the network. While it reduces parameter count, modern hardware (like GPUs) struggles to accelerate this irregular, "swiss-cheese" sparse matrix. Structured Pruning deletes entire rows, columns, or channels of weights. This maintains a neat, dense matrix structure, making it highly efficient for hardware acceleration.
@@ -64,6 +202,8 @@ Classic algorithms include QAT (Quantization-Aware Training), PTQ (Post-Training
 - Magnitude-based Pruning vs. Importance-based Pruning: Magnitude-based is the simplest method. If a weight's absolute value is very close to zero, it is deemed useless and deleted. Importance-based uses more complex metrics (like gradient analysis or loss sensitivity) to determine if a specific weight or layer is critical to the model's reasoning, regardless of its raw size.
 
 Classic algorithms include Magnitude Pruning and Lottery Ticket Hypothesis: A famous theory stating that within any massive, randomly initialized network, there exists a smaller, sparse sub-network (the "winning ticket") that can be trained from scratch to match the performance of the full model.
+
+#### 5.1.2.3 Knowledge Distillation
 
 **Knowledge Distillation** doesn't physically shrink an existing model; instead, it uses a massive, highly capable model (the "Teacher") to train a smaller, more efficient model (the "Student").
 
