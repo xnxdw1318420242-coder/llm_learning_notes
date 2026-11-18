@@ -259,6 +259,56 @@ The best production quantization method is not simply the one with the lowest ma
 
 - Research prototypes frequently ship only single-GPU kernels. Scaling to tensor parallelism (multi-GPU) requires properly sharding and communicating codebooks, rotation matrices, and sparse outlier structures. If an algorithm tops academic leaderboards but cannot plug into your serving stack, integration costs will quickly outweigh VRAM savings.
 
+While weight quantization shrinks a model’s static storage footprint, KV Cache quantization tackles dynamic runtime state. During autoregressive generation, Transformer models cache the Key ($K$) and Value ($V$) projections of every historical token across all layers to avoid redundant recomputation. As context windows expand and serving concurrency rises, the KV Cache rapidly overtakes model weights as the primary bottleneck for both GPU VRAM capacity and memory bandwidth. 
+
+For a batch size $B$, cached sequence length $T$, number of layers $L$, number of KV heads $H_{\text{kv}}$, per-head dimension $D$, and $p$ bits per element, the ideal KV Cache memory footprint is:   
+
+$$M_{\text{KV}} = 2 B L T H_{\text{kv}} D \cdot \frac{p}{8} \text{ bytes}$$
+
+The factor of $2$ accounts for storing both Key and Value tensors. In standard Multi-Head Attention (MHA), $H_{\text{kv}}$ equals the number of Query heads; Multi-Query Attention (MQA) collapses this to a single KV head, while Grouped-Query Attention (GQA) shares fewer KV heads across Query groups. KV Cache quantization and GQA/MQA stack multiplicatively—architectural head sharing reduces the total element count, while quantization reduces the bit-width per element. 
+
+Generating each new token requires Attention kernels to read the entire history of cached Keys and Values. Under long contexts, compute cores stall waiting on VRAM data transfers—meaning the KV Cache simultaneously caps maximum batch size and limits single-step decoding speed. Compressing an FP16 KV Cache down to 4 bits cuts theoretical memory to one-quarter and slashes Attention read volume—but every decoding step must quantize new vectors online and dequantize historical vectors inside Attention. If dequantization is not fused directly into the Attention kernel, extra memory accesses and format conversions can completely erase those bandwidth gains.
+
+A foundational insight in KV Cache compression is that Keys and Values play fundamentally different mathematical roles and exhibit distinct statistical distributions:
+
+- Keys ($K$): Participate in the $QK^\top$ dot product prior to Softmax. Directional errors or distorted outlier channels directly corrupt attention routing scores. Additionally, Rotary Position Embeddings (RoPE) rotate Key coordinates by token position, altering their channel distributions before and after rotation.
+
+- Values ($V$): Are combined via a weighted sum after Softmax attention weights are computed, causing quantization noise to propagate as representational error rather than routing distortion.
+
+The key to effective KV Cache quantization is not uniformly casting both tensors to the same bit-width, but matching quantization granularity to the distinct statistical structures and computational roles of Key and Value.
+
+| Method | Key Handling | Value Handling | Typical Bit-Width | Extra Structures & Overhead |
+| :--- | :--- | :--- | :--- | :--- |
+| **KIVI** | `per-channel` | `per-token` | **2 bit** | High-precision `residual window` |
+| **KVQuant** | `pre-RoPE`, `per-channel` | Non-uniform, `dense-sparse` | **3–4 bit** | Non-uniform codebooks & sparse outlier indices |
+| **TurboQuant** | Orthogonal rotation, inner-product-oriented coding | Orthogonal rotation, distribution-matched quantization | **3–4 bit** | Orthogonal transforms & optional residual correction |
+
+Deploying quantized KV Caches in production engines requires co-designing memory allocators, kernels, schedulers, and evaluation suites.
+
+In online serving, total KV memory depends on active concurrent requests and their current cached lengths ($T_i$):  
+
+$$M_{\text{total}} = 2 L H_{\text{kv}} D \cdot \frac{p}{8} \sum_i T_i + M_{\text{meta}} + M_{\text{residual}}$$
+
+Real allocations must also include block tables, page-alignment fragmentation, scales, outlier indices, and residual buffers. Max context length only dictates the single-request ceiling; actual serving throughput depends on request length distributions, whether the scheduler can reclaim pages from completed sequences, and whether prefill and decode share the same VRAM budget.
+
+PagedAttention partitions each sequence's KV Cache into fixed-token blocks/pages to prevent contiguous memory over-allocation. Quantization shrinks the physical byte size of each page, but granularity must align with page boundaries:
+
+- If per-channel statistics span multiple pages, updating scales and reclaiming pages becomes complex.
+
+- per-token quantization localizes cleanly within pages, though it increases per-token metadata.
+
+- Using a residual window requires batch-encoding tokens whenever they migrate from high-precision pages into compressed low-bit pages.
+
+KV quantization is not an isolated tensor type-cast—it is a shared data format jointly maintained by the cache allocator, Attention kernel, and sequence scheduler.
+
+Launching a standalone quantization kernel for every single newly generated token introduces kernel-launch and reduction latencies that can outweigh saved read bandwidth. Production engines amortize this cost by fusing quantization into the QKV projection or cache-write pass, accumulating residual blocks before batch encoding, and reading packed formats directly inside fused Attention kernels. KIVI’s residual cache, KVQuant’s custom kernels, and TurboQuant’s fast transforms all target the exact same systems problem: keeping encoding costs off the critical path or ensuring they are outweighed by downstream bandwidth savings.
+
+Freeing VRAM via KV compression lets operators raise concurrency (batch size), extend context windows, expand speculative decoding draft batches, or keep model weights at higher precision—though these objectives compete with one another. If serving is compute-bound, increasing batch size improves matrix multiplication efficiency. If serving is already Attention bandwidth-bound, pushing concurrency higher forces each decoding step to read more cache data, causing Time Per Output Token (TPOT) to degrade. Consequently, benchmarks should always map throughput-vs-latency Pareto curves.
+
+KV quantization can be stacked with sliding windows, StreamingLLM, or KV eviction policies: eviction reduces the count of retained tokens, while quantization shrinks the bytes per token. However, eviction relies on attention importance scores, which Key quantization errors can perturb. When quantizing first and then evicting based on approximate attention scores, always verify whether approximation errors systematically drop long-range evidence. Additionally, for prefix caching, quantized KVs shared across requests must strictly lock model revisions, RoPE settings, and quantization parameters to prevent incompatible state reuse.
+
+Short-text perplexity is largely blind to KV quantization degradation. Evaluations must test needle-in-a-haystack (NIAH), multi-document QA, long-code completion, positional extrapolation, and multi-turn dialogue, plotted as curves across context lengths. Key errors distort attention rankings and tend to surface when retrieving sparse evidence from distant positions, whereas Value errors manifest as representational noise aggregated by attention weights. Validating only at 2K or 4K context lengths and claiming support for 100K+ tokens ignores the risk of quantization errors compounding across cache length, token positions, and attention sparsity shifts. 
+
 ##### 5.1.2.1.1 LLM.int8()
 
 Standard absmax INT8 quantization works reliably on smaller Transformer models. However, once models scale beyond billions of parameters, systematic high-magnitude outliers emerge across layers and tokens in a tiny subset of hidden feature dimensions. These outlier values are orders of magnitude larger than normal activations and disproportionately govern model predictions. Forcing normal values and extreme outliers to share a single quantization range severely degrades the effective precision of normal features. To preserve accuracy without abandoning 8-bit execution, LLM.int8() combines two mechanisms:
@@ -349,6 +399,32 @@ QuIP# starts from a fundamental insight: low-bit quantization breaks down when w
 Scalar grids quantize each dimension independently and miss geometric correlations across local vectors. QuIP# uses a lattice-based E8P codebook to jointly encode small vector blocks for superior spatial coverage, followed by lightweight end-to-end fine-tuning on calibration data to minimize KL divergence or output error.
 
 Orthogonal rotation suppresses worst-case coordinate errors while lattice coding boosts 2-bit vector efficiency, establishing QuIP# as a primary benchmark for ultra-low-bit Post-Training Quantization (PTQ). Hadamard transforms, codebook lookups, bit-packing, and fused kernels add substantial systems complexity. If your serving engine only supports standard INT4 kernels, QuIP#'s accuracy gains will not automatically translate into deployment speedups.
+
+##### 5.1.2.1.10 KIVI
+
+KIVI exploits structural asymmetry between Keys and Values to push compression down to 2 bits without fine-tuning. KIVI observes that Key outliers cluster persistently within a small subset of feature channels, making per-channel quantization (grouping along the channel dimension) ideal. Values lack persistent outlier channels, making per-token quantization on each arriving vector far more natural. This asymmetric design controls 2-bit quantization error far better than applying uniform per-token or per-channel schemes across both tensors.
+
+Computing per-channel scales for Keys requires accumulating a full group of tokens. To handle token-by-token generation, KIVI maintains a short, full-precision residual window. Newly generated KVs enter this high-precision buffer first; once the buffer reaches a group threshold ($G_k$), older tokens are batch-quantized into the low-bit main cache. Because recent tokens typically receive high attention weights, keeping them in full precision also buffers accuracy.   
+
+KIVI requires no fine-tuning, expands feasible batch sizes with a 2-bit cache, and improves real throughput via hardware-friendly implementations. However, peak VRAM still includes model weights and the residual window, and 2-bit sensitivity varies across models, tasks, and context lengths—meaning a single perplexity score cannot be generalized to all generation workloads.
+
+##### 5.1.2.1.11 KVQuant
+
+KVQuant targets ~3-bit compression by addressing Key outliers, positional rotations, and skewed distributions. KVQuant quantizes Keys before applying RoPE. Because RoPE is a deterministic rotation, it can be applied on-the-fly after reading and dequantizing the Keys. This lets the quantizer operate on stable, unrotated channel distributions rather than letting position-dependent rotations scatter outlier patterns across dimensions.
+
+Uniform grids place quantization levels at equal intervals, wasting resolution on sparse tails. KVQuant learns layer-wise, sensitivity-weighted non-uniform codebooks that pack limited coding points into high-probability density regions. Extreme outliers within each vector are separated into a high-precision sparse matrix, while remaining values are compressed into low-bit dense representations. By combining per-channel Key quantization, pre-RoPE quantization, non-uniform codebooks, and outlier isolation, KVQuant compresses the KV Cache to roughly 3 bits with dedicated CUDA kernels. However, sparse indices and codebooks increase the true average bit-width—so capacity estimates for million-token contexts must account for this metadata and system-reserved memory.
+
+##### 5.1.2.1.12 TurboQuant
+
+TurboQuant focuses on quantizing streaming KV vectors online without relying on model-specific calibration datasets. TurboQuant applies a fast orthogonal transform to incoming vectors to spread outlier energy evenly across coordinates. Because the rotated components follow a predictable, analytical distribution, they can be quantized using a matched scalar quantizer—eliminating the need to compute or store expensive dynamic codebooks per group. 
+
+- PolarQuant decouples vector magnitudes (norms) from directions, designing quantization grids around the marginal distribution of rotated directional coordinates.
+
+- Quantized Johnson-Lindenstrauss (QJL) uses low-bit random projections to approximate inner products or compensate for quantization residuals. It is engineered directly around the inner-product fidelity required by Attention, rather than merely minimizing element-wise reconstruction MSE.
+
+As TurboQuant moved into broader kernel and inference-framework evaluations in 2026, practical implementations typically adopted distinct configurations for Keys and Values alongside norm correction. Low-bit rotational coding opens a training-free path to 3–4 bit KV Caches, yet independent implementations reveal an important reality: theoretical inner-product estimation error, end-to-end language model quality, and fused kernel speed do not always align—whether QJL is applied to Keys and how rotation costs are fused must be empirically benchmarked.
+
+
 
 #### 5.1.2.2 Pruning
 
