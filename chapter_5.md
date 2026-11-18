@@ -424,7 +424,61 @@ TurboQuant focuses on quantizing streaming KV vectors online without relying on 
 
 As TurboQuant moved into broader kernel and inference-framework evaluations in 2026, practical implementations typically adopted distinct configurations for Keys and Values alongside norm correction. Low-bit rotational coding opens a training-free path to 3–4 bit KV Caches, yet independent implementations reveal an important reality: theoretical inner-product estimation error, end-to-end language model quality, and fused kernel speed do not always align—whether QJL is applied to Keys and how rotation costs are fused must be empirically benchmarked.
 
+##### 5.1.2.1.13 BitNet
 
+Post-training quantization (PTQ) methods like GPTQ and AWQ start with an already-trained floating-point model and compress its weights afterward without full retraining. BitNet takes a fundamentally different approach: it constrains weights to a tiny set of discrete values from the very beginning of training, forcing the neural network to learn representational capacity directly inside a low-bit parameter space. Native low-bit models are not merely a more aggressive form of PTQ—they represent a holistic co-design of model architecture, optimization dynamics, and inference kernels.
+
+- Original BitNet (1-bit): Replaces standard Transformer Linear layers with BitLinear. During the forward pass, real-valued latent weights are binarized to $\{-1, +1\}$, while activations stay in higher precision or are quantized to lower bit-widths. Training still maintains full-precision master weights and optimizer states to accumulate small gradient updates, while the discrete weights execute the forward matrix multiplications.
+
+- BitNet b1.58: Expands the discrete weight alphabet to ternary values $\{-1, 0, +1\}$. Three states carry a theoretical information content of:
+
+$$\log_2(3) \approx 1.585 \text{ bits}$$
+
+Introducing zero lets the model switch off unnecessary connections, giving it sparse representational capacity that pure binary weights lack. Furthermore, the "1.58" in the name refers strictly to the theoretical information entropy per ternary symbol—it does not mean general-purpose file formats can achieve that exact average bit-width without paying bit-packing and scaling metadata overhead.
+
+The BitLinear Quantization steps are:
+
+1. Weight Centering & AbsMean Quantization: Weights are first zero-centered by subtracting their mean, then scaled using their mean absolute value ($\gamma$) before rounding and clipping to $\{-1, 0, +1\}$:
+
+$$\gamma = \frac{1}{nm} \sum_{i,j} \vert{}W_{ij}\vert{}$$
+
+$$\tilde{W} = \text{clip}\left(\text{round}\left(\frac{W}{\gamma}\right), -1, 1\right)$$
+
+Forward matrix multiplication runs using the ternary matrix $\tilde{W}$, and the resulting output is rescaled by $\gamma$ afterward. Because round() has zero derivative almost everywhere, backpropagation relies on the Straight-Through Estimator (STE) to pass gradients straight through as an identity mapping.  
+
+2. Activation Quantization: BitNet b1.58 does not quantize intermediate activations down to 1.58 bits. Instead, activations typically use per-token absmax INT8, while accumulators and normalization layers remain in higher precision. "1.58-bit LLM" primarily describes the weights—it does not mean the entire inference graph, KV Cache, and activations are compressed to 1.58 bits.
+
+3. Normalization & Training Stability: Ultra-low-bit forward passes inject substantial quantization noise. Using RMSNorm, careful weight initialization, tuned learning rates, and proper weight decay becomes critical for stable convergence. At smaller parameter counts, ternary constraints noticeably restrict fitting capacity; as model scale and training token counts grow, the network compensates by distributing representations across wider channels and deeper layers.
+
+When multiplying ternary weights against activations, weights simply dictate whether to add, subtract, or skip an input value. Theoretically, this eliminates general-purpose floating-point multiplications and drastically cuts weight memory traffic. The larger the model and the more memory-bandwidth-bound the decoding phase is, the more pronounced the potential gains from ultra-low-bit weights become. However, GPUs and CPUs do not automatically treat ternary tensors as fast operators. If a runtime unpacks ternary weights back into INT8 or FP16 first in order to call standard GEMM routines, the theoretical arithmetic advantage largely vanishes. Real-world speedups require compact bit-packing, vectorized lookup tables (LUTs), fused scaling, and custom ternary matrix-multiplication kernels.
+
+Frameworks like bitnet.cpp implement custom ternary weight packing, lookup tables, and matrix multiplication kernels tailored for x86 and ARM CPUs, avoiding full unpacking into high-precision buffers. This demonstrates that the value of native low-bit models must be unlocked through the software stack rather than estimated from theoretical TOPS alone. Native b1.58 checkpoints encode losslessly into ternary formats. By contrast, naively ternarizing a standard pretrained FP16 model right before inference causes severe accuracy collapse; approaching native accuracy requires dedicated fine-tuning or QAT. Consequently, fast inference support in bitnet.cpp does not mean any arbitrary Llama or Qwen checkpoint can be losslessly converted into 1.58 bits.
+
+| Dimension | 4-Bit PTQ | QAT / Ultra-Low-Bit Fine-Tuning | Native b1.58 Training |
+| :--- | :--- | :--- | :--- |
+| **Starting Point** | Pretrained floating-point model | Existing or mid-training checkpoint | Ternary forward pass from early pretraining |
+| **Training Cost** | Low | Medium to high | Near full pretraining |
+| **Model Compatibility** | Broad | Depends on training recipe | Requires dedicated native checkpoints |
+| **Primary Advantage** | Rapid deployment of mature models | Recovers accuracy at ultra-low bit-widths | Lets the network adapt natively to discrete weights |
+| **Main Limitation** | High error below 2 bits | Training data and optimization overhead | Immature training and kernel ecosystem |
+
+While BitLinear uses ternary weights during the forward pass, training still maintains high-precision latent master weights, gradients, and Adam optimizer moments. If optimizer states remain in FP32, training VRAM is still dominated by those states. Immediate low-bit savings appear first in forward/backward matrix multiplications and weight transfers; lowering total training VRAM requires pairing BitNet with low-precision optimizers, parameter sharding, and activation checkpointing. You cannot directly extrapolate pretraining VRAM reduction ratios from an inference checkpoint's 1.58 BPW.
+
+The true ternary function is piecewise constant between quantization thresholds, yielding zero gradients almost everywhere. STE replaces this with an approximate identity function during backpropagation so latent weights can cross thresholds—an approximation that diverges from the true discrete objective. When latent weights oscillate repeatedly across thresholds, discrete forward signs jitter; scaling factors, normalization, and learning rates determine whether the network absorbs this noise. Stability experiments must therefore track loss curves, gradient norms, discrete sign-flip rates, and scaling behaviors rather than reporting final benchmark scores alone.
+
+In multi-GPU training, ternary forward passes do not automatically shrink all communication overhead. Data parallelism still synchronizes high-precision gradients, and tensor parallelism still exchanges activations; only weight broadcasts, sharded parameter reads, or specialized quantized collectives benefit directly. Moreover, if training kernels unpack ternary weights back into BF16 before computing, memory bandwidth drops, yet matrix multiplication FLOPs and communication volume do not scale down to 1.58 bits. True training energy savings must be verified via wall-clock runtime and full-system power draw rather than counting theoretical multiplications.
+
+To evaluate native low-bit models, benchmarks must control for parameter count, training tokens, data quality, and inference hardware. If a b1.58 model trains on more tokens or uses wider hidden dimensions, those gains cannot be credited solely to bit-width. Always measure throughput and energy on real kernels while reporting TTFT, TPOT, peak VRAM, and model accuracy together. Because ternary weights lower per-parameter storage and theoretical multiplication costs, wider models can fit inside the same memory budget—yet at fixed parameter counts, they face stricter representational limits. Fair evaluations require comparing against equal parameter count, equal training FLOPs, and equal inference latency/energy. If a b1.58 model recovers accuracy by scaling up layer width, it remains a strong systems win, but the finding must be framed as "superior under an equal deployment budget," rather than "discretization incurs zero capacity loss".
+
+While three ternary states hold $\log_2(3)$ bits of theoretical entropy, hardware typically stores them using fixed 2-bit encodings, bit-planes, or small-block lookup tables. Fixed 2-bit packing leaves one state unused—resulting in 2 BPW plus block scaling factors. Tighter entropy coding schemes penalize random-access matrix multiplication and can actually slow down decoding despite smaller disk footprints. First and foremost, "1.58 bit" describes the theoretical information content of the parameter set; physical hardware storage formats must always be reported separately.  
+
+Integrating downstream LoRA adapters requires care: whether LoRA attaches to high-precision latent weights, pre-quantized outputs, or standalone high-precision branches dictates whether ternary kernels remain usable at inference. Merging LoRA weights directly can break the $\{-1, 0, +1\}$ constraint unless followed by quantization-aware fine-tuning, and instruction tuning or safety alignment can trigger destructive discrete sign flips. Similarly, before migrating from mature FP16/INT4 ecosystems, verify tokenizer compatibility, context lengths, licensing, and functional checklists (such as tool-calling and multilingual performance) rather than relying on perplexity alone.   
+
+CPUs and mobile NPUs face strict bandwidth and power constraints where ternary add/subtract operations shine—yet edge workloads typically run smaller models at low batch sizes and short contexts, where kernel launch overhead, Embeddings, KV Cache, and sampling dominate runtime. Native low-bit models only truly outperform mature INT4 small models when model file size, resident memory, Time to First Token (TTFT), and sustained generation energy consumption all improve simultaneously.
+
+Always run a high-precision reference implementation alongside the packed ternary kernel on identical inputs across short sequences, long sequences, and varying batch sizes, checking layer-wise max error and cosine similarity to separate intrinsic discretization error from bit-packing, SIMD lookup, or accumulator overflow bugs.
+
+BitNet b1.58 trades ternary weights for compact storage and simplified arithmetic, relying on the training process to absorb quantization noise. While it proves that low-bit models can emerge as a native architecture, current production deployments still depend on specialized checkpoints, packing formats, and custom kernels—meaning it cannot yet replace mature, general-purpose INT4 PTQ.
 
 #### 5.1.2.2 Pruning
 
