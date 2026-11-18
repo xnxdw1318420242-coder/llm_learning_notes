@@ -219,6 +219,46 @@ Use LLM.int8() for zero-shot mixed-precision outlier protection, GPTQ to elimina
 | **SmoothQuant** | Weights & Activations | Small calibration set | `W8A8` | Smoothing factor ($\alpha$) tuning & INT8 kernel support |
 | **QLoRA** | Fine-tuning base weights | LoRA adapter training | `NF4` storage + `BF16` compute | On-the-fly dequantization & CPU–GPU paging transfers |
 
+Compressing Large Language Model (LLM) weights from 4 bits down to 3 bits or 2 bits pushes quantization past a critical threshold. At ultra-low bit-widths, uniform rounding noise is no longer a minor perturbation: a tiny fraction of sensitive weights begins to dominate layer output errors, metadata overhead from scales and zero-points eats into compression gains, and evenly spaced integer grids fail to capture underlying weight distributions. Modern low-bit quantization methods tackle these bottlenecks through five distinct strategies: salient channel protection, outlier isolation, non-uniform clustering, multi-codebook representations, and orthogonal rotation with lattice coding.
+
+| Method | Core Mechanism | Data Representation | Optimal Bit-Width |
+| :--- | :--- | :--- | :--- |
+| **AWQ** | Activation-aware channel scaling | Regular grouped low-bit dense weights | **4-bit** |
+| **SpQR** | Second-order sensitive outlier isolation | Low-bit dense + high-precision sparse | **3–4 bit** |
+| **SqueezeLLM** | Fisher-weighted K-means clustering | Non-uniform codebook + sparse matrix | **3–4 bit** |
+| **AQLM** | Multi-codebook additive vector sums | Uniform multi-codebook indices | **2–3 bit** |
+| **QuIP#** | Hadamard rotation + E8P lattice coding | Vector lattice codebook | **2–3 bit** |
+
+In the 4-bit regime, winning designs focus on protecting a small number of salient channels while preserving regular, hardware-friendly kernels. Once pushing into 2–3 bits, the bottleneck shifts to outlier suppression, inter-vector correlations, and bit-rate allocation—where codebook and rotation methods take the lead.
+
+Headline labels like "2-bit" or "3-bit" rarely reflect actual VRAM usage. True bits-per-weight must account for primary code bits, scales, zero-points, codebooks, sparse outlier values, sparse indices, unquantized layers, and memory alignment padding. If a hybrid method stores a fraction $p$ of weights in high precision ($b_o$ bits), encodes remaining weights in $b$ bits, and requires $b_i$-bit position indices per outlier, the sparse outlier branch alone adds:
+
+$$b_{\text{outlier}} = p(b_o + b_i)$$
+
+While SpQR and SqueezeLLM gain accuracy by moving difficult weights out of the dense body, high outlier ratios, wide index formats, or fine-grained group metadata quickly push true BPW well above the nominal bit-width. Always benchmark methods using their total effective bit-rate rather than headline bit counts.
+
+The lower the bit-width, the less valid the assumption of independent per-coordinate rounding becomes. Ultra-low-bit algorithms deliberately trade inter-coordinate correlation for bit-rate efficiency, and more complex decoding for higher accuracy. 
+
+Orthogonal transforms (like Hadamard matrices) preserve vector $L_2$ norms and linear layer outputs while redistributing coordinate energy. By spreading outlier spikes concentrated in a few channels across all dimensions, rotations equalize per-coordinate dynamic ranges so subsequent uniform or lattice quantizers suffer far smaller worst-case errors. However, rotation only pays off when fused into adjacent operators or executed via fast in-place transforms—materializing rotated tensors separately in memory introduces extra memory traffic and latency. Ultra-low-bit methods optimize different loss proxies—and carry different overfitting risks:
+
+- Different Loss Targets: Element-wise MSE treats all weights equally; Hessian- or activation-weighted losses measure layer output impact under real inputs; end-to-end language modeling loss captures downstream non-linearities and residual propagation. Even at identical BPW, methods differ in what they optimize and which calibration distributions they require.
+
+- Codebook Overfitting: Learning multiple codebooks and indices (as in AQLM) on a narrow calibration set can overfit the correlation patterns of those specific sequences. Always tune codebook counts, sub-vector dimensions, and group sizes on a validation split, and verify perplexity on an unseen held-out corpus. For universal codebooks shared across models, check that target layers exhibit similar variance and tail distributions.
+
+A low-bit format only accelerates inference if it satisfies a simple break-even inequality:
+
+$$\text{Weight Memory Read Time Saved} > \text{Unpack + LUT + Rotation + Scale Overhead}$$
+
+- Small-Batch Decoding (Memory-Bound): With larger models and smaller batch sizes, reading weights from VRAM dominates latency, making complex decoding overheads easier to amortize.
+
+- Large-Batch Prefill (Compute-Bound): High matrix reuse saturates compute units, leaving no slack to hide expensive table lookups or transforms. Consequently, a 2-bit method that wins in single-request decoding will not necessarily beat a well-optimized INT4 kernel in large-batch prefill.
+
+The best production quantization method is not simply the one with the lowest mathematical reconstruction error, but the one with a sustainable, fused kernel path for your specific batch size, context length, and hardware. Before committing to an ultra-low-bit format, evaluate its lifecycle support across your infrastructure:
+
+- Does it integrate cleanly into mainstream serving engines with continuous batching, LoRA adapters, and speculative decoding?
+
+- Research prototypes frequently ship only single-GPU kernels. Scaling to tensor parallelism (multi-GPU) requires properly sharding and communicating codebooks, rotation matrices, and sparse outlier structures. If an algorithm tops academic leaderboards but cannot plug into your serving stack, integration costs will quickly outweigh VRAM savings.
+
 ##### 5.1.2.1.1 LLM.int8()
 
 Standard absmax INT8 quantization works reliably on smaller Transformer models. However, once models scale beyond billions of parameters, systematic high-magnitude outliers emerge across layers and tokens in a tiny subset of hidden feature dimensions. These outlier values are orders of magnitude larger than normal activations and disproportionately govern model predictions. Forcing normal values and extreme outliers to share a single quantization range severely degrades the effective precision of normal features. To preserve accuracy without abandoning 8-bit execution, LLM.int8() combines two mechanisms:
@@ -268,7 +308,47 @@ QLoRA makes fine-tuning massive LLMs accessible on consumer GPUs by combining lo
 
 - Paged Optimizers: Long sequence lengths and gradient checkpointing can trigger sudden VRAM spikes. Paged Optimizers use CUDA Unified Memory to automatically page optimizer states from GPU VRAM to CPU RAM during transient spikes, preventing Out-Of-Memory (OOM) crashes. However, this only solves sporadic memory spikes—it does not eliminate PCIe transfer costs, and frequent paging will noticeably degrade training speed.
 
+##### 5.1.2.1.5 AWQ
 
+AWQ (Activation-Aware Weight Quantization) observes that protecting just ~1% of salient weights drastically reduces quantization error—yet identifying those weights by looking at weight magnitudes alone is unstable. Because a Linear layer's output depends on both weights and inputs, input activation channels with large magnitudes amplify every weight error along those channels. Thus, weight importance must be determined using activation statistics.
+
+Dividing input activation channels by a scaling vector $s$ while multiplying the corresponding weight channels by $s$ leaves the floating-point output mathematically unchanged. AWQ moderately scales up salient weight channels so they occupy more quantization levels relative to their group scale, finding the optimal scaling strength via a simple grid search.  AWQ requires neither backpropagation nor layer-by-layer weight reconstruction, keeping calibration costs low while preserving regular 4-bit dense packing. 
+
+Over-scaling salient channels inflates the dynamic range of other weights within the same quantization group, degrading their precision. Real-world gains depend heavily on group size, representative calibration activations, and optimized kernels. Crucially, "protecting 1% of weights" describes how importance is identified—it does not mean storing those weights separately in an FP16 sparse matrix.
+
+##### 5.1.2.1.6 SpQR
+
+Rather than hunting for weights with large raw magnitudes, SpQR (Sparse-Quantized Representation) targets weights that cause large output errors when quantized. It uses approximate second-order Hessian information to estimate per-weight sensitivity, isolating hard-to-compress elements as outliers while compressing the vast majority of weights into 3–4 bit groups.
+
+SpQR splits each weight matrix into a low-bit dense matrix and a high-precision sparse matrix. To minimize metadata overhead from fine-grained grouping, scales and zero-points are quantized a second time (double quantization). During inference, results from the low-bit dense matrix multiplication and the sparse outlier branch are summed together.
+
+SpQR achieves near-lossless compression around an average bit-width of 3–4 bits, proving especially effective at protecting sensitive weights in smaller models. Introducing a sparse branch breaks uniform dense data layouts. Actual compression ratios and inference speeds depend on the outlier percentage, index encoding format, and sparse kernel efficiency—and any theoretical bits-per-weight (BPW) calculation must include both sparse indices and scale metadata.
+
+##### 5.1.2.1.7 SqueezeLLM
+
+Like SpQR, SqueezeLLM uses a Dense-and-Sparse decomposition to offload extreme and high-sensitivity weights into a sparse high-precision matrix. However, instead of mapping the dense component onto a uniform integer grid, SqueezeLLM learns a non-uniform codebook tailored to the model's weight distribution, clustering coding centroids where weights are densely concentrated. Standard K-means clustering minimizes raw weight reconstruction error. SqueezeLLM weights each parameter's reconstruction error by its gradient or Fisher information, giving higher clustering priority to weights that strongly impact model loss. This shifts the optimization goal from "numerically reconstructing weights" to "prioritizing model behavior preservation within a finite codebook".
+
+Non-uniform codebooks require lookup tables (LUTs) and specialized decoding kernels. While SqueezeLLM delivers strong speedups in low-batch, memory-bandwidth-bound token generation, it does not necessarily outperform regular INT4 in high-concurrency or compute-bound workloads.
+
+##### 5.1.2.1.8 AQLM
+
+AQLM (Additive Quantization of Language Models) abandons element-by-element scalar quantization in favor of representing an entire sub-vector of weights as the sum of entries selected from multiple learned codebooks:
+
+$$\hat{w} = c_1[i_1] + c_2[i_2] + \cdots + c_M[i_M]$$
+
+Each $c_m$ is a distinct codebook, and each index $i_m$ selects one codeword vector. Combining multiple compact codebooks generates an exponentially large pool of candidate vectors, modeling complex local distributions using very few index bits. 
+
+AQLM optimizes layer output reconstruction error using calibration activations rather than fitting raw weights alone, then jointly fine-tunes codebooks and unquantized parameters across each Transformer block. In the extreme ~2-bit compression regime, multi-codebook representations offer far greater expressive power than scalar quantization while keeping a more uniform data layout than hybrid dense-and-sparse formats.
+
+Offline encoding optimization is compute-intensive, and runtime inference demands fast table lookups, codeword accumulation, and custom GEMV kernels. Furthermore, at the same average bit-width, a smaller model at higher precision can sometimes outperform a larger model compressed to 2 bits—so model selection cannot rely on parameter count alone.
+
+##### 5.1.2.1.9 QuIP#
+
+QuIP# starts from a fundamental insight: low-bit quantization breaks down when weight energy or Hessian curvature concentrates in a few coordinates. QuIP# applies a randomized Hadamard transform to orthogonally rotate weight matrices and second-order information. This spreads outlier energy evenly across dimensions so no single coordinate remains extreme. Because orthogonal rotation is functionally equivalent, it can be folded into adjacent layers.
+
+Scalar grids quantize each dimension independently and miss geometric correlations across local vectors. QuIP# uses a lattice-based E8P codebook to jointly encode small vector blocks for superior spatial coverage, followed by lightweight end-to-end fine-tuning on calibration data to minimize KL divergence or output error.
+
+Orthogonal rotation suppresses worst-case coordinate errors while lattice coding boosts 2-bit vector efficiency, establishing QuIP# as a primary benchmark for ultra-low-bit Post-Training Quantization (PTQ). Hadamard transforms, codebook lookups, bit-packing, and fused kernels add substantial systems complexity. If your serving engine only supports standard INT4 kernels, QuIP#'s accuracy gains will not automatically translate into deployment speedups.
 
 #### 5.1.2.2 Pruning
 
