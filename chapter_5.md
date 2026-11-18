@@ -190,7 +190,84 @@ To systematically validate quantized models and prevent unexpected performance r
 
 Model quantization requires co-designing representation error, metadata storage overhead, and hardware execution efficiency. INT8 remains the most reliable drop-in format; INT4 serves as the standard for weight-only serving; and ultra-low 2–3 bit regimes require aggressive compensation techniques. Meanwhile, native 1-bit and 1.58-bit models alter parameter representations during pretraining, representing a distinct architectural approach rather than post-training compression.
 
+Below are introductions to classical quantization methods. Both LLM.int8() and SmoothQuant tackle activation outliers, but with opposite systems trade-offs:
+
+- LLM.int8() dynamically detects and splits outlier channels at runtime, giving it higher resilience to unexpected outlier shifts on out-of-distribution inputs.
+
+- SmoothQuant pre-computes scaling factors offline to produce a static, uniform W8A8 execution graph that maps cleanly onto Tensor Cores.
+
+Do not evaluate these methods on accuracy alone—always verify whether your inference engine natively supports mixed-precision GEMMs, offline-folded smoothing scales, and fused quantized operators.
+
+Between GPTQ and QLoRA,
+
+- GPTQ is a pre-inference compression step that outputs packed low-bit weights for serving.
+
+- QLoRA is a fine-tuning workflow that produces a frozen 4-bit base model paired with trained LoRA adapters.
+
+If you want to deploy a QLoRA model as a single unified weight set, you must either load the adapter dynamically at runtime or merge the LoRA weights into a high-precision base model first and then re-quantize. Directly adding LoRA deltas onto an already discretized 4-bit grid will corrupt the quantization grid unless your framework explicitly supports specialized quantized merging.
+
+When evaluating low-bit methods, advertised bit-widths rarely reflect actual VRAM consumption. For a group size $G$, base weight bit-width $b$, scale bit-width $b_s$, and zero-point bit-width $b_z$, the effective average bit-width (before alignment padding) is:  
+
+$$b_{\text{eff}} = b + \frac{b_s + b_z}{G}$$
+
+Use LLM.int8() for zero-shot mixed-precision outlier protection, GPTQ to eliminate memory-bandwidth bottlenecks in weight-only serving, SmoothQuant for compute-bound W8A8 throughput, and QLoRA for memory-constrained fine-tuning. Always start by defining your lifecycle stage (training vs. inference) and hardware bottleneck (memory bandwidth vs. compute) before choosing a quantization scheme.
+
+| Method | Primary Target | Training / Calibration | Typical Format | Core Engineering Cost |
+| :--- | :--- | :--- | :--- | :--- |
+| **LLM.int8()** | Weights & Activations | None (Zero-shot) | `INT8 + FP16` | Mixed-precision branching & routing overhead |
+| **GPTQ** | Weights only | Small calibration set | `W4A16` / `W3A16` | Second-order Hessian reconstruction & specialized kernels |
+| **SmoothQuant** | Weights & Activations | Small calibration set | `W8A8` | Smoothing factor ($\alpha$) tuning & INT8 kernel support |
+| **QLoRA** | Fine-tuning base weights | LoRA adapter training | `NF4` storage + `BF16` compute | On-the-fly dequantization & CPU–GPU paging transfers |
+
 ##### 5.1.2.1.1 LLM.int8()
+
+Standard absmax INT8 quantization works reliably on smaller Transformer models. However, once models scale beyond billions of parameters, systematic high-magnitude outliers emerge across layers and tokens in a tiny subset of hidden feature dimensions. These outlier values are orders of magnitude larger than normal activations and disproportionately govern model predictions. Forcing normal values and extreme outliers to share a single quantization range severely degrades the effective precision of normal features. To preserve accuracy without abandoning 8-bit execution, LLM.int8() combines two mechanisms:
+
+- Vector-Wise Quantization: Instead of assigning a single scaling factor to an entire matrix multiplication ($C = AB$), LLM.int8() normalizes per vector—assigning an independent scale to every row of the activation matrix and every column of the weight matrix. Integer matrix multiplication accumulates into INT32, which is then dequantized using both row and column scales. This fine-grained scaling minimizes dynamic range discrepancies across normal channels.
+
+- Mixed-Precision Decomposition: Outlier feature dimensions exceeding a predefined magnitude threshold are extracted from the matrix and computed in FP16, while the remaining over 99.9% of values are processed through the INT8 path. Both partial outputs are then summed to form the final result.
+
+By shielding the tiny fraction of critical outlier dimensions in FP16, LLM.int8() allows models up to 175B parameters to match 16-bit baseline quality. Splitting the compute graph requires dynamic feature filtering, extra data movement, and executing two separate matrix multiplications. At small batch sizes or on smaller models, this scheduling overhead can completely cancel out the speedup from INT8 arithmetic. While LLM.int8() solves the accuracy bottleneck, it is not inherently the most hardware-friendly W8A8 architecture.
+
+##### 5.1.2.1.2 GPTQ
+
+GPTQ is a weight-only Post-Training Quantization (PTQ) algorithm. Rather than minimizing element-wise differences between original and quantized weights, GPTQ minimizes the layer's output reconstruction error given a small calibration input $X$:
+
+$$\min_{\hat{W}} \Vert{}WX - \hat{W}X\Vert{}_2^2$$
+
+Using the input-dependent Hessian approximation $H = 2XX^\top$, GPTQ quantizes weights column by column. Whenever a column is rounded to a discrete grid value, GPTQ leverages the inverse Hessian ($H^{-1}$) to calculate how that rounding error affects the remaining unquantized weights, updating them so subsequent columns absorb and compensate for the output bias.   
+
+Storing full inverse Hessians and performing naive element-by-element updates does not scale to models with tens of billions of parameters. GPTQ solves this by processing weight columns in contiguous blocks, applying Cholesky decomposition for numerical stability, and batching weight updates into dense matrix operations.
+
+GPTQ compresses LLMs down to 3–4 bits without requiring end-to-end retraining, serving as the algorithmic foundation for modern GPU inference kernels (such as ExLlama and Marlin) and deployment formats. Final model quality heavily depends on calibration set quality, group size, whether activation ordering (act-order) is enabled, and whether the target inference engine supports the exact weight-packing layout. Furthermore, fast quantization time does not guarantee fast inference speed—actual runtime acceleration still depends entirely on optimized unpacking and fused matrix multiplication kernels.
+
+##### 5.1.2.1.3 SmoothQuant
+
+SmoothQuant is built on two key observations: weights are far easier to quantize than activations, and activation outliers remain persistently concentrated in a small, fixed set of channels. For a Linear layer $Y = XW$, SmoothQuant introduces a per-channel smoothing vector $s$ to mathematically rebalance the dynamic ranges:  
+
+$$Y = \left(X\,\text{diag}(s)^{-1}\right)\left(\text{diag}(s)W\right) = \hat{X}\hat{W}$$
+
+Outlier activation channels are divided by a larger factor $s$, while the corresponding weight channels are multiplied by the exact same factor. The floating-point output remains mathematically identical, but quantization difficulty is shifted away from spiky activations onto weights that can easily absorb a wider range. The smoothing vector $s$ is computed using the per-channel maximum absolute values of both activations and weights, controlled by a migration strength hyperparameter $\alpha$:   
+
+- If $\alpha$ is too small, activation outliers remain prominent and hard to quantize.
+- If $\alpha$ is too large, weight distributions become overly amplified, introducing weight quantization error.
+
+Crucially, this scaling transformation can be folded offline into the weights of preceding LayerNorm and Linear layers, meaning zero extra smoothing operations are needed at runtime.
+
+SmoothQuant enables primary Linear layers to run uniformly with INT8 weights and INT8 activations. By eliminating LLM.int8()'s FP16 outlier branch, it maps cleanly onto standard, high-throughput INT8 GEMM Tensor Cores—making it ideal for compute-bound prefill and large-batch serving. SmoothQuant still requires representative calibration data, and optimal $\alpha$ values vary across models and layers. Additionally, on hardware lacking mature INT8 kernel support, real-world throughput will fall short of theoretical paper gains.  
+
+##### 5.1.2.1.4 QLoRA
+
+QLoRA makes fine-tuning massive LLMs accessible on consumer GPUs by combining low-bit weight storage with high-precision low-rank adaptation.
+
+- Frozen 4-Bit Base with BF16 Compute: QLoRA stores and freezes pretrained base weights in 4-bit precision, dequantizing them on-the-fly to BF16 during forward and backward passes while updating only lightweight LoRA adapters. Rather than performing training math in INT4, QLoRA minimizes base-model VRAM footprint during fine-tuning.
+
+- NF4 (4-Bit NormalFloat): Normalized pretrained weights typically follow a zero-mean normal (bell-curve) distribution. Instead of using uniformly spaced integer bins, NF4 defines 16 non-uniform quantization levels aligned to the quantiles of a standard normal distribution so every bin carries equal probability mass. By concentrating encoding resolution in high-probability regions near zero, NF4 provides an information-theoretically optimal 4-bit data type for neural network weights.
+
+- Double Quantization: Fine-grained 4-bit quantization requires storing a floating-point scaling factor (FP32 or FP16) for every weight group, creating non-negligible metadata overhead when group sizes are small. Double Quantization applies a second quantization pass to the scaling constants themselves, cutting average metadata overhead from roughly 0.5 bit per parameter down to 0.127 bit.
+
+- Paged Optimizers: Long sequence lengths and gradient checkpointing can trigger sudden VRAM spikes. Paged Optimizers use CUDA Unified Memory to automatically page optimizer states from GPU VRAM to CPU RAM during transient spikes, preventing Out-Of-Memory (OOM) crashes. However, this only solves sporadic memory spikes—it does not eliminate PCIe transfer costs, and frequent paging will noticeably degrade training speed.
+
 
 
 #### 5.1.2.2 Pruning
