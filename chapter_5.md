@@ -490,6 +490,84 @@ BitNet b1.58 trades ternary weights for compact storage and simplified arithmeti
 
 Classic algorithms include Magnitude Pruning and Lottery Ticket Hypothesis: A famous theory stating that within any massive, randomly initialized network, there exists a smaller, sparse sub-network (the "winning ticket") that can be trained from scratch to match the performance of the full model.
 
+Unlike quantization—which keeps neural network connections intact while lowering numerical precision—pruning shrinks a model by directly removing weights, channels, Attention Heads, FFN neurons, or entire Transformer Blocks. However, whether pruning actually delivers real-world value depends on whether the resulting sparse pattern can be exploited by storage formats and hardware kernels—not on how many zeros show up in a parameter count table. To translate parameter reduction into actual inference speedup, a pruned model must pass through a strict five-stage validation pipeline, where every link is verified sequentially:
+
+Parameter Count $\rightarrow$ Theoretical FLOPs $\rightarrow$ Storage Format $\rightarrow$ Kernel Support $\rightarrow$ End-to-End Latency
+
+A critical pitfall in model compression is conflating metrics:
+
+- Sparsity Rate ($S = 1 - \frac{N_{\text{nz}}}{N}$) measures the fraction of zeroed weights out of total weights $N$. Sparsity rate only describes the mask; it cannot be used as a substitute for throughput, latency, or hardware utilization.
+
+- Compression Ratio must account for sparse index overhead, unpruned layers, and encoding formats.
+
+- Compute (FLOPs) only drops inside operators capable of skipping zero multiplications. Meanwhile, end-to-end latency is still heavily shaped by unpruned operations like normalization, RoPE, Softmax, KV cache reads/writes, sampling, and scheduling.
+
+The sparsity structure you choose dictates your actual path to hardware acceleration.
+
+- Unstructured Pruning zeroes out arbitrary individual weights freely. Because it imposes no structural constraints, it is the easiest method to preserve model accuracy at a given sparsity rate. Randomly positioned zeros require index or mask overhead; when sparsity isn't high enough, indexing, indirect addressing, and irregular memory access actually make Sparse GEMM slower than Dense GEMM. For example, 50% unstructured sparsity may halve theoretical multiply-accumulate (MAC) operations yet yield zero real speedup due to index lookups, branching, and thread load imbalance.
+
+- N:M Semi-Structured Pruning enforces a fixed pattern where exactly $N$ non-zero values are retained in every $M$ consecutive weights (most commonly 2:4). It trades away some parameter selection freedom in exchange for regular execution and compact metadata. When the hardware, data types, and matrix shapes are supported, N:M pruning achieves real-world acceleration much more easily than arbitrary unstructured pruning at the same sparsity rate.
+
+- Block Sparsity & Width-Structured Pruning. Block sparsity deletes fixed-size matrix blocks, whereas width-structured pruning removes entire channels, Attention Heads, FFN intermediate dimensions, or Embedding dimensions. Post-pruning tensors collapse into smaller dense matrices, eliminating the need for sparse indices. These "dense-small" structures are generally much easier to accelerate across diverse hardware platforms. However, the coarser the pruning granularity, the fewer degrees of freedom the remaining parameters have to adapt—often resulting in steeper capability loss at the same parameter compression ratio.
+
+- Layer Pruning deletes entire Transformer Blocks outright, reducing model depth, sequential dependencies, and KV Cache footprint. It delivers the most predictable, direct reduction in end-to-end latency because every token passes through fewer layers. The catch is that depth handles layer-by-layer feature transformation and multi-step reasoning, so pushing layer removal slightly too far can severely degrade complex reasoning tasks.
+
+| Pruning Format | Model File Size | Theoretical FLOPs | General Hardware Speedup | Primary Overhead / Risk |
+| :--- | :--- | :--- | :--- | :--- |
+| **Unstructured** | Shrinks only with sparse format | Drops by non-zero count | Weak | Indexing & indirect memory access |
+| **N:M Semi-Structured** | Compressible | Drops by a fixed ratio | Hardware-dependent | Pattern constraints & metadata packing |
+| **Structured Width** | Shrinks directly | Drops directly | Strong | Shape alignment & recovery training |
+| **Layer Pruning** | Shrinks directly | Drops roughly by layer count | Strong | Loss of depth-dependent reasoning |
+
+There are different types of weight importance:
+
+- Magnitude: Assumes weights with small absolute values are unimportant. It is fast and data-free, but ignores input activations and downstream sensitivity. Because weight magnitudes vary across layers, naive global ranking tends to over-prune layers with smaller numerical scales.
+
+- Activation-Aware: If an input channel consistently carries large activations, even tiny weights along that channel strongly impact the output. Multiplying weight magnitude by input activation norm is a staple lightweight metric for one-shot LLM pruning.
+
+- Gradient & Taylor Expansion: First-order methods approximate loss sensitivity via $\vert{}w_i \nabla_{w_i} \mathcal{L}\vert{}$, while second-order methods incorporate Hessian curvature to distinguish weights that share similar magnitudes but sit along different sensitivity directions. These yield better accuracy at the cost of heavy compute, memory, and numerical approximation overhead.
+
+- Structure-Level Metrics: When pruning Heads, channels, or layers, you cannot simply sum element-wise scores because architectures are tightly coupled—deleting an Attention Head impacts Q/K/V/O projections simultaneously, and cutting an Embedding dimension propagates through every residual connection. Structure-level scoring must explicitly trace dependencies or compare layer outputs, Block Influence, and representation similarity before and after removal.
+
+And different types of pruning schedules:
+
+- One-Shot Pruning: Uses a small calibration set to score and prune weights without full retraining—well-suited for multi-billion-parameter LLMs.
+
+- Iterative Pruning: Prunes a small fraction per cycle followed by fine-tuning recovery; achieves stronger accuracy at higher compute cost.
+
+- In-Training Pruning: Gradually induces sparsity during training via sparsity regularization, learnable masks, or movement scores, requiring full access to training data and the optimizer.
+
+In LLM compression, recovery training is just as critical as pruning itself:
+
+- LoRA works well for low-cost behavioral recovery.
+
+- Continual pre-training helps redistribute general language capabilities.
+
+- Knowledge distillation uses the unpruned teacher model's outputs to constrain and guide the smaller pruned student.
+
+If pruned structures contained irreplaceable knowledge, short-term fine-tuning only patches surface-level benchmark performance and cannot fully restore lost capabilities.
+
+Using the Roofline model (arithmetic intensity = compute-to-memory-traffic ratio) clarifies where sparsity actually pays off:
+
+- Small-batch Decode (Memory-Bandwidth Bound): Compressing weights or cutting layers directly reduces bytes fetched from VRAM. However, unstructured CSR/CSC formats must also load indices; at low sparsity, index traffic cancels out zero-weight bandwidth savings.
+
+- Large-batch Prefill (Compute Bound): Realizing FLOPs gains requires Sparse Tensor Cores or smaller dense GEMMs.
+
+- The exact same sparsity mask can require completely different optimal execution strategies across decode, prefill, and training phases.
+
+In structured width pruning, FLOPs do not scale linearly with parameter count. Attention projections scale roughly quadratically with hidden width, FFN compute scales with $\text{hidden width} \times \text{intermediate dimension}$, and Attention's sequence quadratic term depends on Head Dimension and token count. Choose your pruning target based on the operator profile of your prefill vs. decode workloads.  GPU kernels are sensitive to matrix dimensions, tile alignment, and batch size. Pruning 13% of an intermediate dimension may yield virtually zero speedup if the new dimension still pads up to the same hardware tile boundary. In multi-GPU inference, uneven tensor-parallel sharding caused by pruning can also inflate communication wait times. Support for 2:4 sparsity varies across GPU architectures, data types (dtype), matrix shapes, and framework versions. Even on supported GPUs, exported memory layouts, transpose orientations, and GEMM shapes must satisfy library constraints. "Obtaining a 2:4 mask" does not automatically mean "sparse Tensor Cores are actually invoked in production".
+
+Some frameworks only dispatch sparse kernels when weights meet strict dtype, alignment, transposition, and static shape rules. Operations like LoRA merging, tensor-parallel slicing, or weight reordering can break the sparse pattern. Always inspect the exported execution plan and kernel names, and verify numerical parity against a dense baseline. If the compiler falls back to standard dense GEMM, categorize the result as model compression, not inference acceleration. Sparse kernels operate within a sweet spot: if sparsity is too low, indexing costs more than skipped math; if sparsity is too high, uneven non-zero distributions across rows leave GPU threads idling. Sweep across sparsity ratios to find the true performance inflection points for your matrix shapes. Determining which sparsity regimes actually yield hardware speedups first—and optimizing model quality within those bounds—aligns far better with real deployment goals than chasing arbitrary sparsity targets upfront. Even when unstructured sparsity has forward kernel support, backpropagation still handles sparse gradients, mask updates, and optimizer states—and many frameworks maintain dense master weights, preventing VRAM savings. If your roadmap involves long-term continual pre-training or frequent fine-tuning, a regular, smaller dense model is usually much easier to maintain than a large, highly sparse model.
+
+When input Embeddings and the LM Head are tied, vocabulary or hidden dimension deletions must stay synchronized. In Grouped-Query Attention (GQA), multiple Query Heads share a KV Head and cannot be pruned into invalid groupings. In gated FFNs, the up and gate projections must delete the exact same intermediate channels. Mishandling these dependencies may still allow a checkpoint to load, only for it to crash during residual additions, reshapes, or tensor-parallel slicing. Model compression relies on static sparsity (masks fixed pre-deployment, altering checkpoints and allowing offline weight packing). Dynamic sparsity (token pruning, dynamic layer skipping, conditional routing) adapts per input at runtime, introducing branching, load imbalance, and unpredictable latency—these belong to inference-time scheduling and must not be conflated in benchmarks. Sparse weights can be compressed with ZIP or Zstd for disk storage and transfer, but upon loading they must expand into the runtime layout expected by the kernel—so peak VRAM must always be calculated from the runtime format. Because pruning is irreversible, version-control the original model, masks, pre-recovery weights, post-recovery weights, deployment exports, calibration sets, and random seeds. Keeping only the final sparse checkpoint strips away your ability to run ablations, roll back changes, or audit the compression pipeline.
+
+Reporting only "50% of weights removed" without specifying the sparse storage format and end-to-end speed fails to prove any real-world deployment benefit. A rigorous acceptance matrix must track both sides:
+
+- Quality Metrics: Perplexity (PPL), zero-shot, few-shot, long-context, and generative benchmarks, alongside exact recovery dataset sizes and training token counts.
+
+- System & Architecture Metrics: Model disk size, load time, peak VRAM, TTFT, TPOT, tokens/s, energy draw, multi-concurrency capacity, and target hardware kernel utilization. Structured pruning reports must also disclose final layer counts, hidden dimensions, Attention Heads, KV Heads, and FFN widths so the architecture is reproducible. Pruning results only have deployment reproducibility when the sparsity structure, storage format, kernel implementation, and workload profile are disclosed together.
+
+Ultimately, unstructured pruning prioritizes accuracy preservation, structured and layer pruning prioritize hardware regularity, and N:M bridges the middle ground. The real objective of LLM pruning isn't to manufacture more zeros—it is to produce a model that target hardware can execute efficiently while preserving its capabilities through bounded recovery training.
 #### 5.1.2.3 Knowledge Distillation
 
 **Knowledge Distillation** doesn't physically shrink an existing model; instead, it uses a massive, highly capable model (the "Teacher") to train a smaller, more efficient model (the "Student").
