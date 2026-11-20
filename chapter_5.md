@@ -568,6 +568,68 @@ Reporting only "50% of weights removed" without specifying the sparse storage fo
 - System & Architecture Metrics: Model disk size, load time, peak VRAM, TTFT, TPOT, tokens/s, energy draw, multi-concurrency capacity, and target hardware kernel utilization. Structured pruning reports must also disclose final layer counts, hidden dimensions, Attention Heads, KV Heads, and FFN widths so the architecture is reproducible. Pruning results only have deployment reproducibility when the sparsity structure, storage format, kernel implementation, and workload profile are disclosed together.
 
 Ultimately, unstructured pruning prioritizes accuracy preservation, structured and layer pruning prioritize hardware regularity, and N:M bridges the middle ground. The real objective of LLM pruning isn't to manufacture more zeros—it is to produce a model that target hardware can execute efficiently while preserving its capabilities through bounded recovery training.
+
+
+##### 5.1.2.2.1 Second-Order Pruning
+
+Early pruning methods relied on weight magnitude, but classical second-order approaches reframed importance around how much the training loss actually changes when a parameter is removed.
+
+Near a converged local minimum, first-order gradients are close to zero, meaning the loss change caused by weight perturbations can be approximated using the second-order term:
+
+$$\Delta \mathcal{L} \approx \frac{1}{2} \Delta w^\top H \Delta w$$
+
+OBD simplifies the Hessian matrix $H$ to its diagonal entries ($H_{ii}$). When a single weight $w_i$ is zeroed out, its saliency score is:
+
+$$S_i = \frac{1}{2} H_{ii} w_i^2$$
+
+Weight magnitude only tells half the story—loss curvature dictates how sensitive the model is along that parameter's direction. Between two weights of identical magnitude, the one sitting in a high-curvature direction is far more critical to preserve. Keeping only $H_{ii}$ makes importance scoring computationally tractable, but it ignores correlations between weights and assumes the remaining parameters will not cooperatively adjust after a deletion. Among strongly correlated parameters, a diagonal approximation can misclassify connections that could have been compensated by other weights as indispensable, while also underestimating coupled errors.  
+
+OBS incorporates off-diagonal interactions via the inverse Hessian ($H^{-1}$). Under the constraint that the $q$-th weight is forced to zero, OBS computes an optimal analytical compensation update for the remaining weights:
+
+$$\Delta w = -\frac{w_q}{[H^{-1}]_{qq}} H^{-1} e_q$$
+
+with a corresponding deletion cost of $w_q^2 / (2 [H^{-1}]_{qq})$.
+
+OBS demonstrated that pruning does not have to stop at "select and zero out"—models can actively adjust surviving parameters after every deletion to preserve layer outputs. The sequential error compensation used in modern GPTQ and SparseGPT is a direct extension of this principle scaled up to large matrices via block-wise approximations. Computing and storing the full inverse Hessian scales quadratically with parameter count, making it impossible to apply directly to modern LLMs. Subsequent methods must rely on layer-wise, block-wise, Kronecker, or low-rank approximations to keep costs manageable. Second-order derivations assume that current weights sit near a local optimum and that the loss landscape is locally quadratic. When evaluating a pre-trained LLM on a new calibration domain, these conditions may not hold, and the Hessian can exhibit strong off-diagonal structure. Because damping, block partitioning, and layer-wise approximations are computational compromises rather than exact deletion costs, curvature scores should never be treated as absolute ground truth.
+
+Second-Order Methods Reframed "Small Weight" as "Low Deletion Cost": While magnitude pruning looks solely at parameter values, OBD and OBS analyze local quadratic loss expansion to quantify deletion impact and parameter compensation. Because full Hessians cannot fit in memory on modern networks, LLM methods approximate them layer-wise, block-wise, diagonally, or via input covariance—with SparseGPT and GPTQ directly inheriting OBS's immediate error-absorption paradigm.
+
+##### 5.1.2.2.2 Deep Compression
+
+Rather than treating pruning as an isolated step, Deep Compression chained three distinct compression techniques together:
+
+1. Iterative Pruning and Retraining: Small weights below a threshold are pruned, and the surviving non-zero connections are retrained. Removing too many weights in a single step causes irreversible capability loss, so alternating between pruning and fine-tuning allows the network to redistribute functionality across remaining weights.
+
+2. Trained Quantization: Non-zero weights are clustered per layer to share a codebook, replacing floating-point numbers with cluster indices while continuing to update the centroids during training. Rather than uniform integer quantization, this acts as weight-sharing non-uniform encoding.
+
+3. Huffman Coding: Applies entropy coding to sparse index differences and quantized codebook indices, assigning shorter bit-codes to more frequent symbols.
+
+Deep Compression was the first framework to unify algorithmic compression rate, storage format, and energy consumption within a single end-to-end pipeline. However, it also exposed a fundamental systems trade-off: Huffman coding is well-suited for storage and transmission, but poorly suited for GPU random memory access; if full decoding is required before inference, it will not directly reduce matrix multiplication latency. Modern GPUs rely on fixed-width packing, block-sparse metadata, and aligned memory layouts because decoding must happen inside every matrix multiplication. Minimizing compressed file size and maximizing inference speed are two distinct objectives: the former can rely on entropy coding, whereas the latter typically sacrifices a bit of compression rate in exchange for regular memory access.
+
+Deep Compression separated statistical redundancy (pruning), numerical precision redundancy (quantization), and encoding redundancy (entropy coding). In LLMs, this translates into pruning/structural trimming $\rightarrow$ LoRA or continual pre-training recovery $\rightarrow$ low-bit quantization $\rightarrow$ weight packing and custom kernels. Because each stage alters the activation and weight distributions seen by the next, every step requires fresh calibration rather than plugging in isolated optimal hyperparameters.  
+
+##### 5.1.2.2.3 Subnetwork Trainability & Dynamic Scoring
+
+The Lottery Ticket Hypothesis proposes that a randomly initialized dense network contains a sparse subnetwork ("winning ticket") capable of training in isolation from its original initialization to match the accuracy of the full network. Classic experiments discover these subnetworks using Iterative Magnitude Pruning (IMP): train the network, prune a fraction of small weights, reset surviving weights back to their early initialization, and repeat. Because pre-training is the primary cost bottleneck for LLMs, engineers rarely care about finding tickets trainable from scratch; instead, the goal is extracting a capability-preserving subnetwork from an already pre-trained checkpoint. Follow-up research showed that rewinding weights to an early training checkpoint is far more stable than rewinding to random initialization, giving rise to weight rewinding and learning-rate rewinding. The Lottery Ticket Hypothesis explains the trainability of sparse subnetworks—it does not directly guarantee speedup on general-purpose hardware, as a winning ticket can still possess a completely irregular connectivity pattern.
+
+LTH proves that trainable sparse subnetworks exist within dense initializations, not that arbitrary pre-trained LLMs can have massive parameter counts stripped away in one shot without recovery. In LLM practice, the real question is whether a pre-trained checkpoint contains a function-preserving subnetwork and how much calibration and compute are required to find it. Equating "a winning ticket exists" with "the smallest-magnitude weights are the winning ticket" confuses a theoretical existence theorem with a specific search heuristic.
+
+Instead of relying on static weight magnitude, Movement Pruning assigns every weight a learnable importance score that tracks whether the parameter is consistently moving away from zero during fine-tuning. Score updates are governed by $-w \nabla_w \mathcal{L}$: connections pushed by task gradients to grow in magnitude are retained, while those pushed toward zero are pruned.  During downstream fine-tuning of pre-trained models like BERT, Movement Pruning adapts well to task objectives even at high sparsity, gradually carving out a subnetwork via soft masks and sparsity regularization. However, because it requires training and task-specific data, the resulting mask is often task-specific and cannot be applied directly to a general-purpose foundation model in a one-shot manner like modern LLM pruning.
+
+By scoring weights on how they adapt to task gradients rather than static magnitude, Movement Pruning enabled downstream objectives to shape sparsity. Modern LLM pruning choices between one-shot calibration and recovery training still balance these same three forces: static importance, task relevance, and compute budget. Applying classical pruning lessons to multi-billion-parameter LLMs requires adjusting for architectural, procedural, and generational differences:
+
+- Transformers interleave residual connections, layer normalizations, coupled Q/K/V projections, Grouped-Query Attention (GQA), and gated FFNs—meaning deleting a single channel affects multiple adjacent matrices, while autoregressive generation compounds local errors across tokens. Furthermore, benchmarks must separate pre-training perplexity, instruction-following, and reasoning capabilities, as each reacts differently to where you prune and what recovery data you use.
+
+- Iterative magnitude pruning relies on gradual adaptation across rounds; Lottery Ticket rewinds to early training trajectories; and Movement Pruning relies on task gradients. Because these methods leverage fundamentally different mechanisms, they cannot be compared solely by final sparsity percentages.
+
+- Full iterative pruning is cost-prohibitive at LLM scale. Teams deploying an existing large model typically favor one-shot calibration methods, whereas teams building an entire model family often use structured pruning paired with longer continual pre-training—carving multiple target sizes from one base model while sharing teacher models and data pipelines.
+
+- CNN weight sharing and local convolutions differ vastly from a Transformer's massive dense linear layers, just as BERT's classification gradients differ from long-sequence autoregressive loss. Classical papers provide design principles for importance scoring, retraining, and encoding—their specific empirical numbers should not be extrapolated directly to models with tens of billions of parameters.
+
+- Pruning schedules need explicit stopping criteria: halt pruning when pushing sparsity higher causes recovery token requirements to spike or drops key task metrics below acceptable thresholds, rather than blindly chasing neat, round compression ratios. The true value of classical iterative pruning curves lies in exposing the exact inflection points where model quality begins to break down.
+
+
+
 #### 5.1.2.3 Knowledge Distillation
 
 **Knowledge Distillation** doesn't physically shrink an existing model; instead, it uses a massive, highly capable model (the "Teacher") to train a smaller, more efficient model (the "Student").
