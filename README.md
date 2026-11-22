@@ -230,19 +230,6 @@
 * **5.1.1 Memory Usage**
 * **5.1.2 Model Compression**
     * **5.1.2.1 Quantization**
-      * **5.1.2.1.1 LLM.int8()**
-      * **5.1.2.1.2 GPTQ**
-      * **5.1.2.1.3 SmoothQuant**
-      * **5.1.2.1.4 QLoRA**
-      * **5.1.2.1.5 AWQ**
-      * **5.1.2.1.6 SpQR**
-      * **5.1.2.1.7 SqueezeLLM**
-      * **5.1.2.1.8 AQLM**
-      * **5.1.2.1.9 QuIP#**
-      * **5.1.2.1.10 KIVI**
-      * **5.1.2.1.11 KVQuant**
-      * **5.1.2.1.12 TurboQuant**
-      * **5.1.2.1.13 BitNet**
     * **5.1.2.2 Pruning**
       * **5.1.2.2.1 Second-Order Pruning**
       * **5.1.2.2.2 Deep Compression**
