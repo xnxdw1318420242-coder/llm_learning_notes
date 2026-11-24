@@ -3854,11 +3854,37 @@ SFT uses cross-entropy loss to fine-tune a model on expert data:
 
 $$\mathcal{L}_{SFT}(\theta) = -\mathbb{E}_{(x, y^*) \sim \mathcal{D}} \left[ \sum_{t=1}^{|y^*|} \log \pi_\theta(y_t^* \mid x, y_{<t}^*) \right]$$
 
-It provides dense, token-level supervision. Every single word has a clear "correct" label. It suffers from Exposure Bias because it is Off-Policy. During training, the model is fed perfect expert context ($y_{<t}^*$). During real-world inference, it has to rely on its own generated context ($\hat{y}_{<t}$). This distribution mismatch means if the model makes a slight mistake early on, it doesn't know how to recover, leading to compounding errors.
+It provides dense, token-level supervision. Every single word has a clear "correct" label. It suffers from Exposure Bias because it is Off-Policy. During training, the model is fed perfect expert context ($y_{<t}^*$). During real-world inference, it has to rely on its own generated context ($\hat{y}_{<t}$). This distribution mismatch means if the model makes a slight mistake early on, it doesn't know how to recover, leading to compounding errors. Besides, the student often learns to mimic the teacher's tone, formatting, and confidence without actually absorbing its factual accuracy.
 
 RL is On-Policy. The model learns by rolling out its own answers, meaning training perfectly matches inference. It is much more stable and mitigates "catastrophic forgetting" because it reinforces its own good habits rather than forcing a completely new distribution. It suffers from sparse supervision. The model generates a massive trajectory and only gets a single reward signal ($r$) at the very end, making it hard to know which specific tokens were responsible for the success or failure.
 
 OPD combines the best of both worlds. It forces the Student model to generate its own rollouts (maintaining the On-Policy advantage) but uses a Teacher model to calculate a logit distribution for every single token along that path (providing the dense supervision of SFT).
+
+OPD draws inspiration from DAgger (an iterative imitation learning algorithm where a teacher labels states visited by the student) and closely parallels Process Reward Modeling (PRM), which grades every step in a chain-of-thought. It is particularly effective for mathematical reasoning and building assistant models that blend domain expertise with instruction following. Building on Qwen3's findings, experiments show that OPD matches the benchmark performance of full RL at a fraction of the compute cost.
+
+To measure the gap between the student policy $\pi_\theta$ and the teacher policy $\pi_{\text{teacher}}$ on the student's own trajectories, OPD minimizes the per-token reverse KL divergence:   
+
+$$\text{KL}(\pi_\theta \,\Vert{}\, \pi_{\text{teacher}}) = \mathbb{E}_{x \sim \pi_\theta} \left[ \log \pi_\theta(x_{t+1} \mid x_{1..t}) - \log \pi_{\text{teacher}}(x_{t+1} \mid x_{1..t}) \right]$$
+
+When the student and teacher distributions match, reverse KL drops to zero. Using a discount factor of zero (optimizing each immediate next token greedily without looking ahead) keeps training simple and brings several major advantages:
+
+- Unhackable Reward Signal: Unlike learned reward models that models can exploit via reward hacking, low reverse KL strictly aligns with high-probability behavior under the teacher.
+
+- Mode-Seeking Behavior: Reverse KL is mode-seeking, meaning the student locks onto the teacher's specific, high-confidence behavior rather than spreading probability mass thinly across multiple suboptimal alternatives.
+
+- Reduced Exposure Bias: Because optimization happens on the student's own rollouts, the student learns to stay on track and recover from its own states.
+
+- Major Compute Savings: Because you don't need to wait for an entire sequence to finish before computing rewards, you can train on shorter or incomplete generation segments. Furthermore, the small student model handles autoregressive sampling, while the large teacher only needs a single forward pass to compute log probabilities—eliminating the need for a separate reward or annotation model. (Combining per-token distillation rewards with sequence-level environment rewards remains an exciting avenue for future work.)
+
+Implementing OPD fits cleanly into a standard policy-gradient RL loop:
+
+1. Initialize the teacher client: Spin up a lightweight inference/sampling client for the teacher—no backpropagation through the teacher is needed.
+
+2. Sample trajectories: Roll out trajectories from the student model just like in RL, caching the student's per-token log probabilities $\log \pi_\theta(x)$ for the importance sampling loss.
+
+3. Compute rewards: Pass the student's trajectories to the teacher via compute_logprobs to get $\log \pi_{\text{teacher}}(x)$, then calculate reverse_kl.
+
+4. Train with RL: Set each token's advantage to -reverse_kl and update the student using an importance-sampling policy gradient step.
 
 How exactly do we mathematically force the Student to learn from the Teacher at every token? The researchers developed two distinct approaches.
 
@@ -3891,3 +3917,13 @@ $$\pi_T(\cdot \mid x, c) \triangleq p_\theta(\cdot \mid x, c)$$
 $$\pi_S(\cdot \mid x) \triangleq p_\theta(\cdot \mid x)$$
 
 The system uses the expert data to force the model to write a perfect answer in its own native "voice" and style. It then uses this self-generated, high-quality sample to perform on-policy supervision. It perfectly preserves the expert's knowledge while completely eliminating the off-policy distribution shift.
+
+Beyond boosting general reasoning on compact models, distillation is a powerful tool for personalization—such as teaching a model to maintain a specific tone and output format in dialogue, or equipping it with tool-use and cost-budgeting capabilities. Training a model to master both new domain knowledge and tailored behaviors simultaneously is notoriously difficult. Lightweight fine-tuning rarely cuts it, which means you typically have to run large-scale mid-training first. However, layering post-training behaviors on top of newly injected knowledge normally demands a complex post-training stack built on proprietary datasets and custom reward models. On-policy distillation (OPD) streamlines this bottleneck. Because it requires neither a separate reward model nor heavy infrastructure, OPD works seamlessly for continual learning and test-time training—allowing teams to update deployed models on the fly (for instance, adapting a model mid-trained on internal corporate documentation) without degrading their baseline capabilities.
+
+Both Reinforcement Learning (RL) and OPD optimize via reverse KL divergence—effectively pruning the base policy's action space. The critical difference lies in information density: RL delivers only $O(1)$ bits of feedback per episode, whereas OPD delivers $O(N)$ bits per episode (where $N$ is the sequence length in tokens). RL has to train near the full evaluation context length so the policy learns length limits without triggering format penalties. By contrast, OPD learns effectively even on shorter context windows because there is no sharp reward cliff between completed sequences and truncated ones. When backed by a strong SFT initialization, OPD works reliably with much smaller batch sizes because every episode packs far more bits of supervision, cutting down gradient noise.
+
+While training RL with explicit process supervision is notoriously finicky in practice, these findings show that process supervision and dense rewards have the potential to boost learning efficiency by an order of magnitude. Curating massive prompt datasets is expensive and time-consuming, so practitioners naturally want to reuse prompts across training epochs. In standard RL, training for multiple epochs on the same prompt quickly causes the model to memorize the final answer—especially in larger models. OPD avoids this trap by minimizing reverse KL to match the teacher's full probability distribution rather than memorizing a single target string, allowing you to train extensively on the exact same prompt. Although repeating a single prompt sequentially induces overfitting and is less compute-efficient, training on just that single prompt still roughly recovered the teacher model's benchmark performance.
+
+Why can OPD replicate an entire RL run in a fraction of the steps? Unlike pre-training—which burns massive compute taking gradient steps across a high-dimensional parameter space unique to each network—RL spends relatively little compute on weight updates themselves. Instead, RL should be viewed as spending the bulk of its compute on search (policy generation and credit assignment) rather than model updates. More specifically, RL explores a semantic policy space, where each step makes small tweaks to previously discovered strategies—stumbling onto better reasoning patterns by sampling from its existing weights. Once RL discovers a strong strategy, distillation offers a direct shortcut: OPD doesn't need to simulate every intermediate policy along an RL curriculum; it only needs to learn the final policy, sparing you the compute of simulating intermediate steps. 
+
+OPD allows you to re-inject specialized behaviors back into a model without eroding its existing strengths—making it ideal for continual learning, where models must acquire new capabilities without forgetting old ones. RL excels at shaping behavior, but it is poor at teaching brand-new factual or domain knowledge. Standard SFT tends to degrade previously learned behaviors and suffers from model collapse/degradation in self-distillation setups. On-policy learning suffers from significantly less catastrophic forgetting than off-policy learning. Furthermore, because the teacher model stays fixed while the student remains strictly on-policy, the student converges cleanly toward the teacher's desired behaviors without suffering the performance degradation seen with SFT in self-distillation. Together, dense per-token supervision, extreme data efficiency, and resistance to forgetting make on-policy distillation one of the most practical post-training paradigms for building adaptable, production-grade models.
